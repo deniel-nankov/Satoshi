@@ -399,8 +399,8 @@ class FeatureFactory:
         prices = np.array(price_data_sorted[price_col].values, dtype=float)
         timestamps = np.array(price_data_sorted[timestamp_col].values)
         
-        # Validate temporal integrity with Leakage Police
-        leakage_proof_id = self._validate_temporal_integrity_sync(timestamps, window_size, horizon)
+        # Validate temporal integrity with existing Leakage Police agent
+        leakage_proof_id = self._validate_temporal_integrity_sync(timestamps, window_size, horizon, features_array, parameters)
         
         # Compute log returns
         log_prices = np.log(np.array(prices, dtype=float))
@@ -491,12 +491,15 @@ class FeatureFactory:
         prices = price_data[price_col].values
         timestamps = price_data[timestamp_col].values
         
-        # Validate temporal integrity
-        if not self._validate_temporal_integrity(timestamps, window_size, horizon):
-            raise ValueError("Temporal integrity validation failed")
+        # Validate temporal integrity with existing Leakage Police agent
+        timestamps_array = np.array(timestamps)
+        prices_array = np.array(prices)
+        parameters = {'feature_type': 'realized_volatility', 'window_size': window_size, 'horizon': horizon}
+        leakage_proof_id = self._validate_temporal_integrity_sync(timestamps_array, window_size, horizon, 
+                                                                 prices_array, parameters)
         
         # Compute log returns
-        log_prices = np.log(prices)
+        log_prices = np.log(prices_array)
         returns = np.diff(log_prices)
         
         # Feature engineering
@@ -543,7 +546,7 @@ class FeatureFactory:
         }
         
         feature_id = self._generate_feature_id(FeatureType.REALIZED_VOLATILITY, parameters)
-        leakage_proof_id = self._generate_leakage_proof_id(features_array, timestamps_array, parameters)
+        # Use leakage proof ID from validation above (already generated with existing Leakage Police)
         
         provenance = FeatureProvenance(
             feature_id=feature_id,
@@ -623,12 +626,15 @@ class FeatureFactory:
         prices = price_data[price_col].values
         timestamps = price_data[timestamp_col].values
         
-        # Validate temporal integrity
-        if not self._validate_temporal_integrity(timestamps, window_size, horizon):
-            raise ValueError("Temporal integrity validation failed")
+        # Validate temporal integrity with existing Leakage Police agent
+        timestamps_array = np.array(timestamps)
+        prices_array = np.array(prices)
+        parameters = {'feature_type': 'jumps', 'window_size': window_size, 'horizon': horizon}
+        leakage_proof_id = self._validate_temporal_integrity_sync(timestamps_array, window_size, horizon, 
+                                                                 prices_array, parameters)
         
         # Compute returns
-        log_prices = np.log(prices)
+        log_prices = np.log(prices_array)
         returns = np.diff(log_prices)
         
         # Feature engineering

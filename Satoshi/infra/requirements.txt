@@ -1,0 +1,58 @@
+# Storage Infrastructure Requirements
+# Required packages for the Satoshi trading system storage layer
+
+# Streaming Bus (Kafka/Redpanda)
+aiokafka>=0.8.0              # Async Kafka client
+kafka-python>=2.0.2          # Kafka utilities
+
+# Columnar IPC (Arrow Flight)
+pyarrow>=13.0.0              # Apache Arrow and Flight
+pyarrow-hotfix>=0.6          # Security patches
+
+# Lakehouse (Iceberg)
+pyiceberg>=0.5.0             # Apache Iceberg
+duckdb>=0.9.0                # DuckDB integration
+delta-spark>=2.4.0           # Delta Lake (alternative)
+
+# TSDB (ClickHouse)
+clickhouse-connect>=0.6.0    # ClickHouse client
+clickhouse-driver>=0.2.0     # Alternative driver
+
+# Registry (PostgreSQL)
+asyncpg>=0.28.0              # Async PostgreSQL client
+sqlalchemy>=2.0.0            # ORM and query builder
+psycopg2-binary>=2.9.0       # PostgreSQL adapter
+
+# Secrets Management
+cryptography>=41.0.0         # Local encryption
+hvac>=1.2.0                  # HashiCorp Vault client
+boto3>=1.28.0                # AWS KMS/Secrets Manager
+azure-keyvault-secrets>=4.7.0  # Azure Key Vault
+google-cloud-secret-manager>=2.16.0  # GCP Secret Manager
+
+# Data Processing
+pandas>=2.1.0                # Data manipulation
+numpy>=1.24.0                # Numerical computing
+polars>=0.20.0               # Fast DataFrames (alternative)
+
+# Async and Concurrency
+asyncio-mqtt>=0.13.0         # MQTT for IoT data
+aioredis>=2.0.0              # Redis async client
+aiofiles>=23.0.0             # Async file operations
+
+# Monitoring and Observability
+prometheus-client>=0.17.0    # Metrics collection
+structlog>=23.1.0            # Structured logging
+opentelemetry-api>=1.20.0    # Distributed tracing
+
+# Serialization and Compression
+msgpack>=1.0.5               # Fast serialization
+zstandard>=0.21.0            # Compression
+snappy>=1.1.10               # Google Snappy
+
+# Development and Testing
+pytest>=7.4.0               # Testing framework
+pytest-asyncio>=0.21.0      # Async testing
+pytest-benchmark>=4.0.0     # Performance testing
+black>=23.7.0                # Code formatting
+mypy>=1.5.0                  # Type checking

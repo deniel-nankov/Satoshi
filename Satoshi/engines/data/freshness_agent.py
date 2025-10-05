@@ -21,6 +21,9 @@ from dataclasses import asdict
 import json
 from threading import Lock
 
+# Streaming Bus Integration
+from infra.bus.streaming_bus import StreamingBus
+
 logger = logging.getLogger(__name__)
 
 
@@ -532,6 +535,24 @@ class FreshnessAgent:
         self.stream_configs: Dict[str, StreamConfig] = {}
         self.stream_stats: Dict[str, StreamStats] = {}
         self.running = False
+        
+        # Streaming Bus Integration
+        streaming_config = self.config.get("streaming_bus", {
+            "bootstrap_servers": "localhost:9092",
+            "enable_ssl": False,
+            "enable_sasl": False
+        })
+        self.streaming_bus = StreamingBus(streaming_config)
+        
+        # Component identification for circuit breaker
+        self.component_id = "freshness_agent"
+        
+        # Circuit breaker dependencies - monitors all data collectors
+        self.circuit_breaker_dependencies = [
+            "exchange_connector",
+            "options_chain_collector", 
+            "onchain_collector"
+        ]
         
         # Global configuration
         self.check_interval_us = config.get('check_interval_us', 30_000_000)  # 30 seconds
@@ -1165,36 +1186,217 @@ class FreshnessAgent:
                 logger.debug(f"Burst recovery detected for {stream_name}, expediting clearance")
     
     async def _enqueue_freshness_incident(self, incident: FreshnessIncident) -> None:
-        """Enqueue freshness incident to output queue."""
+        """Enqueue freshness incident to output queue and publish to streaming bus."""
         try:
+            # Keep backward compatibility with output queue
             if not self.output_queues['freshness_incidents'].full():
                 self.output_queues['freshness_incidents'].put_nowait(incident)
             else:
                 logger.warning(f"Freshness incidents queue full, dropping incident for {incident.stream_name}")
+                
+            # Publish to streaming bus
+            await self._publish_freshness_incident(incident)
+            
         except Exception as e:
             logger.error(f"Failed to enqueue freshness incident: {e}")
     
-    async def _enqueue_circuit_breaker_request(self, request: CircuitBreakerRequest) -> None:
-        """Enqueue circuit breaker request to output queue."""
+    async def _publish_freshness_incident(self, incident: FreshnessIncident) -> None:
+        """Publish freshness incident to incidents.Freshness topic."""
         try:
+            incident_data = {
+                "incident_id": f"freshness_{incident.stream_name}_{incident.timestamp_utc_us}",
+                "stream_name": incident.stream_name,
+                "level": incident.level.value,
+                "staleness_us": incident.staleness_duration_us,
+                "staleness_seconds": incident.staleness_duration_us / 1_000_000,
+                "threshold_us": incident.threshold_us or 0,
+                "confidence": incident.confidence,
+                "detected_at": incident.timestamp_utc_us,
+                "last_update_us": incident.last_update_us,
+                "evidence": {
+                    "expected_interval_us": incident.expected_interval_us,
+                    "threshold_multiplier": incident.threshold_multiplier,
+                    "bar_us": incident.bar_us,
+                    "jitter_us": incident.jitter_us,
+                    "clock_source": incident.clock_source,
+                    "consecutive_misses": incident.consecutive_misses,
+                    "occurrence_count": incident.occurrence_count
+                },
+                "clock_source": incident.clock_source,
+                "severity": incident.severity.upper(),
+                "description": f"Stream {incident.stream_name} staleness: {incident.staleness_duration_us/1_000_000:.1f}s (threshold: {(incident.threshold_us or 0)/1_000_000:.1f}s)",
+                "impacted_streams": [incident.stream_name],  # For circuit breaker integration
+                "proposed_action": "CircuitBreak" if incident.level == FreshnessLevel.CRITICAL else "Monitor"
+            }
+            
+            # Use stream name as partition key for locality
+            partition_key = f"freshness_{incident.stream_name}"
+            
+            await self.streaming_bus.publish_with_headers(
+                topic="incidents.Freshness",
+                partition_key=partition_key,
+                payload=incident_data,
+                headers={
+                    "data_type": "freshness_incident",
+                    "stream": incident.stream_name,
+                    "level": incident.level.value,
+                    "severity": incident.severity.upper()
+                },
+                dedupe_key=f"freshness_{incident.stream_name}_{incident.level.value}_{incident.timestamp_utc_us}"
+            )
+            
+        except Exception as e:
+            logger.error(f"Failed to publish freshness incident to streaming bus: {e}")
+    
+    async def _enqueue_circuit_breaker_request(self, request: CircuitBreakerRequest) -> None:
+        """
+        Enhanced circuit breaker request handling with system-wide coordination.
+        Integrates with StreamingBus circuit breaker manager for dependency-aware failures.
+        """
+        try:
+            # Map stream names to component IDs for circuit breaker coordination
+            component_mapping = {
+                "raw_data.exchange_feed": "exchange_connector",
+                "raw_data.options_chain": "options_chain_collector",
+                "raw_data.onchain": "onchain_collector"
+            }
+            
+            # Extract component from stream name
+            component_id = None
+            for stream_prefix, comp_id in component_mapping.items():
+                if request.stream_name.startswith(stream_prefix):
+                    component_id = comp_id
+                    break
+            
+            if component_id and request.action.lower() == "open":
+                # Coordinate with system-wide circuit breaker
+                logger.warning(f"Freshness failure detected, opening system circuit breaker for {component_id}")
+                await self.streaming_bus.record_component_failure(
+                    component_id=component_id,
+                    cascade_failure=True  # Enable cascade to dependents
+                )
+            elif component_id and request.action.lower() == "close":
+                # Signal component recovery
+                logger.info(f"Freshness restored, recording recovery for {component_id}")
+                await self.streaming_bus.record_component_success(component_id)
+            
+            # Keep existing queue-based approach for backwards compatibility
             if not self.output_queues['circuit_breaker_requests'].full():
                 self.output_queues['circuit_breaker_requests'].put_nowait(request)
             else:
                 logger.warning(f"Circuit breaker queue full, dropping request for {request.stream_name}")
+                
         except Exception as e:
             logger.error(f"Failed to enqueue circuit breaker request: {e}")
     
     async def start(self) -> None:
-        """Start the freshness monitoring agent."""
+        """Start the freshness monitoring agent with streaming bus consumer."""
         self.running = True
-        logger.info("Freshness Agent started")
+        
+        # Register circuit breaker with streaming bus
+        await self.streaming_bus.register_circuit_breaker(
+            component_id=self.component_id,
+            failure_threshold=5,  # More tolerant for monitoring component
+            recovery_timeout_us=self.circuit_breaker_timeout_us,
+            dependency_components=self.circuit_breaker_dependencies
+        )
+        
+        # Subscribe to raw data topics to monitor freshness
+        raw_data_topics = [
+            "raw_data.exchange_feed",
+            "raw_data.options_chain", 
+            "raw_data.onchain_events",
+            "raw_data.offchain_events",
+            "raw_data.market.trades",
+            "raw_data.market.book",
+            "raw_data.market.funding",
+            "raw_data.market.oi",
+            "raw_data.onchain.blocks",
+            "raw_data.onchain.mempool"
+        ]
+        
+        # Start consumer to track message timestamps (sync handler for compatibility)
+        await self.streaming_bus.subscribe_with_worker_pool(
+            consumer_group="freshness-monitor",
+            topics=raw_data_topics,
+            handler=self._handle_data_update_sync,
+            pool_size=4  # Lightweight processing
+        )
+        
+        logger.info("Freshness Agent started with streaming bus consumer")
         
         # Start background monitoring task
         asyncio.create_task(self._monitoring_loop())
     
+    def _handle_data_update_sync(self, topic: str, partition_key: str, payload: Dict[str, Any], headers: Dict[str, str]) -> None:
+        """Synchronous handler for incoming data updates to track freshness."""
+        try:
+            # Extract timestamp from payload or use current time
+            timestamp_us = payload.get('timestamp_utc_us') or payload.get('timestamp') or int(time.time() * 1_000_000)
+            
+            # Convert to microseconds if needed
+            if isinstance(timestamp_us, str):
+                try:
+                    timestamp_us = int(timestamp_us)
+                except ValueError:
+                    timestamp_us = int(time.time() * 1_000_000)
+            
+            # Handle different timestamp units
+            if timestamp_us < 1e12:  # Likely seconds
+                timestamp_us = timestamp_us * 1_000_000
+            elif timestamp_us < 1e15:  # Likely milliseconds 
+                timestamp_us = timestamp_us * 1_000
+            
+            # Map topic to stream name for freshness tracking
+            stream_name = self._map_topic_to_stream(topic, payload, headers)
+            if stream_name:
+                self.record_data_update(stream_name, timestamp_us)
+                
+        except Exception as e:
+            logger.error(f"Error tracking freshness for {topic}: {e}")
+    
+    def _map_topic_to_stream(self, topic: str, payload: Dict[str, Any], headers: Dict[str, str]) -> Optional[str]:
+        """Map Kafka topic to stream name for freshness tracking."""
+        # Base stream name from topic
+        if topic == "raw_data.exchange_feed":
+            # Use venue from headers for granular tracking
+            venue = headers.get("venue") or payload.get("venue", "unknown")
+            return f"exchange_feed_{venue}"
+        elif topic == "raw_data.options_chain":
+            venue = headers.get("venue") or payload.get("venue", "unknown") 
+            return f"options_chain_{venue}"
+        elif topic == "raw_data.onchain_events":
+            chain = headers.get("chain") or payload.get("chain", "unknown")
+            return f"onchain_events_{chain}"
+        elif topic == "raw_data.market.trades":
+            venue = headers.get("venue") or payload.get("venue", "unknown")
+            return f"market_trades_{venue}"
+        elif topic == "raw_data.market.book":
+            venue = headers.get("venue") or payload.get("venue", "unknown")
+            return f"market_book_{venue}"
+        elif topic == "raw_data.market.funding":
+            venue = headers.get("venue") or payload.get("venue", "unknown")
+            return f"market_funding_{venue}"
+        elif topic == "raw_data.market.oi":
+            venue = headers.get("venue") or payload.get("venue", "unknown")
+            return f"market_oi_{venue}"
+        elif topic == "raw_data.onchain.blocks":
+            chain = headers.get("chain") or payload.get("chain", "unknown")
+            return f"onchain_blocks_{chain}"
+        elif topic == "raw_data.onchain.mempool":
+            chain = headers.get("chain") or payload.get("chain", "unknown")
+            return f"onchain_mempool_{chain}"
+        else:
+            # Fallback to topic name
+            return topic.replace("raw_data.", "").replace(".", "_")
+    
     async def stop(self) -> None:
         """Stop the freshness monitoring agent."""
         self.running = False
+        
+        # Stop streaming bus
+        await self.streaming_bus.graceful_shutdown()
+        
         logger.info("Freshness Agent stopped")
     
     async def _monitoring_loop(self) -> None:

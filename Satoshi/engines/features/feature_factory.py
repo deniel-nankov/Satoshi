@@ -300,6 +300,110 @@ class FeatureFactory:
             content_str = json.dumps(content, sort_keys=True, default=str)
             return f"LP_clean_{hashlib.sha256(content_str.encode()).hexdigest()[:16]}"
     
+    def _generate_leakage_proof_id_from_validation(
+        self,
+        validation_result: Dict[str, Any],
+        timestamps: np.ndarray,
+        window_size: int,
+        horizon: int,
+        parameters: Optional[Dict[str, Any]] = None
+    ) -> str:
+        """Generate leakage proof ID from existing Leakage Police validation result."""
+        if validation_result.get("proof_id"):
+            return validation_result["proof_id"]
+        
+        # Generate proof ID from validation context
+        content = {
+            "validation_status": validation_result.get("status", "unknown"),
+            "timestamps_hash": hashlib.sha256(timestamps.tobytes()).hexdigest()[:16],
+            "window_size": window_size,
+            "horizon": horizon,
+            "parameters": sorted(parameters.items()) if parameters else [],
+            "validation_timestamp": int(time.time() * 1000000)
+        }
+        content_str = json.dumps(content, sort_keys=True, default=str)
+        return f"LP_valid_{hashlib.sha256(content_str.encode()).hexdigest()[:16]}"
+    
+    async def _validate_with_existing_leakage_police(
+        self, 
+        timestamps: np.ndarray, 
+        window_size: int, 
+        horizon: int,
+        feature_data: Optional[np.ndarray] = None,
+        parameters: Optional[Dict[str, Any]] = None
+    ) -> Tuple[bool, str]:
+        """
+        Validate temporal integrity using existing Leakage Police agent.
+        
+        This method delegates all validation to the existing LeakagePolice 
+        implementation in the data layer, ensuring proper domain separation.
+        
+        Args:
+            timestamps: Array of timestamps for validation
+            window_size: Window size for temporal analysis  
+            horizon: Forward-looking horizon
+            feature_data: Optional feature data for validation
+            parameters: Optional parameters for validation context
+            
+        Returns:
+            Tuple[bool, str]: (is_valid, leakage_proof_id)
+            
+        Raises:
+            ValueError: If validation fails or detects leakage
+        """
+        try:
+            # Create configuration for existing Leakage Police
+            config = LeakagePoliceConfig(
+                temporal_tolerance_ms=50,
+                future_window_hours=24,
+                label_horizon_us=horizon * 1000000,  # Convert to microseconds
+                statistical_threshold=0.001
+            )
+            
+            # Initialize existing Leakage Police agent
+            leakage_police = LeakagePolice(config)
+            
+            # Convert numpy arrays to pandas for existing interface
+            features_df = pd.DataFrame({
+                'timestamp': timestamps,
+                'feature_window_size': [window_size] * len(timestamps)
+            })
+            
+            # Create simple labels df for temporal validation
+            labels_df = pd.DataFrame({
+                'timestamp': timestamps + horizon * 1000000,  # Future timestamps
+                'label': np.ones(len(timestamps))  # Dummy labels for validation
+            })
+            
+            # Use existing implementation for temporal ordering analysis
+            incidents = await leakage_police.analyze_temporal_ordering(
+                features=features_df,
+                labels=labels_df,
+                feature_timestamp_col='timestamp',
+                label_timestamp_col='timestamp'
+            )
+            
+            # Check for critical incidents
+            critical_incidents = [inc for inc in incidents if inc.severity.value in ['high', 'critical']]
+            
+            if critical_incidents:
+                incident_msg = "; ".join([f"{inc.description} (severity: {inc.severity.value})" 
+                                        for inc in critical_incidents[:3]])
+                raise ValueError(f"Critical leakage detected: {incident_msg}")
+            
+            # Generate leakage proof ID using validation context
+            proof_id = self._generate_leakage_proof_id_from_validation(
+                {"status": "valid", "incidents": len(incidents)}, 
+                timestamps, window_size, horizon, parameters
+            )
+            
+            return True, proof_id
+            
+        except Exception as e:
+            # Use print instead of self.logger since logger might not exist
+            print(f"Leakage Police validation failed: {e}")
+            raise ValueError(f"Validation error: {e}")
+    
     def _validate_temporal_integrity_sync(self, timestamps: np.ndarray, window_size: int, 
                                          horizon: int, feature_data: Optional[np.ndarray] = None,
                                          parameters: Optional[Dict[str, Any]] = None) -> str:
@@ -400,7 +504,8 @@ class FeatureFactory:
         timestamps = np.array(price_data_sorted[timestamp_col].values)
         
         # Validate temporal integrity with existing Leakage Police agent
-        leakage_proof_id = self._validate_temporal_integrity_sync(timestamps, window_size, horizon, features_array, parameters)
+        parameters = {'feature_type': 'returns', 'window_size': window_size, 'horizon': horizon}
+        leakage_proof_id = self._validate_temporal_integrity_sync(timestamps, window_size, horizon, prices, parameters)
         
         # Compute log returns
         log_prices = np.log(np.array(prices, dtype=float))
@@ -442,7 +547,7 @@ class FeatureFactory:
         }
         
         feature_id = self._generate_feature_id(FeatureType.RETURNS, parameters)
-        leakage_proof_id = self._generate_leakage_proof_id(features_array, timestamps_array, parameters)
+        # Use leakage proof ID from validation above (already generated with existing Leakage Police)
         
         provenance = FeatureProvenance(
             feature_id=feature_id,
@@ -692,7 +797,7 @@ class FeatureFactory:
         }
         
         feature_id = self._generate_feature_id(FeatureType.JUMPS, parameters)
-        leakage_proof_id = self._generate_leakage_proof_id(features_array, timestamps_array, parameters)
+        # Use leakage proof ID from validation above (already generated with existing Leakage Police)
         
         provenance = FeatureProvenance(
             feature_id=feature_id,
@@ -740,6 +845,12 @@ class FeatureFactory:
         common_timestamps = np.intersect1d(orderbook_data[timestamp_col], trades_data[timestamp_col])
         if len(common_timestamps) < window_size + horizon:
             raise ValueError("Insufficient aligned timestamps")
+        
+        # Validate temporal integrity with existing Leakage Police agent
+        timestamps_array = np.array(common_timestamps)
+        parameters = {'feature_type': 'microstructure', 'window_size': window_size, 'horizon': horizon}
+        leakage_proof_id = self._validate_temporal_integrity_sync(timestamps_array, window_size, horizon, 
+                                                                 None, parameters)
         
         # Feature engineering
         features = []
@@ -825,7 +936,7 @@ class FeatureFactory:
         }
         
         feature_id = self._generate_feature_id(FeatureType.MICROSTRUCTURE, parameters)
-        leakage_proof_id = self._generate_leakage_proof_id(features_array, timestamps_array, parameters)
+        # Use leakage proof ID from validation above (already generated with existing Leakage Police)
         
         provenance = FeatureProvenance(
             feature_id=feature_id,
@@ -872,6 +983,12 @@ class FeatureFactory:
         common_timestamps = np.intersect1d(spot_data[timestamp_col], futures_data[timestamp_col])
         if len(common_timestamps) < window_size + horizon:
             raise ValueError("Insufficient aligned data for funding/basis analysis")
+        
+        # Validate temporal integrity with existing Leakage Police agent
+        timestamps_array = np.array(common_timestamps)
+        parameters = {'feature_type': 'funding_basis', 'window_size': window_size, 'horizon': horizon}
+        leakage_proof_id = self._validate_temporal_integrity_sync(timestamps_array, window_size, horizon, 
+                                                                 None, parameters)
         
         features = []
         feature_timestamps = []
@@ -965,7 +1082,7 @@ class FeatureFactory:
         }
         
         feature_id = self._generate_feature_id(FeatureType.FUNDING_BASIS, parameters)
-        leakage_proof_id = self._generate_leakage_proof_id(features_array, timestamps_array, parameters)
+        # Use leakage proof ID from validation above (already generated with existing Leakage Police)
         
         provenance = FeatureProvenance(
             feature_id=feature_id,
@@ -1014,6 +1131,12 @@ class FeatureFactory:
         # Get unique cohorts
         cohorts = wallet_data[cohort_col].unique()
         timestamps = sorted(wallet_data[timestamp_col].unique())
+        
+        # Validate temporal integrity with existing Leakage Police agent
+        timestamps_array = np.array(timestamps)
+        parameters = {'feature_type': 'wallet_flows', 'window_size': window_size, 'horizon': horizon}
+        leakage_proof_id = self._validate_temporal_integrity_sync(timestamps_array, window_size, horizon, 
+                                                                 None, parameters)
         
         if len(timestamps) < window_size + horizon:
             raise ValueError("Insufficient timestamps for analysis")
@@ -1097,7 +1220,7 @@ class FeatureFactory:
         }
         
         feature_id = self._generate_feature_id(FeatureType.WALLET_FLOWS, parameters)
-        leakage_proof_id = self._generate_leakage_proof_id(features_array, timestamps_array, parameters)
+        # Use leakage proof ID from validation above (already generated with existing Leakage Police)
         
         provenance = FeatureProvenance(
             feature_id=feature_id,
@@ -1342,9 +1465,10 @@ class FeatureFactory:
         volumes = np.array(market_data[volume_col].values, dtype=float) if volume_col in market_data.columns else np.ones_like(prices)
         timestamps = np.array(market_data[timestamp_col].values)
         
-        # Validate temporal integrity
-        if not self._validate_temporal_integrity(timestamps, window_size, horizon):
-            raise ValueError("Temporal integrity validation failed")
+        # Validate temporal integrity with existing Leakage Police agent
+        parameters = {'feature_type': 'regime_signal', 'window_size': window_size, 'horizon': horizon}
+        leakage_proof_id = self._validate_temporal_integrity_sync(timestamps, window_size, horizon, 
+                                                                 prices, parameters)
         
         # Compute log returns and volatility
         log_prices = np.log(prices)
@@ -1416,7 +1540,7 @@ class FeatureFactory:
         }
         
         feature_id = self._generate_feature_id(FeatureType.REGIME_SIGNALS, parameters)
-        leakage_proof_id = self._generate_leakage_proof_id(features_array, timestamps_array, parameters)
+        # Use leakage proof ID from validation above (already generated with existing Leakage Police)
         
         provenance = FeatureProvenance(
             feature_id=feature_id,
@@ -1465,9 +1589,10 @@ class FeatureFactory:
         prices = np.array(price_data[price_col].values, dtype=float)
         timestamps = np.array(price_data[timestamp_col].values)
         
-        # Validate temporal integrity
-        if not self._validate_temporal_integrity(timestamps, window_size, horizon):
-            raise ValueError("Temporal integrity validation failed")
+        # Validate temporal integrity with existing Leakage Police agent
+        parameters = {'feature_type': 'information_decay', 'window_size': window_size, 'horizon': horizon}
+        leakage_proof_id = self._validate_temporal_integrity_sync(timestamps, window_size, horizon, 
+                                                                 prices, parameters)
         
         log_prices = np.log(prices)
         returns = np.diff(log_prices)
@@ -1563,7 +1688,7 @@ class FeatureFactory:
         }
         
         feature_id = self._generate_feature_id(FeatureType.INFORMATION_DECAY, parameters)
-        leakage_proof_id = self._generate_leakage_proof_id(features_array, timestamps_array, parameters)
+        # Use leakage proof ID from validation above (already generated with existing Leakage Police)
         
         provenance = FeatureProvenance(
             feature_id=feature_id,

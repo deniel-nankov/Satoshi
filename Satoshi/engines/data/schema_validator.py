@@ -18,6 +18,9 @@ from datetime import datetime, timezone
 import difflib
 import hashlib
 
+# Streaming Bus Integration
+from infra.bus.streaming_bus import StreamingBus
+
 logger = logging.getLogger(__name__)
 
 
@@ -204,6 +207,14 @@ class SchemaValidatorAgent:
         self.reference_data: Dict[str, Dict[str, Set[Any]]] = {}  # table -> field -> values
         self.running = False
         self._semantic_patterns: Dict[str, Pattern[str]] = {}  # Will be initialized below
+        
+        # Streaming Bus Integration
+        streaming_config = self.config.get("streaming_bus", {
+            "bootstrap_servers": "localhost:9092",
+            "enable_ssl": False,
+            "enable_sasl": False
+        })
+        self.streaming_bus = StreamingBus(streaming_config)
         
         # Strict mode disables all coercion
         self.strict_mode = config.get('strict_mode', False)
@@ -1393,6 +1404,55 @@ class SchemaValidatorAgent:
             first_error_examples=first_error_examples
         )
         
+        # Streaming Bus: Publish validation summary to clean.pass_fail
+        try:
+            validation_result = {
+                "table_name": table_name,
+                "timestamp": int(time.time() * 1_000_000),  # Current time in microseconds
+                "total_rows": summary.total_rows,
+                "passed_rows": summary.passed_rows,
+                "failed_rows": summary.failed_rows,
+                "coerced_rows": summary.coerced_rows,
+                "pass_rate": summary.passed_rows / summary.total_rows if summary.total_rows > 0 else 0,
+                "violations_by_type": summary.violations_by_type,
+                "fields_with_most_violations": summary.fields_with_most_violations,
+                "result": "PASS" if summary.failed_rows == 0 else "FAIL"
+            }
+            
+            # Use table name as partition key for schema locality
+            partition_key = f"schema_validation_{table_name}"
+            
+            await self.streaming_bus.publish_with_headers(
+                topic="clean.pass_fail",
+                partition_key=partition_key,
+                payload=validation_result,
+                headers={"data_type": "validation_summary", "table": table_name}
+            )
+            
+            # Also publish individual violations to incidents.SchemaViolation
+            for violation in violations[:100]:  # Limit to first 100 violations
+                violation_data = {
+                    "table_name": table_name,
+                    "timestamp": violation.timestamp_utc_us,
+                    "row_id": violation.row_identifier,
+                    "field_name": violation.field_name,
+                    "violation_type": violation.violation_type,
+                    "message": violation.expected_hint or violation.reference_info or f"Expected {violation.expected}",
+                    "invalid_value": str(violation.actual or violation.coerced_value)[:1000] if (violation.actual is not None or violation.coerced_value is not None) else None,
+                    "expected_type": violation.expected,
+                    "severity": violation.severity.upper()
+                }
+                
+                await self.streaming_bus.publish_with_headers(
+                    topic="incidents.SchemaViolation",
+                    partition_key=partition_key,
+                    payload=violation_data,
+                    headers={"data_type": "schema_violation", "table": table_name}
+                )
+                
+        except Exception as e:
+            logger.warning(f"Failed to publish validation results to streaming bus: {e}")
+        
         return summary
     
     def _check_unique_constraints(self, schema: TableSchema, row: Dict[str, Any], row_id: str, 
@@ -1567,13 +1627,204 @@ class SchemaValidatorAgent:
         return violations
     
     async def start(self):
-        """Start the schema validator agent."""
+        """Start the schema validator agent with streaming bus consumer."""
         self.running = True
-        logger.info("Schema Validator Agent started")
+        
+        # Subscribe to raw data topics for validation
+        raw_data_topics = [
+            "raw_data.exchange_feed",
+            "raw_data.options_chain", 
+            "raw_data.onchain_events",
+            "raw_data.offchain_events",
+            "raw_data.market.trades",
+            "raw_data.market.book",
+            "raw_data.market.funding",
+            "raw_data.market.oi",
+            "raw_data.onchain.blocks",
+            "raw_data.onchain.mempool"
+        ]
+        
+        # Start consumer with worker pool for parallel processing
+        await self.streaming_bus.subscribe_with_worker_pool(
+            consumer_group="schema-validator",
+            topics=raw_data_topics,
+            handler=self._handle_raw_message_sync,
+            pool_size=8  # Process validation in parallel
+        )
+        
+        logger.info("Schema Validator Agent started with streaming bus consumer")
+    
+    def _handle_raw_message_sync(self, topic: str, partition_key: str, payload: Dict[str, Any], headers: Dict[str, str]) -> None:
+        """Synchronous handler for incoming raw data messages for validation."""
+        try:
+            # Extract table name from topic
+            table_name = self._extract_table_name_from_topic(topic)
+            if not table_name or table_name not in self.schemas:
+                # Skip topics we don't have schemas for
+                return
+            
+            # Generate row identifier from payload and headers
+            row_id = headers.get("record_id", f"{topic}_{partition_key}_{int(time.time_ns())}")
+            
+            # Schedule async validation (avoid asyncio.run in potential async context)
+            if not hasattr(self, '_pending_tasks'):
+                self._pending_tasks = []
+            validation_task = asyncio.create_task(self._async_validate_and_publish(table_name, payload, row_id, headers))
+            self._pending_tasks.append(validation_task)
+            
+        except Exception as e:
+            logger.exception(f"Error validating message from {topic}: {e}")
+            
+            # Schedule async error publishing and store task
+            if not hasattr(self, '_pending_tasks'):
+                self._pending_tasks = []
+            task = asyncio.create_task(self._publish_validation_error(topic, payload, str(e), headers))
+            self._pending_tasks.append(task)
+    
+    async def _async_validate_and_publish(self, table_name: str, payload: Dict[str, Any], row_id: str, headers: Dict[str, str]) -> None:
+        """Async helper to validate a row and publish results."""
+        try:
+            cleaned_row, violations, flags = await self.validate_row(table_name, payload, row_id)
+            await self._publish_validation_results(table_name, payload, cleaned_row, violations, flags, headers)
+        except Exception:
+            logger.exception(f"Error in async validation and publishing for table {table_name}")
+    
+    def _extract_table_name_from_topic(self, topic: str) -> Optional[str]:
+        """Extract logical table name from Kafka topic."""
+        # Map Kafka topics to logical table names
+        topic_mapping = {
+            "raw_data.exchange_feed": "exchange_trades",
+            "raw_data.options_chain": "options_surface",
+            "raw_data.onchain_events": "onchain_flows",
+            "raw_data.offchain_events": "offchain_events",
+            "raw_data.market.trades": "market_trades",
+            "raw_data.market.book": "market_book",
+            "raw_data.market.funding": "market_funding",
+            "raw_data.market.oi": "market_oi",
+            "raw_data.onchain.blocks": "onchain_blocks",
+            "raw_data.onchain.mempool": "onchain_mempool"
+        }
+        
+        return topic_mapping.get(topic)
+    
+    async def _publish_validation_results(self, table_name: str, original_payload: Dict[str, Any], 
+                                         cleaned_row: Dict[str, Any], violations: List[SchemaViolation], 
+                                         flags: ValidationFlags, headers: Dict[str, str]) -> None:
+        """Publish validation results to streaming bus."""
+        
+        # Determine validation status
+        has_errors = any(v.severity == "error" for v in violations)
+        has_coercions = any(v.violation_type.endswith("_coerced") for v in violations)
+        
+        if has_errors:
+            status = "FAIL"
+        elif has_coercions:
+            status = "COERCED"
+        else:
+            status = "PASS"
+        
+        # Create validation summary
+        validation_result = {
+            "table_name": table_name,
+            "row_id": violations[0].row_identifier if violations else headers.get("record_id", "unknown"),
+            "timestamp": int(time.time() * 1_000_000),
+            "status": status,
+            "total_violations": len(violations),
+            "error_violations": len([v for v in violations if v.severity == "error"]),
+            "warning_violations": len([v for v in violations if v.severity == "warning"]),
+            "coercion_count": len([v for v in violations if v.violation_type.endswith("_coerced")]),
+            "validation_flags": {
+                "had_pattern_error": flags.had_pattern_error,
+                "had_range_error": flags.had_range_error,
+                "had_type_error": flags.had_type_error,
+                "had_null_error": flags.had_null_error,
+                "had_foreign_key_error": flags.had_foreign_key_error,
+                "had_unique_constraint_error": flags.had_unique_constraint_error,
+                "had_coercion": flags.had_coercion
+            }
+        }
+        
+        # Publish to clean.pass_fail topic
+        partition_key = f"schema_validation_{table_name}"
+        await self.streaming_bus.publish_with_headers(
+            topic="clean.pass_fail",
+            partition_key=partition_key,
+            payload=validation_result,
+            headers={
+                "data_type": "validation_result", 
+                "table": table_name,
+                "status": status,
+                "original_topic": headers.get("original_topic", "unknown")
+            },
+            dedupe_key=f"{table_name}_{validation_result['row_id']}_{validation_result['timestamp']}"
+        )
+        
+        # Publish individual schema violations to incidents
+        for violation in violations[:20]:  # Limit to first 20 violations per message
+            if violation.severity == "error":  # Only publish errors as incidents
+                violation_data = {
+                    "incident_id": f"schema_{violation.table_name}_{violation.row_identifier}_{violation.field_name}_{int(time.time_ns())}",
+                    "table_name": violation.table_name,
+                    "field_name": violation.field_name,
+                    "violation_type": violation.violation_type,
+                    "expected": violation.expected,
+                    "actual": violation.actual,
+                    "row_identifier": violation.row_identifier,
+                    "severity": violation.severity.upper(),
+                    "timestamp": violation.timestamp_utc_us,
+                    "expected_hint": violation.expected_hint,
+                    "reference_info": violation.reference_info,
+                    "coerced_value": str(violation.coerced_value) if violation.coerced_value is not None else None
+                }
+                
+                await self.streaming_bus.publish_with_headers(
+                    topic="incidents.SchemaViolation",
+                    partition_key=partition_key,
+                    payload=violation_data,
+                    headers={
+                        "data_type": "schema_violation", 
+                        "table": table_name,
+                        "severity": violation.severity.upper(),
+                        "violation_type": violation.violation_type
+                    },
+                    dedupe_key=f"schema_{violation.table_name}_{violation.row_identifier}_{violation.field_name}_{violation.violation_type}"
+                )
+    
+    async def _publish_validation_error(self, topic: str, payload: Dict[str, Any], error_message: str, headers: Dict[str, str]) -> None:
+        """Publish validation processing errors as incidents."""
+        error_data = {
+            "incident_id": f"schema_error_{topic}_{int(time.time_ns())}",
+            "table_name": topic,
+            "field_name": None,
+            "violation_type": "validation_processing_error",
+            "expected": "successful schema validation",
+            "actual": f"validation failed: {error_message}",
+            "row_identifier": headers.get("record_id", "unknown"),
+            "severity": "ERROR",
+            "timestamp": int(time.time() * 1_000_000),
+            "payload_size": len(str(payload)),
+            "error_details": error_message[:500]  # Truncate long error messages
+        }
+        
+        await self.streaming_bus.publish_with_headers(
+            topic="incidents.SchemaViolation",
+            partition_key=f"schema_error_{topic}",
+            payload=error_data,
+            headers={
+                "data_type": "schema_processing_error", 
+                "source_topic": topic,
+                "severity": "ERROR"
+            },
+            dedupe_key=f"schema_error_{topic}_{headers.get('record_id', int(time.time_ns()))}"
+        )
     
     async def stop(self):
         """Stop the schema validator agent."""
         self.running = False
+        
+        # Stop streaming bus
+        await self.streaming_bus.graceful_shutdown()
+        
         logger.info("Schema Validator Agent stopped")
 
 

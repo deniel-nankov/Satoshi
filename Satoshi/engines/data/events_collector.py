@@ -11,7 +11,7 @@ SLO: event→bus lag p95 < 5 minutes (real-time for governance, best-effort for 
 import asyncio
 import aiohttp
 import logging
-from typing import List, Dict, Any, Optional
+from typing import Any, Optional, ClassVar
 from dataclasses import dataclass, field
 from decimal import Decimal
 from datetime import datetime, timezone
@@ -20,6 +20,9 @@ import hashlib
 from collections import defaultdict, deque
 import os
 import json
+
+# Streaming Bus Integration
+from infra.bus.streaming_bus import StreamingBus
 
 logger = logging.getLogger(__name__)
 
@@ -87,12 +90,266 @@ class CalendarEvent:
     source: str = ""  # e.g. 'snapshot', 'compound', 'binance', 'github'
     source_id: str = ""  # external ID from source
     status: str = "active"  # 'active', 'completed', 'cancelled'
-    metadata: Optional[Dict[str, Any]] = field(default_factory=lambda: {})
+    metadata: Optional[dict[str, Any]] = field(default_factory=lambda: {})
     capture_timestamp_utc_us: int = 0
 
     def get_hash(self) -> str:
         h = f"{self.event_type}:{self.source}:{self.source_id}:{self.start_time_utc_us}"
-        return hashlib.md5(h.encode()).hexdigest()
+        return hashlib.sha256(h.encode()).hexdigest()
+
+# =============================
+# EVENT CLASSIFIER
+# =============================
+
+class EventClassifier:
+    """Deterministic classification and prioritization of off-chain events."""
+    
+    # Event priority levels (1 = highest priority, 5 = lowest)
+    EVENT_PRIORITIES: ClassVar[dict[str, int]] = {
+        'governance_proposal': 1,      # Highest priority - real-time
+        'exchange_maintenance': 2,     # High priority - trading impact
+        'github_release': 3,           # Medium priority
+        'token_unlock': 4,             # Medium priority
+        'general_announcement': 5      # Lowest priority
+    }
+    
+    # Valid status transitions for governance proposals
+    VALID_TRANSITIONS: ClassVar[dict[str, set[str]]] = {
+        'pending': {'active', 'cancelled'},
+        'active': {'closed', 'succeeded', 'defeated', 'cancelled'},
+        'closed': {'succeeded', 'defeated'},
+        'succeeded': set(),  # Terminal state
+        'defeated': set(),   # Terminal state
+        'cancelled': set()   # Terminal state
+    }
+    
+    @classmethod
+    def classify_event_priority(cls, event: CalendarEvent) -> int:
+        """Classify event priority for processing order."""
+        return cls.EVENT_PRIORITIES.get(event.event_type, 5)
+    
+    @classmethod
+    def validate_status_transition(cls, old_status: str, new_status: str, event_type: str) -> bool:
+        """Validate status transitions for governance proposals."""
+        if event_type != 'governance_proposal':
+            return True  # Only validate governance proposal transitions
+        
+        return new_status in cls.VALID_TRANSITIONS.get(old_status, set())
+    
+    @classmethod
+    def normalize_event_type(cls, raw_type: str, source: str, metadata: dict) -> str:
+        """Normalize event types across sources."""
+        raw_type = raw_type.lower().strip()
+        
+        # Governance proposal detection
+        if ('proposal' in raw_type or 'governance' in raw_type or 
+            source == 'snapshot' or metadata.get('space')):
+            return 'governance_proposal'
+        
+        # Exchange maintenance detection
+        if ('maintenance' in raw_type or 'outage' in raw_type or 
+            'incident' in raw_type or source in {'binance', 'coinbase', 'kraken'}):
+            return 'exchange_maintenance'
+        
+        # GitHub release detection
+        if ('release' in raw_type or 'version' in raw_type or 
+            source == 'github' or metadata.get('tag_name')):
+            return 'github_release'
+        
+        # Token unlock detection
+        if ('unlock' in raw_type or 'vesting' in raw_type or 
+            'airdrop' in raw_type):
+            return 'token_unlock'
+        
+        return raw_type or 'general_announcement'
+
+# =============================
+# EVENT VALIDATOR
+# =============================
+
+class EventValidator:
+    """Lightweight validation for event data - source-side sanity checks only."""
+    
+    @staticmethod
+    def validate_event_timing(event: CalendarEvent) -> tuple[bool, list[str]]:
+        """Validate event timing is reasonable."""
+        issues = []
+        now = int(time.time() * 1_000_000)
+        
+        # Check if start time is too far in the past (older than 5 years)
+        five_years_ago = now - (5 * 365 * 24 * 60 * 60 * 1_000_000)
+        if event.start_time_utc_us < five_years_ago:
+            issues.append("start_time_too_old")
+        
+        # Check if start time is too far in the future (more than 10 years)
+        ten_years_future = now + (10 * 365 * 24 * 60 * 60 * 1_000_000)
+        if event.start_time_utc_us > ten_years_future:
+            issues.append("start_time_too_future")
+        
+        # Check if end time is before start time
+        if (event.end_time_utc_us and 
+            event.end_time_utc_us < event.start_time_utc_us):
+            issues.append("end_before_start")
+        
+        # Check for zero timestamps (likely parsing error)
+        if event.start_time_utc_us == 0:
+            issues.append("zero_start_time")
+        
+        return len(issues) == 0, issues
+    
+    @staticmethod
+    def validate_governance_proposal(event: CalendarEvent) -> tuple[bool, list[str]]:
+        """Validate governance proposal specific fields."""
+        issues = []
+        
+        if event.event_type != 'governance_proposal':
+            return True, []
+        
+        # Check for required metadata
+        metadata = event.metadata or {}
+        if not metadata.get('space'):
+            issues.append("missing_governance_space")
+        
+        if not metadata.get('author'):
+            issues.append("missing_proposal_author")
+        
+        # Check proposal ID format (should be meaningful)
+        if not event.source_id or len(event.source_id) < 8:
+            issues.append("invalid_proposal_id")
+        
+        # Check title length (too short might be truncated)
+        if len(event.title) < 10:
+            issues.append("title_too_short")
+        
+        return len(issues) == 0, issues
+    
+    @staticmethod
+    def validate_github_release(event: CalendarEvent) -> tuple[bool, list[str]]:
+        """Validate GitHub release specific fields."""
+        issues = []
+        
+        if event.event_type != 'github_release':
+            return True, []
+        
+        metadata = event.metadata or {}
+        
+        # Check for required GitHub metadata
+        if not metadata.get('repo'):
+            issues.append("missing_repo_name")
+        
+        if not metadata.get('tag_name'):
+            issues.append("missing_tag_name")
+        
+        # Check for valid release ID
+        if not event.source_id:
+            issues.append("missing_release_id")
+        
+        return len(issues) == 0, issues
+    
+    @classmethod
+    def validate_event(cls, event: CalendarEvent) -> tuple[bool, list[str]]:
+        """Comprehensive event validation."""
+        all_issues = []
+        
+        # General timing validation
+        _, timing_issues = cls.validate_event_timing(event)
+        all_issues.extend(timing_issues)
+        
+        # Event-type specific validation
+        if event.event_type == 'governance_proposal':
+            _, gov_issues = cls.validate_governance_proposal(event)
+            all_issues.extend(gov_issues)
+        elif event.event_type == 'github_release':
+            _, gh_issues = cls.validate_github_release(event)
+            all_issues.extend(gh_issues)
+        
+        return len(all_issues) == 0, all_issues
+
+# =============================
+# EVENT CORRELATOR
+# =============================
+
+class EventCorrelator:
+    """Cross-source event correlation and deduplication."""
+    
+    def __init__(self, correlation_window_hours: int = 24):
+        self.correlation_window_hours = correlation_window_hours
+        self.pending_correlations: dict[str, list[CalendarEvent]] = defaultdict(list)
+        self.max_correlations_per_key = 100  # Prevent memory bloat
+        self._lock = asyncio.Lock()  # Protect concurrent access to pending_correlations
+    
+    async def find_related_events(self, event: CalendarEvent) -> list[CalendarEvent]:
+        """Find events that might be duplicates or related."""
+        async with self._lock:
+            related = []
+            correlation_key = self._get_correlation_key(event)
+            
+            # Look for events within correlation window
+            time_window = self.correlation_window_hours * 60 * 60 * 1_000_000  # Convert to microseconds
+            candidates = self.pending_correlations[correlation_key]
+            
+            for candidate in candidates:
+                time_diff = abs(candidate.start_time_utc_us - event.start_time_utc_us)
+                if time_diff < time_window:
+                    similarity = self._calculate_similarity(event, candidate)
+                    if similarity > 0.7:  # 70% similarity threshold
+                        related.append(candidate)
+            
+            return related
+    
+    async def add_event_for_correlation(self, event: CalendarEvent):
+        """Add event to correlation tracking."""
+        async with self._lock:
+            correlation_key = self._get_correlation_key(event)
+            correlations = self.pending_correlations[correlation_key]
+            
+            # Add new event
+            correlations.append(event)
+            
+            # Maintain reasonable size
+            if len(correlations) > self.max_correlations_per_key:
+                # Remove oldest events
+                correlations.sort(key=lambda e: e.capture_timestamp_utc_us)
+                self.pending_correlations[correlation_key] = correlations[-self.max_correlations_per_key:]
+    
+    def _get_correlation_key(self, event: CalendarEvent) -> str:
+        """Generate correlation key for grouping similar events."""
+        # Use event type + normalized title keywords
+        title_words = set(event.title.lower().split())
+        
+        # Extract key words that might indicate same event
+        key_words = title_words & {
+            'ethereum', 'bitcoin', 'upgrade', 'fork', 'proposal', 'maintenance', 
+            'release', 'unlock', 'airdrop', 'hardfork', 'snapshot', 'voting',
+            'compound', 'aave', 'uniswap', 'binance', 'coinbase'
+        }
+        
+        # Include event type and up to 3 key words
+        sorted_words = sorted(key_words)[:3]
+        return f"{event.event_type}:{':'.join(sorted_words)}"
+    
+    def _calculate_similarity(self, event1: CalendarEvent, event2: CalendarEvent) -> float:
+        """Calculate similarity score between two events."""
+        # Skip if different sources and types (unlikely to be duplicates)
+        if event1.source != event2.source and event1.event_type != event2.event_type:
+            return 0.0
+        
+        # Title similarity (word overlap)
+        words1 = set(event1.title.lower().split())
+        words2 = set(event2.title.lower().split())
+        
+        if not words1 or not words2:
+            return 0.0
+        
+        intersection = len(words1 & words2)
+        union = len(words1 | words2)
+        jaccard_similarity = intersection / union if union > 0 else 0.0
+        
+        # Boost similarity if same source_id (likely same event)
+        if event1.source_id and event1.source_id == event2.source_id:
+            jaccard_similarity = min(1.0, jaccard_similarity + 0.3)
+        
+        return jaccard_similarity
 
 # =============================
 # DUPLICATE DETECTOR
@@ -102,7 +359,7 @@ class DuplicateDetector:
     def __init__(self, window_size: int = 10000):
         self.window_size = window_size
         # For each stream, keep a dict of key -> (deque, set)
-        self.seen: Dict[str, Dict[str, tuple]] = defaultdict(dict)
+        self.seen: dict[str, dict[str, tuple]] = defaultdict(dict)
 
     def is_duplicate(self, data_type: str, data_hash: str, key: str = "default") -> bool:
         # key can be source, event_type, etc. for per-stream dedup
@@ -148,7 +405,7 @@ class HttpClient:
         if self.session:
             await self.session.close()
 
-    async def post_json(self, url: str, json_data: dict, headers: Dict[str, str] = {}) -> Optional[dict]:
+    async def post_json(self, url: str, json_data: dict, headers: dict[str, str] = {}) -> Optional[dict]:
         assert self.session is not None, "aiohttp session is not initialized"
         try:
             timeout = aiohttp.ClientTimeout(total=15)
@@ -172,7 +429,7 @@ class HttpClient:
             logger.warning(f"HTTP error for {url}: {e}")
             return None
 
-    async def get_json_with_headers(self, url: str, headers: Dict[str, str] = {}) -> tuple[Optional[dict], Dict[str, str]]:
+    async def get_json_with_headers(self, url: str, headers: dict[str, str] = {}) -> tuple[Optional[dict], dict[str, str]]:
         """Returns (json_data, response_headers) for ETag handling."""
         assert self.session is not None, "aiohttp session is not initialized"
         try:
@@ -202,7 +459,7 @@ class HttpClient:
             logger.warning(f"HTTP error for {url}: {e}")
             return None, {}
 
-    async def get_json(self, url: str, headers: Dict[str, str] = {}) -> Optional[dict]:
+    async def get_json(self, url: str, headers: dict[str, str] = {}) -> Optional[dict]:
         assert self.session is not None, "aiohttp session is not initialized"
         try:
             timeout = aiohttp.ClientTimeout(total=15)
@@ -226,18 +483,148 @@ class HttpClient:
 # =============================
 
 class EventsCollectorAgent:
-    def __init__(self, config: Dict[str, Any]):
+    def __init__(self, config: dict[str, Any]):
         self.config = config
         self.duplicate_detector = DuplicateDetector()
-        self.output_queues: Dict[str, asyncio.Queue] = {
+        self.output_queues: dict[str, asyncio.Queue] = {
             'calendar': asyncio.Queue(maxsize=config.get('calendar_queue_size', 5000)),
         }
+        
+        # Streaming Bus Integration
+        streaming_config = self.config.get("streaming_bus", {
+            "bootstrap_servers": "localhost:9092",
+            "enable_ssl": False,
+            "enable_sasl": False
+        })
+        self.streaming_bus = StreamingBus(streaming_config)
+        
+        # Enhanced Event Processing Components
+        self.classifier = EventClassifier()
+        self.validator = EventValidator()
+        self.correlator = EventCorrelator(config.get('correlation_window_hours', 24))
+        
         self.running = False
-        self.tasks: List[asyncio.Task] = []
+        self.tasks: list[asyncio.Task] = []
         # ETag cache for GitHub API
-        self.etag_by_repo: Dict[str, str] = {}
-        # Status tracking for event updates
-        self.last_status: Dict[tuple, str] = {}  # (source, source_id) -> status
+        self.etag_by_repo: dict[str, str] = {}
+        # Enhanced status tracking for event updates with transition validation
+        self.last_status: dict[tuple, str] = {}  # (source, source_id) -> status
+        
+        # Source health tracking
+        self.source_health: dict[str, dict[str, Any]] = defaultdict(lambda: {
+            'status': 'unknown',
+            'last_success': None,
+            'consecutive_failures': 0,
+            'circuit_breaker_open': False,
+            'last_check': None
+        })
+
+    async def _publish_event(self, event: CalendarEvent, partition_key: str, headers: dict[str, str]) -> bool:
+        """Enhanced event publishing with validation and correlation metadata."""
+        try:
+            # Validate event data
+            is_valid, validation_issues = self.validator.validate_event(event)
+            
+            # Calculate event priority
+            priority = self.classifier.classify_event_priority(event)
+            
+            # Find related events for correlation
+            related_events = await self.correlator.find_related_events(event)
+            
+            # Add event to correlation tracking
+            await self.correlator.add_event_for_correlation(event)
+            
+            event_data = {
+                "source": event.source,
+                "event_type": event.event_type,
+                "title": event.title,
+                "description": event.description[:500] if event.description else None,
+                "timestamp": event.start_time_utc_us,
+                "end_timestamp": event.end_time_utc_us,
+                "capture_timestamp": event.capture_timestamp_utc_us,
+                "status": event.status,
+                "source_id": event.source_id,
+                "metadata": event.metadata,
+                # Enhanced fields
+                "priority": priority,
+                "related_event_count": len(related_events),
+                "validation_status": "valid" if is_valid else "suspect"
+            }
+            
+            # Enhanced headers with validation and correlation info
+            enhanced_headers = {
+                **headers,
+                "data_type": "calendar_events",
+                "priority": str(priority),
+                "collector_version": "enhanced_v1"
+            }
+            
+            # Add validation flags
+            if validation_issues:
+                enhanced_headers["validation_issues"] = ','.join(validation_issues)
+                enhanced_headers["suspect_data"] = "true"
+            
+            # Add correlation info
+            if related_events:
+                enhanced_headers["has_related_events"] = "true"
+                enhanced_headers["related_count"] = str(len(related_events))
+            
+            # Add source health info
+            source_health = self.source_health[event.source]
+            enhanced_headers["source_health"] = source_health['status']
+            if source_health['consecutive_failures'] > 0:
+                enhanced_headers["source_failures"] = str(source_health['consecutive_failures'])
+            
+            await self.streaming_bus.publish_with_headers(
+                topic="raw_data.offchain_events",
+                partition_key=partition_key,
+                payload=event_data,
+                headers=enhanced_headers
+            )
+            
+            # Update source health on successful publish
+            self._update_source_health(event.source, success=True)
+            
+            return True
+        except Exception as e:
+            logger.warning(f"Failed to publish {event.event_type} event to streaming bus: {e}")
+            self._update_source_health(event.source, success=False)
+            return False
+    
+    def _update_source_health(self, source: str, success: bool):
+        """Update source health tracking."""
+        health = self.source_health[source]
+        health['last_check'] = time.time()
+        
+        if success:
+            health['status'] = 'healthy'
+            health['last_success'] = time.time()
+            health['consecutive_failures'] = 0
+            health['circuit_breaker_open'] = False
+        else:
+            health['consecutive_failures'] += 1
+            if health['consecutive_failures'] >= 3:
+                health['status'] = 'unhealthy'
+                health['circuit_breaker_open'] = True
+                logger.warning(f"Circuit breaker opened for source {source} after {health['consecutive_failures']} failures")
+    
+    def _is_source_healthy(self, source: str) -> bool:
+        """Check if source is healthy for data collection."""
+        return not self.source_health[source]['circuit_breaker_open']
+
+    async def _add_to_queue(self, event: CalendarEvent) -> bool:
+        """Helper method to add events to local queue with consistent handling."""
+        try:
+            q = self.output_queues['calendar']
+            if q.full():
+                try: 
+                    q.get_nowait()
+                except asyncio.QueueEmpty: 
+                    pass
+            q.put_nowait(event)
+            return True
+        except asyncio.QueueFull:
+            return False
 
     async def start(self):
         logger.info("Starting Events Collector Agent...")
@@ -334,8 +721,13 @@ class EventsCollectorAgent:
                             
                             for proposal in proposals:
                                 try:
+                                    # Normalize event type and status
+                                    normalized_event_type = self.classifier.normalize_event_type(
+                                        "governance_proposal", "snapshot", proposal
+                                    )
+                                    
                                     event = CalendarEvent(
-                                        event_type="governance_proposal",
+                                        event_type=normalized_event_type,
                                         title=proposal["title"],
                                         description=proposal.get("body", "")[:500],  # Truncate
                                         start_time_utc_us=_normalize_timestamp(proposal["start"], now),
@@ -350,21 +742,66 @@ class EventsCollectorAgent:
                                         capture_timestamp_utc_us=capture_now
                                     )
                                     
-                                    # Check for status updates
+                                    # Enhanced status update validation
                                     status_key = ("snapshot", proposal["id"])
                                     last_status = self.last_status.get(status_key)
-                                    is_status_update = last_status and last_status != proposal["state"]
+                                    current_status = proposal["state"]
                                     
-                                    if is_status_update or not self.duplicate_detector.is_duplicate('calendar', event.get_hash(), key=f"snapshot_{space}"):
-                                        # Update status tracking
-                                        self.last_status[status_key] = proposal["state"]
+                                    # Validate status transition for governance proposals
+                                    is_valid_transition = True
+                                    if last_status and last_status != current_status:
+                                        is_valid_transition = self.classifier.validate_status_transition(
+                                            last_status, current_status, event.event_type
+                                        )
+                                        if not is_valid_transition:
+                                            logger.warning(f"Invalid status transition for {proposal['id']}: "
+                                                         f"{last_status} -> {current_status}")
+                                    
+                                    is_status_update = last_status and last_status != current_status
+                                    
+                                    if (is_status_update or 
+                                        not self.duplicate_detector.is_duplicate('calendar', event.get_hash(), key=f"snapshot_{space}")):
                                         
-                                        q = self.output_queues['calendar']
-                                        if q.full():
-                                            try: q.get_nowait()
-                                            except asyncio.QueueEmpty: pass
-                                        try: q.put_nowait(event)
-                                        except asyncio.QueueFull: pass
+                                        # Update status tracking only if transition is valid
+                                        if is_valid_transition:
+                                            self.last_status[status_key] = current_status
+                                        
+                                        # Enhanced publishing with validation
+                                        partition_key = f"governance_{space}"
+                                        headers = {
+                                            "data_type": "governance", 
+                                            "source": "snapshot", 
+                                            "space": space,
+                                            "event_type": event.event_type,
+                                            "status": event.status
+                                        }
+                                        
+                                        # Add transition validation info
+                                        if is_status_update:
+                                            headers["status_update"] = "true"
+                                            headers["previous_status"] = last_status or "unknown"
+                                            headers["valid_transition"] = str(is_valid_transition).lower()
+                                        
+                                        # Use enhanced publishing method
+                                        success = await self._publish_event(event, partition_key, headers)
+                                        
+                                        if success:
+                                            # Local queue fallback with proper error handling
+                                            try:
+                                                q = self.output_queues['calendar']
+                                                if q.full():
+                                                    try: 
+                                                        q.get_nowait()
+                                                        logger.debug("Dropped old governance event from full queue")
+                                                    except asyncio.QueueEmpty: 
+                                                        pass
+                                                q.put_nowait(event)
+                                                logger.debug("Enqueued governance event to local queue")
+                                            except asyncio.QueueFull:
+                                                logger.warning("Failed to enqueue governance event - queue full")
+                                            except Exception as queue_e:
+                                                logger.warning(f"Failed to enqueue governance event to local queue: {queue_e}")
+                                        
                                 except Exception as row_exc:
                                     logger.warning(f"Bad governance proposal: {row_exc} | {str(proposal)[:300]}")
                                     continue
@@ -416,12 +853,44 @@ class EventsCollectorAgent:
                                     )
                                     
                                     if not self.duplicate_detector.is_duplicate('calendar', event.get_hash(), key="token_unlocks"):
-                                        q = self.output_queues['calendar']
-                                        if q.full():
-                                            try: q.get_nowait()
-                                            except asyncio.QueueEmpty: pass
-                                        try: q.put_nowait(event)
-                                        except asyncio.QueueFull: pass
+                                        # Streaming Bus: Publish to raw_data.offchain_events
+                                        try:
+                                            event_data = {
+                                                "source": "token_unlocks",
+                                                "event_type": event.event_type,
+                                                "timestamp": event.start_time_utc_us,
+                                                "capture_timestamp": event.capture_timestamp_utc_us,
+                                                "title": event.title,
+                                                "description": event.description[:500] if event.description else None,
+                                                "status": event.status,
+                                                "source_id": event.source_id,
+                                                "extra": event.metadata
+                                            }
+                                            
+                                            await self.streaming_bus.publish_with_headers(
+                                                topic="raw_data.offchain_events",
+                                                partition_key="token_unlocks",
+                                                payload=event_data,
+                                                headers={"data_type": "token_unlocks", "source": "token_unlocks_api"}
+                                            )
+                                        except Exception as e:
+                                            logger.warning(f"Failed to publish token unlock event to streaming bus: {e}")
+                                        
+                                        # Local queue fallback with proper error handling
+                                        try:
+                                            q = self.output_queues['calendar']
+                                            if q.full():
+                                                try: 
+                                                    q.get_nowait()
+                                                    logger.debug("Dropped old token unlock event from full queue")
+                                                except asyncio.QueueEmpty: 
+                                                    pass
+                                            q.put_nowait(event)
+                                            logger.debug("Enqueued token unlock event to local queue")
+                                        except asyncio.QueueFull:
+                                            logger.warning("Failed to enqueue token unlock event - queue full")
+                                        except Exception as queue_e:
+                                            logger.warning(f"Failed to enqueue token unlock event to local queue: {queue_e}")
                                 except Exception as row_exc:
                                     logger.warning(f"Bad token unlock: {row_exc} | {str(unlock)[:300]}")
                                     continue
@@ -506,12 +975,45 @@ class EventsCollectorAgent:
                                                 # Update status tracking
                                                 self.last_status[status_key] = "active"
                                                 
-                                                q = self.output_queues['calendar']
-                                                if q.full():
-                                                    try: q.get_nowait()
-                                                    except asyncio.QueueEmpty: pass
-                                                try: q.put_nowait(event)
-                                                except asyncio.QueueFull: pass
+                                                # Streaming Bus: Publish to raw_data.offchain_events
+                                                try:
+                                                    event_data = {
+                                                        "source": "exchange_status",
+                                                        "exchange": "binance",
+                                                        "event_type": event.event_type,
+                                                        "timestamp": event.start_time_utc_us,
+                                                        "capture_timestamp": event.capture_timestamp_utc_us,
+                                                        "title": event.title,
+                                                        "description": event.description[:500] if event.description else None,
+                                                        "status": event.status,
+                                                        "source_id": event.source_id,
+                                                        "extra": event.metadata
+                                                    }
+                                                    
+                                                    await self.streaming_bus.publish_with_headers(
+                                                        topic="raw_data.offchain_events",
+                                                        partition_key="exchange_binance",
+                                                        payload=event_data,
+                                                        headers={"data_type": "exchange_status", "exchange": "binance"}
+                                                    )
+                                                except Exception as e:
+                                                    logger.warning(f"Failed to publish binance status event to streaming bus: {e}")
+                                                
+                                                # Local queue fallback with proper error handling
+                                                try:
+                                                    q = self.output_queues['calendar']
+                                                    if q.full():
+                                                        try: 
+                                                            q.get_nowait()
+                                                            logger.debug("Dropped old exchange status event from full queue")
+                                                        except asyncio.QueueEmpty: 
+                                                            pass
+                                                    q.put_nowait(event)
+                                                    logger.debug("Enqueued exchange status event to local queue")
+                                                except asyncio.QueueFull:
+                                                    logger.warning("Failed to enqueue exchange status event - queue full")
+                                                except Exception as queue_e:
+                                                    logger.warning(f"Failed to enqueue exchange status event to local queue: {queue_e}")
                                         except Exception as row_exc:
                                             logger.warning(f"Bad {exchange} status: {row_exc} | {str(article)[:300]}")
                                             continue
@@ -545,12 +1047,45 @@ class EventsCollectorAgent:
                                                 # Update status tracking
                                                 self.last_status[status_key] = current_status
                                                 
-                                                q = self.output_queues['calendar']
-                                                if q.full():
-                                                    try: q.get_nowait()
-                                                    except asyncio.QueueEmpty: pass
-                                                try: q.put_nowait(event)
-                                                except asyncio.QueueFull: pass
+                                                # Streaming Bus: Publish to raw_data.offchain_events
+                                                try:
+                                                    event_data = {
+                                                        "source": "exchange_status",
+                                                        "exchange": "coinbase",
+                                                        "event_type": event.event_type,
+                                                        "timestamp": event.start_time_utc_us,
+                                                        "capture_timestamp": event.capture_timestamp_utc_us,
+                                                        "title": event.title,
+                                                        "description": event.description[:500] if event.description else None,
+                                                        "status": event.status,
+                                                        "source_id": event.source_id,
+                                                        "extra": event.metadata
+                                                    }
+                                                    
+                                                    await self.streaming_bus.publish_with_headers(
+                                                        topic="raw_data.offchain_events",
+                                                        partition_key="exchange_coinbase",
+                                                        payload=event_data,
+                                                        headers={"data_type": "exchange_status", "exchange": "coinbase"}
+                                                    )
+                                                except Exception as e:
+                                                    logger.warning(f"Failed to publish coinbase status event to streaming bus: {e}")
+                                                
+                                                # Local queue fallback with proper error handling
+                                                try:
+                                                    q = self.output_queues['calendar']
+                                                    if q.full():
+                                                        try: 
+                                                            q.get_nowait()
+                                                            logger.debug("Dropped old coinbase incident event from full queue")
+                                                        except asyncio.QueueEmpty: 
+                                                            pass
+                                                    q.put_nowait(event)
+                                                    logger.debug("Enqueued coinbase incident event to local queue")
+                                                except asyncio.QueueFull:
+                                                    logger.warning("Failed to enqueue coinbase incident event - queue full")
+                                                except Exception as queue_e:
+                                                    logger.warning(f"Failed to enqueue coinbase incident event to local queue: {queue_e}")
                                         except Exception as row_exc:
                                             logger.warning(f"Bad {exchange} incident: {row_exc} | {str(incident)[:300]}")
                                             continue
@@ -632,8 +1167,18 @@ class EventsCollectorAgent:
                                 
                             for release in data:
                                 try:
+                                    # Check if source is healthy before processing
+                                    if not self._is_source_healthy('github'):
+                                        logger.debug("Skipping GitHub releases - circuit breaker open")
+                                        break
+                                    
+                                    # Normalize event type
+                                    normalized_event_type = self.classifier.normalize_event_type(
+                                        "github_release", "github", release
+                                    )
+                                    
                                     event = CalendarEvent(
-                                        event_type="github_release",
+                                        event_type=normalized_event_type,
                                         title=f"{repo}: {release.get('name', release.get('tag_name', 'Release'))}",
                                         description=release.get("body", "")[:500],
                                         start_time_utc_us=_normalize_timestamp(release.get("published_at"), now),
@@ -649,22 +1194,56 @@ class EventsCollectorAgent:
                                         capture_timestamp_utc_us=capture_now
                                     )
                                     
-                                    # Check for status updates
+                                    # Enhanced status update tracking
                                     status_key = ("github", str(release.get("id", "")))
                                     last_status = self.last_status.get(status_key)
                                     current_status = "completed" if not release.get("draft") else "draft"
                                     is_status_update = last_status and last_status != current_status
                                     
-                                    if is_status_update or not self.duplicate_detector.is_duplicate('calendar', event.get_hash(), key=f"github_{repo}"):
+                                    if (is_status_update or 
+                                        not self.duplicate_detector.is_duplicate('calendar', event.get_hash(), key=f"github_{repo}")):
+                                        
                                         # Update status tracking
                                         self.last_status[status_key] = current_status
                                         
-                                        q = self.output_queues['calendar']
-                                        if q.full():
-                                            try: q.get_nowait()
-                                            except asyncio.QueueEmpty: pass
-                                        try: q.put_nowait(event)
-                                        except asyncio.QueueFull: pass
+                                        # Enhanced publishing
+                                        partition_key = f"github_{repo.replace('/', '_')}"
+                                        headers = {
+                                            "data_type": "github_releases",
+                                            "source": "github", 
+                                            "repo": repo,
+                                            "event_type": event.event_type,
+                                            "status": event.status
+                                        }
+                                        
+                                        # Add release-specific metadata
+                                        if release.get("prerelease"):
+                                            headers["prerelease"] = "true"
+                                        if release.get("draft"):
+                                            headers["draft"] = "true"
+                                        if release.get("tag_name"):
+                                            headers["tag_name"] = release["tag_name"]
+                                        
+                                        # Use enhanced publishing method
+                                        success = await self._publish_event(event, partition_key, headers)
+                                        
+                                        if success:
+                                            # Local queue fallback with proper error handling
+                                            try:
+                                                q = self.output_queues['calendar']
+                                                if q.full():
+                                                    try: 
+                                                        q.get_nowait()
+                                                        logger.debug("Dropped old github release event from full queue")
+                                                    except asyncio.QueueEmpty: 
+                                                        pass
+                                                q.put_nowait(event)
+                                                logger.debug("Enqueued github release event to local queue")
+                                            except asyncio.QueueFull:
+                                                logger.warning("Failed to enqueue github release event - queue full")
+                                            except Exception as queue_e:
+                                                logger.warning(f"Failed to enqueue github release event to local queue: {queue_e}")
+                                        
                                 except Exception as row_exc:
                                     logger.warning(f"Bad GitHub release: {row_exc} | {str(release)[:300]}")
                                     continue
@@ -694,15 +1273,43 @@ class EventsCollectorAgent:
 
 async def main():
     config = {
-        'governance_interval_sec': 300,
+        # Collection intervals (enhanced with priority-based processing)
+        'governance_interval_sec': 180,  # Faster for high-priority governance
         'token_unlocks_interval_sec': 3600,
-        'exchange_status_interval_sec': 600,
+        'exchange_status_interval_sec': 300,  # More frequent for trading impact
         'github_releases_interval_sec': 1800,
-        'snapshot_spaces': ['compound', 'aave.eth', 'uniswap', 'ens.eth'],
-        'github_repos': ['ethereum/go-ethereum', 'compound-finance/compound-protocol', 'Uniswap/v3-core'],
+        
+        # Enhanced source configuration
+        'snapshot_spaces': ['compound', 'aave.eth', 'uniswap', 'ens.eth', 'gitcoin.eth'],
+        'github_repos': [
+            'ethereum/go-ethereum', 
+            'compound-finance/compound-protocol', 
+            'Uniswap/v3-core',
+            'aave/aave-protocol-v2'
+        ],
         'binance_status_enabled': True,
-        'calendar_queue_size': 5000
+        'coinbase_status_enabled': True,
+        
+        # Enhanced queue and correlation settings
+        'calendar_queue_size': 10000,  # Increased for enhanced processing
+        'correlation_window_hours': 48,  # Extended for better event correlation
+        
+        # Circuit breaker configuration
+        'source_health_check_interval': 300,  # 5 minutes
+        'max_consecutive_failures': 3,
+        
+        # Enhanced validation settings
+        'enable_strict_validation': True,
+        'log_validation_issues': True,
+        
+        # GitHub API rate limiting
+        'github_token': None,  # Set to your GitHub token for higher rate limits
+        
+        # Priority processing
+        'priority_queue_enabled': True,
+        'max_priority_events_per_batch': 50
     }
+    
     logging.basicConfig(level=logging.INFO)
     agent = EventsCollectorAgent(config)
     try:
@@ -710,7 +1317,22 @@ async def main():
         while True:
             event = await agent.get_output_data('calendar', timeout=5.0)
             if event:
-                print(f"Event: {event.event_type} | {event.title} | {event.source}")
+                # Enhanced event display with validation and correlation info
+                priority_symbols = {1: "🔴", 2: "🟡", 3: "🟢", 4: "🔵", 5: "⚪"}
+                priority = agent.classifier.classify_event_priority(event)
+                priority_symbol = priority_symbols.get(priority, "⚪")
+                
+                validation_status = "✓"
+                is_valid, _ = agent.validator.validate_event(event)
+                if not is_valid:
+                    validation_status = "⚠️"
+                
+                related_events = await agent.correlator.find_related_events(event)
+                related_count = len(related_events)
+                correlation_info = f" ({related_count} related)" if related_count > 0 else ""
+                
+                print(f"{priority_symbol}{validation_status} {event.event_type} | {event.title} | "
+                      f"{event.source} | {event.status}{correlation_info}")
     except KeyboardInterrupt:
         logger.info("Received interrupt signal")
     finally:

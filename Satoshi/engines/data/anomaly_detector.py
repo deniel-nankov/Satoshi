@@ -18,6 +18,9 @@ from collections import defaultdict, deque
 import hashlib
 from datetime import datetime, timezone
 
+# Streaming Bus Integration
+from infra.bus.streaming_bus import StreamingBus
+
 logger = logging.getLogger(__name__)
 
 
@@ -335,6 +338,15 @@ class DataAnomalyDetector:
     def __init__(self, config: Dict[str, Any]):
         self.config = config
         self.detection_config = DetectionConfig(**config.get('detection_params', {}))
+        
+        # Streaming Bus Integration
+        streaming_config = self.config.get("streaming_bus", {
+            "bootstrap_servers": "localhost:9092",
+            "enable_ssl": False,
+            "enable_sasl": False
+        })
+        self.streaming_bus = StreamingBus(streaming_config)
+        self.running = False
         
         # Backward compatibility: if duplicate_window_size is set but duplicate_window_seconds isn't,
         # treat duplicate_window_size as seconds for compatibility
@@ -1523,6 +1535,128 @@ class DataAnomalyDetector:
         """Reset detection statistics."""
         self.detections_count = 0
         logger.info("Anomaly detection statistics reset")
+    
+    async def start(self):
+        """Start the anomaly detector with streaming bus consumer."""
+        self.running = True
+        
+        # Subscribe to raw data topics for anomaly detection
+        raw_data_topics = [
+            "raw_data.exchange_feed",
+            "raw_data.options_chain", 
+            "raw_data.onchain_events",
+            "raw_data.offchain_events",
+            "raw_data.market.trades",
+            "raw_data.market.book",
+            "raw_data.market.funding",
+            "raw_data.market.oi",
+            "raw_data.onchain.blocks",
+            "raw_data.onchain.mempool"
+        ]
+        
+        # Start consumer for anomaly detection
+        await self.streaming_bus.subscribe_with_worker_pool(
+            consumer_group="anomaly-detector",
+            topics=raw_data_topics,
+            handler=self._handle_message_for_anomaly_detection,
+            pool_size=6  # Parallel processing for anomaly detection
+        )
+        
+        logger.info("Anomaly Detector started with streaming bus consumer")
+    
+    def _handle_message_for_anomaly_detection(self, topic: str, partition_key: str, payload: Dict[str, Any], headers: Dict[str, str]) -> None:
+        """Handle incoming messages for anomaly detection."""
+        try:
+            # Extract table name from topic
+            table_name = self._extract_table_name_from_topic(topic)
+            if not table_name:
+                return
+            
+            # Generate row identifier for logging context
+            row_id = headers.get("record_id", f"{topic}_{partition_key}_{int(time.time_ns())}")
+            
+            # Detect anomalies in this message
+            incidents = self.analyze_batch(table_name, [payload])
+            
+            # Publish detected incidents and collect tasks
+            if not hasattr(self, '_pending_tasks'):
+                self._pending_tasks = []
+            
+            for incident in incidents:
+                task = asyncio.create_task(self._publish_anomaly_incident(incident, headers))
+                self._pending_tasks.append(task)
+                # Log the incident with row context
+                logger.debug(f"Scheduled anomaly incident publishing for row {row_id}: {incident.anomaly_type}")
+                
+        except Exception as e:
+            logger.exception(f"Error in anomaly detection for {topic}: {e}")
+    
+    def _extract_table_name_from_topic(self, topic: str) -> Optional[str]:
+        """Extract logical table name from Kafka topic."""
+        topic_mapping = {
+            "raw_data.exchange_feed": "exchange_trades",
+            "raw_data.options_chain": "options_surface",
+            "raw_data.onchain_events": "onchain_flows",
+            "raw_data.offchain_events": "offchain_events",
+            "raw_data.market.trades": "market_trades",
+            "raw_data.market.book": "market_book",
+            "raw_data.market.funding": "market_funding",
+            "raw_data.market.oi": "market_oi",
+            "raw_data.onchain.blocks": "onchain_blocks",
+            "raw_data.onchain.mempool": "onchain_mempool"
+        }
+        
+        return topic_mapping.get(topic)
+    
+    async def _publish_anomaly_incident(self, incident: AnomalyIncident, headers: Dict[str, str]) -> None:
+        """Publish anomaly incident to incidents.Anomaly topic."""
+        try:
+            incident_data = {
+                "incident_id": incident.incident_id,
+                "table_name": incident.table_name,
+                "field_name": incident.field_name,
+                "anomaly_type": incident.anomaly_type.value,
+                "severity": incident.severity.value.upper(),
+                "detected_at": incident.detected_at,
+                "window_start": incident.window_start,
+                "window_end": incident.window_end,
+                "expected_value": str(incident.expected_value) if incident.expected_value is not None else None,
+                "actual_value": str(incident.actual_value) if incident.actual_value is not None else None,
+                "deviation_magnitude": incident.deviation_magnitude,
+                "confidence_score": incident.confidence_score,
+                "evidence": incident.evidence,
+                "affected_rows": incident.affected_rows,
+                "description": incident.description,
+                "source_topic": headers.get("data_type", "unknown")
+            }
+            
+            # Use table name as partition key for locality
+            partition_key = f"anomaly_{incident.table_name}"
+            
+            await self.streaming_bus.publish_with_headers(
+                topic="incidents.Anomaly",
+                partition_key=partition_key,
+                payload=incident_data,
+                headers={
+                    "data_type": "anomaly_incident",
+                    "table": incident.table_name,
+                    "anomaly_type": incident.anomaly_type.value,
+                    "severity": incident.severity.value.upper()
+                },
+                dedupe_key=f"anomaly_{incident.table_name}_{incident.field_name or 'global'}_{incident.anomaly_type.value}_{incident.detected_at}"
+            )
+            
+        except Exception as e:
+            logger.exception(f"Failed to publish anomaly incident to streaming bus: {e}")
+    
+    async def stop(self):
+        """Stop the anomaly detector."""
+        self.running = False
+        
+        # Stop streaming bus
+        await self.streaming_bus.graceful_shutdown()
+        
+        logger.info("Anomaly Detector stopped")
 
 
 # Example usage and demo

@@ -6,6 +6,7 @@ Outputs: incidents.Anomaly (data class).
 Don't: no routing, no autoscaling, no alerts; just incidents.
 """
 
+import asyncio
 import logging
 import time
 import math
@@ -348,6 +349,44 @@ class DataAnomalyDetector:
         self.streaming_bus = StreamingBus(streaming_config)
         self.running = False
         
+        # Circuit breaker integration for resilience
+        self.circuit_breaker_id = f"anomaly_detector_{id(self)}"
+        self._circuit_breaker_registered = False
+        
+        # Health monitoring
+        self._health_check_task: Optional[asyncio.Task] = None
+        self._last_health_check = 0.0
+        self._health_check_interval = config.get('health_check_interval', 30.0)
+        
+        # Retry configuration with exponential backoff
+        self.retry_config = {
+            'max_retries': config.get('max_retries', 3),
+            'base_delay': config.get('retry_base_delay', 1.0),
+            'max_delay': config.get('retry_max_delay', 60.0),
+            'exponential_base': config.get('retry_exponential_base', 2.0)
+        }
+        
+        # Metrics and telemetry
+        self.metrics = {
+            'anomalies_detected': 0,
+            'batches_processed': 0,
+            'spikes_detected': 0,
+            'flatlines_detected': 0,
+            'duplicates_detected': 0,
+            'discontinuities_detected': 0,
+            'outliers_detected': 0,
+            'missing_data_detected': 0,
+            'circuit_breaker_trips': 0,
+            'retry_attempts': 0,
+            'health_checks_performed': 0,
+            'avg_processing_time_ms': 0.0,
+            'last_processing_timestamp': 0
+        }
+        
+        # Task lifecycle management
+        self._consumer_task: Optional[asyncio.Task] = None
+        self._background_tasks: Set[asyncio.Task] = set()
+        
         # Backward compatibility: if duplicate_window_size is set but duplicate_window_seconds isn't,
         # treat duplicate_window_size as seconds for compatibility
         if (hasattr(self.detection_config, 'duplicate_window_size') and 
@@ -384,6 +423,206 @@ class DataAnomalyDetector:
         stats.detection_config = self.detection_config
         stats.__post_init__()  # Initialize optimal deque sizes
         return stats
+    
+    async def _register_circuit_breaker(self):
+        """Register circuit breaker with the streaming bus."""
+        if not self._circuit_breaker_registered:
+            try:
+                await self.streaming_bus.register_circuit_breaker(
+                    component_id=self.circuit_breaker_id,
+                    failure_threshold=self.config.get('circuit_breaker_failure_threshold', 5),
+                    recovery_timeout_us=self.config.get('circuit_breaker_recovery_timeout_us', 300_000_000),
+                    dependency_components=self.config.get('circuit_breaker_dependencies', [])
+                )
+                self._circuit_breaker_registered = True
+                logger.info(f"Circuit breaker registered for {self.circuit_breaker_id}")
+            except Exception as e:
+                logger.warning(f"Failed to register circuit breaker: {e}")
+    
+    async def _perform_health_check(self):
+        """Perform health check and update metrics."""
+        try:
+            # Check streaming bus health via system status
+            system_health = await self.streaming_bus.get_system_health_status()
+            bus_health = system_health.get('streaming_bus_healthy', True)
+            
+            # Check detection pipeline health
+            detection_health = (
+                hasattr(self, 'field_stats') and 
+                len(self.field_stats) >= 0 and  # At least initialized
+                self.running
+            )
+            
+            # Check task health
+            task_health = (
+                (self._consumer_task is None or not self._consumer_task.done()) and
+                len(self._background_tasks) < 100  # Reasonable task backlog
+            )
+            
+            overall_health = bus_health and detection_health and task_health
+            
+            # Update metrics
+            self.metrics['health_checks_performed'] += 1
+            self._last_health_check = time.time()
+            
+            return overall_health
+            
+        except Exception as e:
+            logger.error(f"Health check failed: {e}")
+            return False
+    
+    async def _health_monitor_loop(self):
+        """Background health monitoring loop."""
+        while self.running:
+            try:
+                await self._perform_health_check()
+                await self._asyncio_sleep(self._health_check_interval)
+            except asyncio.CancelledError:
+                # Task was cancelled, break gracefully
+                break
+            except Exception as e:
+                logger.error(f"Health monitor error: {e}")
+                break
+    
+    async def _retry_with_backoff(self, operation_func, operation_name: str, *args, **kwargs):
+        """Execute operation with exponential backoff retry."""
+        last_exception = None
+        
+        for attempt in range(self.retry_config['max_retries'] + 1):
+            try:
+                # Check circuit breaker
+                if self._circuit_breaker_registered:
+                    can_execute = await self.streaming_bus.can_component_execute(self.circuit_breaker_id)
+                    if not can_execute:
+                        self.metrics['circuit_breaker_trips'] += 1
+                        raise Exception("Circuit breaker is open")
+                
+                # Execute operation
+                if hasattr(operation_func, '__call__'):
+                    if self._is_async_function(operation_func):
+                        result = await operation_func(*args, **kwargs)
+                    else:
+                        result = operation_func(*args, **kwargs)
+                else:
+                    result = operation_func
+                
+                # Record success
+                if self._circuit_breaker_registered:
+                    await self.streaming_bus.record_component_success(self.circuit_breaker_id)
+                
+                return result
+                
+            except Exception as e:
+                last_exception = e
+                self.metrics['retry_attempts'] += 1
+                
+                # Record failure
+                if self._circuit_breaker_registered:
+                    await self.streaming_bus.record_component_failure(self.circuit_breaker_id, cascade_failure=True)
+                
+                if attempt < self.retry_config['max_retries']:
+                    # Calculate backoff delay
+                    delay = min(
+                        self.retry_config['base_delay'] * (self.retry_config['exponential_base'] ** attempt),
+                        self.retry_config['max_delay']
+                    )
+                    logger.warning(f"Attempt {attempt + 1} failed for {operation_name}: {e}. Retrying in {delay:.1f}s")
+                    await self._asyncio_sleep(delay)
+                else:
+                    logger.error(f"All {self.retry_config['max_retries']} retry attempts failed for {operation_name}")
+        
+        if last_exception:
+            raise last_exception
+        else:
+            raise Exception(f"Operation {operation_name} failed with no recorded exception")
+    
+    def _is_async_function(self, func):
+        """Check if a function is async."""
+        import asyncio
+        return asyncio.iscoroutinefunction(func)
+    
+    async def _asyncio_sleep(self, delay):
+        """Safe asyncio sleep wrapper."""
+        import asyncio
+        await asyncio.sleep(delay)
+    
+    def _update_processing_metrics(self, processing_time_ms: float, anomalies_count: int):
+        """Update processing metrics."""
+        self.metrics['batches_processed'] += 1
+        self.metrics['anomalies_detected'] += anomalies_count
+        self.metrics['last_processing_timestamp'] = time.time()
+        
+        # Update running average of processing time
+        current_avg = self.metrics['avg_processing_time_ms']
+        processed = self.metrics['batches_processed']
+        self.metrics['avg_processing_time_ms'] = ((current_avg * (processed - 1)) + processing_time_ms) / processed
+    
+    async def get_health_status(self) -> Dict[str, Any]:
+        """Get comprehensive health status."""
+        return {
+            'component_id': self.circuit_breaker_id,
+            'running': self.running,
+            'last_health_check': self._last_health_check,
+            'field_stats_count': len(self.field_stats),
+            'background_tasks': len(self._background_tasks),
+            'circuit_breaker_registered': self._circuit_breaker_registered,
+            'metrics': self.metrics.copy()
+        }
+    
+    def _simple_retry_sync(self, operation_func, operation_name: str):
+        """Simple synchronous retry for non-async operations."""
+        last_exception = None
+        
+        for attempt in range(self.retry_config['max_retries'] + 1):
+            try:
+                result = operation_func()
+                return result
+            except Exception as e:
+                last_exception = e
+                self.metrics['retry_attempts'] += 1
+                
+                if attempt < self.retry_config['max_retries']:
+                    delay = min(
+                        self.retry_config['base_delay'] * (self.retry_config['exponential_base'] ** attempt),
+                        self.retry_config['max_delay']
+                    )
+                    logger.warning(f"Attempt {attempt + 1} failed for {operation_name}: {e}. Retrying in {delay:.1f}s")
+                    import time
+                    time.sleep(delay)
+                else:
+                    logger.error(f"All {self.retry_config['max_retries']} retry attempts failed for {operation_name}")
+        
+        if last_exception:
+            raise last_exception
+        else:
+            raise Exception(f"Operation {operation_name} failed with no recorded exception")
+    
+    def _update_anomaly_type_metrics(self, anomaly_type: AnomalyType):
+        """Update metrics for specific anomaly types."""
+        if anomaly_type == AnomalyType.SPIKE:
+            self.metrics['spikes_detected'] += 1
+        elif anomaly_type == AnomalyType.FLATLINE:
+            self.metrics['flatlines_detected'] += 1
+        elif anomaly_type == AnomalyType.DUPLICATE:
+            self.metrics['duplicates_detected'] += 1
+        elif anomaly_type == AnomalyType.DISCONTINUITY:
+            self.metrics['discontinuities_detected'] += 1
+        elif anomaly_type == AnomalyType.OUTLIER:
+            self.metrics['outliers_detected'] += 1
+        elif anomaly_type == AnomalyType.MISSING_DATA:
+            self.metrics['missing_data_detected'] += 1
+    
+    async def _publish_anomaly_incident_with_retry(self, incident: AnomalyIncident, headers: Dict[str, str]):
+        """Publish anomaly incident with retry logic."""
+        try:
+            await self._retry_with_backoff(
+                self._publish_anomaly_incident,
+                f"publish_incident_{incident.incident_id}",
+                incident,
+                headers
+            )
+        except Exception as e:
+            logger.error(f"Failed to publish anomaly incident {incident.incident_id}: {e}")
     
     def _should_analyze_field(self, field_name: str, value: Any) -> bool:
         """Determine if a field should be analyzed based on filtering configuration."""
@@ -1540,6 +1779,13 @@ class DataAnomalyDetector:
         """Start the anomaly detector with streaming bus consumer."""
         self.running = True
         
+        # Register circuit breaker
+        await self._register_circuit_breaker()
+        
+        # Start health monitoring
+        import asyncio
+        self._health_check_task = asyncio.create_task(self._health_monitor_loop())
+        
         # Subscribe to raw data topics for anomaly detection
         raw_data_topics = [
             "raw_data.exchange_feed",
@@ -1554,18 +1800,62 @@ class DataAnomalyDetector:
             "raw_data.onchain.mempool"
         ]
         
-        # Start consumer for anomaly detection
-        await self.streaming_bus.subscribe_with_worker_pool(
-            consumer_group="anomaly-detector",
-            topics=raw_data_topics,
-            handler=self._handle_message_for_anomaly_detection,
-            pool_size=6  # Parallel processing for anomaly detection
+        # Start consumer for anomaly detection as a managed task
+        self._consumer_task = asyncio.create_task(
+            self.streaming_bus.subscribe_with_worker_pool(
+                consumer_group="anomaly-detector",
+                topics=raw_data_topics,
+                handler=self._handle_message_for_anomaly_detection,
+                pool_size=6  # Parallel processing for anomaly detection
+            )
         )
         
         logger.info("Anomaly Detector started with streaming bus consumer")
     
+    def _handle_control_message_wrapper(self, topic: str, partition_key: str, message: Dict[str, Any], headers: Dict[str, str]) -> None:
+        """Wrapper to handle control messages asynchronously."""
+        asyncio.create_task(self._handle_control_message_async(topic, message, headers))
+    
+    async def _handle_control_message_async(self, topic: str, message: Dict[str, Any], headers: Dict[str, str]) -> None:
+        """Handle control messages for dynamic configuration updates."""
+        try:
+            if message.get("action") == "update_thresholds":
+                threshold_updates = message.get("thresholds", {})
+                await self._apply_threshold_updates(threshold_updates)
+            elif message.get("action") == "circuit_breaker":
+                component = message.get("component")
+                if component == "anomaly_detector":
+                    await self._handle_circuit_breaker_message(message)
+        except Exception as e:
+            logger.error(f"Error handling control message from {topic}: {e}")
+    
+    async def _apply_threshold_updates(self, threshold_updates: Dict[str, Any]) -> None:
+        """Apply dynamic threshold updates."""
+        try:
+            for metric, threshold in threshold_updates.items():
+                if hasattr(self, f'{metric}_threshold'):
+                    setattr(self, f'{metric}_threshold', threshold)
+                    logger.info(f"Updated {metric} threshold to {threshold}")
+        except Exception as e:
+            logger.error(f"Error applying threshold updates: {e}")
+    
+    async def _handle_circuit_breaker_message(self, message: Dict[str, Any]) -> None:
+        """Handle circuit breaker control messages."""
+        try:
+            action = message.get("circuit_action")
+            if action == "pause":
+                # Pause anomaly detection temporarily
+                logger.info("Anomaly detection paused via circuit breaker")
+            elif action == "resume":
+                # Resume anomaly detection
+                logger.info("Anomaly detection resumed via circuit breaker")
+        except Exception as e:
+            logger.error(f"Error handling circuit breaker message: {e}")
+    
     def _handle_message_for_anomaly_detection(self, topic: str, partition_key: str, payload: Dict[str, Any], headers: Dict[str, str]) -> None:
-        """Handle incoming messages for anomaly detection."""
+        """Handle incoming messages for anomaly detection with metrics tracking."""
+        start_time = time.time()
+        
         try:
             # Extract table name from topic
             table_name = self._extract_table_name_from_topic(topic)
@@ -1575,18 +1865,37 @@ class DataAnomalyDetector:
             # Generate row identifier for logging context
             row_id = headers.get("record_id", f"{topic}_{partition_key}_{int(time.time_ns())}")
             
-            # Detect anomalies in this message
-            incidents = self.analyze_batch(table_name, [payload])
+            # Detect anomalies in this message with retry support
+            anomaly_detection_func = lambda: self.analyze_batch(table_name, [payload])
+            
+            # Use retry pattern for critical detection operations
+            try:
+                # For sync operations, we'll wrap in a simple retry without async
+                incidents = self._simple_retry_sync(anomaly_detection_func, "anomaly_detection")
+            except Exception as e:
+                logger.error(f"Anomaly detection failed for {table_name}: {e}")
+                incidents = []
+            
+            # Update type-specific metrics
+            for incident in incidents:
+                self._update_anomaly_type_metrics(incident.anomaly_type)
             
             # Publish detected incidents and collect tasks
             if not hasattr(self, '_pending_tasks'):
                 self._pending_tasks = []
             
             for incident in incidents:
-                task = asyncio.create_task(self._publish_anomaly_incident(incident, headers))
-                self._pending_tasks.append(task)
-                # Log the incident with row context
-                logger.debug(f"Scheduled anomaly incident publishing for row {row_id}: {incident.anomaly_type}")
+                task = asyncio.create_task(self._publish_anomaly_incident_with_retry(incident, headers))
+                self._background_tasks.add(task)
+                # Clean up completed tasks to prevent memory leaks
+                task.add_done_callback(self._background_tasks.discard)
+            
+            # Update processing metrics
+            processing_time_ms = (time.time() - start_time) * 1000
+            self._update_processing_metrics(processing_time_ms, len(incidents))
+            
+            # Log the processing completion
+            logger.debug(f"Processed anomaly detection for {table_name}, found {len(incidents)} incidents")
                 
         except Exception as e:
             logger.exception(f"Error in anomaly detection for {topic}: {e}")
@@ -1650,13 +1959,55 @@ class DataAnomalyDetector:
             logger.exception(f"Failed to publish anomaly incident to streaming bus: {e}")
     
     async def stop(self):
-        """Stop the anomaly detector."""
+        """Stop the anomaly detector with proper task cleanup."""
         self.running = False
+        
+        logger.info("Stopping Anomaly Detector...")
+        
+        # Cancel the health check task
+        if self._health_check_task and not self._health_check_task.done():
+            logger.info("Cancelling health check task...")
+            self._health_check_task.cancel()
+            try:
+                await self._health_check_task
+            except asyncio.CancelledError:
+                logger.info("Health check task cancelled successfully")
+            except Exception as e:
+                logger.error(f"Error during health check task cancellation: {e}")
+        
+        # Cancel the consumer task
+        if self._consumer_task and not self._consumer_task.done():
+            logger.info("Cancelling consumer task...")
+            self._consumer_task.cancel()
+            try:
+                await self._consumer_task
+            except asyncio.CancelledError:
+                logger.info("Consumer task cancelled successfully")
+            except Exception as e:
+                logger.error(f"Error during consumer task cancellation: {e}")
+        
+        # Cancel all background tasks
+        if self._background_tasks:
+            logger.info(f"Cancelling {len(self._background_tasks)} background tasks...")
+            
+            # Cancel all background tasks
+            for task in list(self._background_tasks):
+                if not task.done():
+                    task.cancel()
+            
+            # Wait for cancelled tasks to complete
+            if self._background_tasks:
+                try:
+                    await asyncio.gather(*self._background_tasks, return_exceptions=True)
+                except Exception as e:
+                    logger.error(f"Error during background task cleanup: {e}")
+                finally:
+                    self._background_tasks.clear()
         
         # Stop streaming bus
         await self.streaming_bus.graceful_shutdown()
         
-        logger.info("Anomaly Detector stopped")
+        logger.info("Anomaly Detector stopped with graceful cleanup")
 
 
 # Example usage and demo

@@ -536,6 +536,40 @@ class FreshnessAgent:
         self.stream_stats: Dict[str, StreamStats] = {}
         self.running = False
         
+        # Task management with health monitoring
+        self._consumer_task: Optional[asyncio.Task] = None
+        self._health_check_task: Optional[asyncio.Task] = None
+        self._background_tasks: Set[asyncio.Task] = set()
+        
+        # Health monitoring configuration
+        self._health_check_interval = config.get('health_check_interval', 30.0)  # seconds
+        self._last_health_check = time.time()
+        
+        # Retry configuration for streaming operations
+        self.retry_config = {
+            'max_retries': config.get('max_retries', 3),
+            'base_delay_ms': config.get('base_delay_ms', 1000),
+            'max_delay_ms': config.get('max_delay_ms', 30000),
+            'exponential_base': config.get('exponential_base', 2.0)
+        }
+        
+        # Enhanced metrics tracking
+        self.metrics = {
+            'streams_monitored': 0,
+            'incidents_generated': 0,
+            'false_positives_detected': 0,
+            'circuit_breakers_triggered': 0,
+            'health_checks_performed': 0,
+            'health_checks_failed': 0,
+            'kafka_operations_retried': 0,
+            'kafka_operations_failed': 0,
+            'slo_violations_detected': 0,
+            'confidence_adjustments_made': 0,
+            'messages_processed': 0,
+            'processing_errors': 0,
+            'total_staleness_checks': 0
+        }
+        
         # Streaming Bus Integration
         streaming_config = self.config.get("streaming_bus", {
             "bootstrap_servers": "localhost:9092",
@@ -546,6 +580,10 @@ class FreshnessAgent:
         
         # Component identification for circuit breaker
         self.component_id = "freshness_agent"
+        
+        # Generate unique circuit breaker ID for this instance
+        self.circuit_breaker_id = f"freshness_agent_{id(self)}"
+        self._circuit_breaker_registered = False
         
         # Circuit breaker dependencies - monitors all data collectors
         self.circuit_breaker_dependencies = [
@@ -581,12 +619,97 @@ class FreshnessAgent:
         # Incident deduplication cache
         self.last_incident_by_key: Dict[str, FreshnessIncident] = {}
     
+    async def _register_circuit_breaker(self):
+        """Register circuit breaker with streaming bus."""
+        try:
+            if not self._circuit_breaker_registered:
+                await self.streaming_bus.register_circuit_breaker(
+                    component_id=self.circuit_breaker_id,
+                    failure_threshold=5,  # More tolerant for monitoring component
+                    recovery_timeout_us=self.circuit_breaker_timeout_us,
+                    dependency_components=self.circuit_breaker_dependencies
+                )
+                self._circuit_breaker_registered = True
+                logger.info(f"Registered circuit breaker: {self.circuit_breaker_id}")
+        except Exception as e:
+            logger.error(f"Failed to register circuit breaker: {e}")
+            raise
+    
     def _get_week_start_us(self) -> int:
         """Get the start of the current week in microseconds."""
         now = datetime.now(timezone.utc)
         week_start = now.replace(hour=0, minute=0, second=0, microsecond=0)
         week_start = week_start - timedelta(days=now.weekday())  # Monday
         return int(week_start.timestamp() * 1_000_000)
+    
+    async def _perform_health_check(self) -> bool:
+        """Perform comprehensive health check of freshness agent."""
+        try:
+            self.metrics['health_checks_performed'] += 1
+            
+            # Check streaming bus health
+            if not self.streaming_bus or not hasattr(self.streaming_bus, 'producer'):
+                self.metrics['health_checks_failed'] += 1
+                return False
+            
+            # Check if we have registered streams
+            if not self.stream_configs:
+                logger.warning("Health check: No streams registered for monitoring")
+                return True  # Not necessarily unhealthy
+            
+            # Check if we have recent data from monitored streams
+            now_us = int(time.time() * 1_000_000)
+            stale_streams = 0
+            
+            for stream_name, stats in self.stream_stats.items():
+                if stats.armed:  # Only check armed streams
+                    staleness_us = now_us - stats.last_update_us
+                    config = self.stream_configs.get(stream_name)
+                    if config:
+                        threshold_us = self._calculate_staleness_threshold(stream_name, config, stats)
+                        if staleness_us > threshold_us * 3:  # Very stale (3x threshold)
+                            stale_streams += 1
+            
+            # Health is good if less than 50% of streams are very stale
+            is_healthy = stale_streams < len([s for s in self.stream_stats.values() if s.armed]) * 0.5
+            
+            if not is_healthy:
+                self.metrics['health_checks_failed'] += 1
+                logger.warning(f"Health check failed: {stale_streams} very stale streams")
+            
+            self._last_health_check = time.time()
+            return is_healthy
+            
+        except Exception as e:
+            self.metrics['health_checks_failed'] += 1
+            logger.error(f"Health check failed: {e}")
+            return False
+    
+    async def _health_monitor_loop(self):
+        """Background health monitoring loop."""
+        while self.running:
+            try:
+                await self._perform_health_check()
+                await asyncio.sleep(self._health_check_interval)
+            except asyncio.CancelledError:
+                # Task was cancelled, break gracefully
+                break
+            except Exception as e:
+                logger.error(f"Health monitor error: {e}")
+                break
+    
+    def get_health_status(self) -> Dict[str, Any]:
+        """Get current health status of the freshness agent."""
+        return {
+            'component_id': self.circuit_breaker_id,
+            'healthy': time.time() - self._last_health_check < self._health_check_interval * 2,
+            'last_health_check': self._last_health_check,
+            'circuit_breaker_registered': self._circuit_breaker_registered,
+            'streams_monitored': len(self.stream_configs),
+            'streams_armed': len([s for s in self.stream_stats.values() if s.armed]),
+            'running': self.running,
+            'metrics': self.metrics.copy()
+        }
     
     def register_stream(self, stream_config: StreamConfig) -> None:
         """Register a stream for freshness monitoring."""
@@ -599,7 +722,77 @@ class FreshnessAgent:
             # Set deque window size from config
             stats.inter_arrival_times = deque(maxlen=stream_config.bar_estimation_window)
             self.stream_stats[stream_config.stream_name] = stats
+        
+        self.metrics['streams_monitored'] = len(self.stream_configs)
         logger.info(f"Registered stream for freshness monitoring: {stream_config.stream_name}")
+    
+    async def _retry_with_backoff(self, operation_func, operation_name: str, *args, **kwargs):
+        """Execute operation with exponential backoff retry."""
+        last_exception = None
+        
+        for attempt in range(self.retry_config['max_retries'] + 1):
+            try:
+                result = await operation_func(*args, **kwargs)
+                if attempt > 0:
+                    logger.info(f"Retry succeeded for {operation_name} on attempt {attempt + 1}")
+                return result
+                
+            except Exception as e:
+                last_exception = e
+                self.metrics['kafka_operations_retried'] += 1
+                
+                if attempt == self.retry_config['max_retries']:
+                    self.metrics['kafka_operations_failed'] += 1
+                    logger.error(f"Retry failed for {operation_name} after {attempt + 1} attempts: {e}")
+                    break
+                
+                # Calculate exponential backoff delay
+                delay_ms = min(
+                    self.retry_config['base_delay_ms'] * (self.retry_config['exponential_base'] ** attempt),
+                    self.retry_config['max_delay_ms']
+                )
+                
+                logger.warning(f"Retry {attempt + 1}/{self.retry_config['max_retries']} for {operation_name} after {delay_ms}ms: {e}")
+                await asyncio.sleep(delay_ms / 1000.0)
+        
+        # Re-raise the last exception if all retries failed
+        if last_exception:
+            raise last_exception
+        else:
+            raise RuntimeError(f"All retries failed for {operation_name} with no exception captured")
+    
+    def _simple_retry_sync(self, operation_func, operation_name: str, *args, **kwargs):
+        """Simplified synchronous retry for non-async operations."""
+        last_exception = None
+        
+        for attempt in range(self.retry_config['max_retries'] + 1):
+            try:
+                result = operation_func(*args, **kwargs)
+                if attempt > 0:
+                    logger.info(f"Sync retry succeeded for {operation_name} on attempt {attempt + 1}")
+                return result
+                
+            except Exception as e:
+                last_exception = e
+                
+                if attempt == self.retry_config['max_retries']:
+                    logger.error(f"Sync retry failed for {operation_name} after {attempt + 1} attempts: {e}")
+                    break
+                
+                import time
+                delay_ms = min(
+                    self.retry_config['base_delay_ms'] * (self.retry_config['exponential_base'] ** attempt),
+                    self.retry_config['max_delay_ms']
+                )
+                
+                logger.warning(f"Sync retry {attempt + 1}/{self.retry_config['max_retries']} for {operation_name} after {delay_ms}ms: {e}")
+                time.sleep(delay_ms / 1000.0)
+        
+        # Re-raise the last exception if all retries failed
+        if last_exception:
+            raise last_exception
+        else:
+            raise RuntimeError(f"All sync retries failed for {operation_name} with no exception captured")
     
     def record_data_update(self, stream_name: str, timestamp_us: int, metadata: Optional[Dict[str, Any]] = None) -> None:
         """Record that a stream received new data."""
@@ -650,6 +843,9 @@ class FreshnessAgent:
         now_us = monotonic_time_us()
         wall_time_us = int(time.time() * 1_000_000)
         
+        # Update metrics
+        self.metrics['total_staleness_checks'] += 1
+        
         # Update SLO tracking
         self.slo_metrics.reset_weekly_counters(wall_time_us)
         self.slo_metrics.last_slo_check_us = wall_time_us
@@ -663,6 +859,7 @@ class FreshnessAgent:
         if self.slo_metrics.should_adjust_confidence_threshold(wall_time_us):
             new_threshold = self.slo_metrics.adjust_confidence_threshold(wall_time_us)
             self.min_confidence_threshold = new_threshold
+            self.metrics['confidence_adjustments_made'] += 1
         
         for stream_name, config in self.stream_configs.items():
             if stream_name not in self.stream_stats:
@@ -745,6 +942,7 @@ class FreshnessAgent:
                         if self._should_emit_after_dedupe(stats, incident, wall_time_us, config):
                             incidents.append(incident)
                             stats.incident_confirmed = True
+                            self.metrics['incidents_generated'] += 1
                             
                             # Track detection SLO compliance
                             target_detection_time = threshold_us * self.slo_metrics.detection_target_multiplier
@@ -756,6 +954,7 @@ class FreshnessAgent:
                             )
                             
                             if is_slo_violation:
+                                self.metrics['slo_violations_detected'] += 1
                                 logger.warning(f"Detection SLO violation for {stream_name}: "
                                              f"delay {detection_delay/1_000_000:.1f}s > "
                                              f"target {target_detection_time/1_000_000:.1f}s")
@@ -863,6 +1062,7 @@ class FreshnessAgent:
                 # Escalate to circuit breaker - align request and state
                 stats.circuit_breaker_escalated_at = now_us
                 stats.circuit_breaker_state = CircuitBreakerState.OPEN  # Set state to match request
+                self.metrics['circuit_breakers_triggered'] += 1
                 
                 # Create circuit breaker request with consistent action casing
                 cb_request = CircuitBreakerRequest(
@@ -1294,12 +1494,7 @@ class FreshnessAgent:
         self.running = True
         
         # Register circuit breaker with streaming bus
-        await self.streaming_bus.register_circuit_breaker(
-            component_id=self.component_id,
-            failure_threshold=5,  # More tolerant for monitoring component
-            recovery_timeout_us=self.circuit_breaker_timeout_us,
-            dependency_components=self.circuit_breaker_dependencies
-        )
+        await self._register_circuit_breaker()
         
         # Subscribe to raw data topics to monitor freshness
         raw_data_topics = [
@@ -1316,21 +1511,33 @@ class FreshnessAgent:
         ]
         
         # Start consumer to track message timestamps (sync handler for compatibility)
-        await self.streaming_bus.subscribe_with_worker_pool(
-            consumer_group="freshness-monitor",
-            topics=raw_data_topics,
-            handler=self._handle_data_update_sync,
-            pool_size=4  # Lightweight processing
+        self._consumer_task = asyncio.create_task(
+            self._retry_with_backoff(
+                self.streaming_bus.subscribe_with_worker_pool,
+                "kafka_consumer_start",
+                consumer_group="freshness-monitor",
+                topics=raw_data_topics,
+                handler=self._handle_data_update_sync,
+                pool_size=4  # Lightweight processing
+            )
         )
+        self._background_tasks.add(self._consumer_task)
         
-        logger.info("Freshness Agent started with streaming bus consumer")
+        # Start health monitoring
+        self._health_check_task = asyncio.create_task(self._health_monitor_loop())
+        self._background_tasks.add(self._health_check_task)
+        
+        logger.info(f"Freshness Agent started with circuit breaker: {self.circuit_breaker_id}")
         
         # Start background monitoring task
-        asyncio.create_task(self._monitoring_loop())
+        monitoring_task = asyncio.create_task(self._monitoring_loop())
+        self._background_tasks.add(monitoring_task)
     
     def _handle_data_update_sync(self, topic: str, partition_key: str, payload: Dict[str, Any], headers: Dict[str, str]) -> None:
         """Synchronous handler for incoming data updates to track freshness."""
         try:
+            self.metrics['messages_processed'] += 1
+            
             # Extract timestamp from payload or use current time
             timestamp_us = payload.get('timestamp_utc_us') or payload.get('timestamp') or int(time.time() * 1_000_000)
             
@@ -1353,6 +1560,7 @@ class FreshnessAgent:
                 self.record_data_update(stream_name, timestamp_us)
                 
         except Exception as e:
+            self.metrics['processing_errors'] += 1
             logger.error(f"Error tracking freshness for {topic}: {e}")
     
     def _map_topic_to_stream(self, topic: str, payload: Dict[str, Any], headers: Dict[str, str]) -> Optional[str]:
@@ -1391,13 +1599,40 @@ class FreshnessAgent:
             return topic.replace("raw_data.", "").replace(".", "_")
     
     async def stop(self) -> None:
-        """Stop the freshness monitoring agent."""
+        """Stop the freshness monitoring agent with graceful task cleanup."""
         self.running = False
+        logger.info("Shutting down Freshness Agent...")
+        
+        # Cancel all background tasks
+        for task in self._background_tasks:
+            if not task.done():
+                task.cancel()
+        
+        # Wait for tasks to complete with timeout
+        if self._background_tasks:
+            try:
+                await asyncio.wait_for(
+                    asyncio.gather(*self._background_tasks, return_exceptions=True),
+                    timeout=10.0
+                )
+                logger.info("All background tasks completed successfully")
+            except asyncio.TimeoutError:
+                logger.warning("Some background tasks did not complete within timeout")
+            except Exception as e:
+                logger.error(f"Error during task cleanup: {e}")
+        
+        # Clear task references
+        self._background_tasks.clear()
+        self._consumer_task = None
+        self._health_check_task = None
         
         # Stop streaming bus
-        await self.streaming_bus.graceful_shutdown()
+        try:
+            await self.streaming_bus.graceful_shutdown()
+        except Exception as e:
+            logger.error(f"Error stopping streaming bus: {e}")
         
-        logger.info("Freshness Agent stopped")
+        logger.info(f"Freshness Agent stopped - Final metrics: {self.metrics}")
     
     async def _monitoring_loop(self) -> None:
         """Background monitoring loop with adaptive check intervals and SLO tracking."""

@@ -1,0 +1,18 @@
+# Satoshi Configuration
+# This file controls which optional features are enabled
+
+# Core Features (enabled by default)
+STREAMING_BUS_ENABLED=true
+FEATURE_FACTORY_ENABLED=true
+API_SERVER_ENABLED=true
+
+# Optional Features (set to true to enable the feature; set to false to disable the feature and its warnings)
+AWS_SECRETS_ENABLED=false
+VAULT_SECRETS_ENABLED=false
+ICEBERG_LAKEHOUSE_ENABLED=false
+CLICKHOUSE_TSDB_ENABLED=false
+
+# Development vs Production
+ENVIRONMENT=development
+LOG_LEVEL=INFO
+SHOW_OPTIONAL_WARNINGS=false

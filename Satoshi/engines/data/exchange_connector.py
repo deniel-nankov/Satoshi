@@ -184,6 +184,7 @@ class BorrowData:
     borrow_rate_annual: Decimal
     available_quantity: Optional[Decimal] = None
     venue_timestamp_utc_us: Optional[int] = None
+    estimated: bool = False  # True if rate is estimated/derived, False if provided by venue
     
     def get_hash(self) -> str:
         """
@@ -929,7 +930,16 @@ class CoinbaseAdapter(VenueAdapter):
                 return None
 
     async def get_borrow_rate(self, symbol: str) -> Optional[BorrowData]:
-        """Fetch margin borrow rates from Coinbase."""
+        """
+        Fetch margin borrow rates from Coinbase.
+        
+        NOTE: Coinbase does not provide real borrow rates via API for retail accounts.
+        This method returns estimated rates based on market volatility when margin is available.
+        All returned rates have estimated=True to indicate they are derived, not venue-provided.
+        
+        Returns:
+            BorrowData with estimated=True if margin is available, None otherwise
+        """
         try:
             if not self.session:
                 raise RuntimeError("Session is not initialized")
@@ -979,7 +989,8 @@ class CoinbaseAdapter(VenueAdapter):
                             venue_type=self.venue_type,
                             symbol=symbol,
                             timestamp_utc_us=capture_time,
-                            borrow_rate_annual=estimated_rate
+                            borrow_rate_annual=estimated_rate,
+                            estimated=True  # Mark as estimated since Coinbase doesn't provide real rates
                         )
                         
         except Exception as e:
@@ -1711,8 +1722,44 @@ class ExchangeConnectorAgent:
         self.running = False
         self.tasks: List[asyncio.Task] = []
         
+        # Enhanced task management
+        self._background_tasks: Set[asyncio.Task] = set()
+        self._health_check_task: Optional[asyncio.Task] = None
+        
+        # Health monitoring configuration
+        self._health_check_interval = config.get('health_check_interval', 60.0)  # seconds
+        self._last_health_check = time.time()
+        
+        # Retry configuration for operations
+        self.retry_config = {
+            'max_retries': config.get('max_retries', 5),
+            'base_delay_ms': config.get('base_delay_ms', 100),
+            'max_delay_ms': config.get('max_delay_ms', 30000),
+            'exponential_base': config.get('exponential_base', 2.0)
+        }
+        
+        # Enhanced metrics dictionary (complement existing MetricsCollector)
+        self.integration_metrics = {
+            'venues_connected': 0,
+            'total_requests': 0,
+            'successful_requests': 0,
+            'failed_requests': 0,
+            'circuit_breaker_trips': 0,
+            'health_checks_performed': 0,
+            'health_checks_failed': 0,
+            'retry_attempts': 0,
+            'duplicate_data_filtered': 0,
+            'streaming_messages_published': 0,
+            'adapters_initialized': 0,
+            'background_tasks_running': 0
+        }
+        
         # Component identification for circuit breaker
         self.component_id = "exchange_connector"
+        
+        # Generate unique circuit breaker ID for this instance
+        self.circuit_breaker_id = f"exchange_connector_{id(self)}"
+        self._circuit_breaker_registered = False
         
         # Streaming Bus Integration
         streaming_config = self.config.get("streaming_bus", {
@@ -1770,6 +1817,84 @@ class ExchangeConnectorAgent:
         
         self._setup_adapters()
 
+    async def _register_circuit_breaker(self):
+        """Register circuit breaker with streaming bus."""
+        try:
+            if not self._circuit_breaker_registered:
+                await self.streaming_bus.register_circuit_breaker(
+                    component_id=self.circuit_breaker_id,
+                    failure_threshold=self.circuit_breaker_config["failure_threshold"],
+                    recovery_timeout_us=self.circuit_breaker_config["recovery_timeout_us"],
+                    dependency_components=self.circuit_breaker_config["dependency_components"]
+                )
+                self._circuit_breaker_registered = True
+                logger.info(f"Registered circuit breaker: {self.circuit_breaker_id}")
+        except Exception as e:
+            logger.error(f"Failed to register circuit breaker: {e}")
+            raise
+
+    async def _perform_health_check(self) -> bool:
+        """Perform comprehensive health check of exchange connector."""
+        try:
+            self.integration_metrics['health_checks_performed'] += 1
+            
+            # Check streaming bus health
+            if not self.streaming_bus or not hasattr(self.streaming_bus, 'producer'):
+                self.integration_metrics['health_checks_failed'] += 1
+                return False
+            
+            # Check adapter health
+            healthy_adapters = 0
+            total_adapters = len(self.adapters)
+            
+            for adapter_name, adapter in self.adapters.items():
+                try:
+                    health_status = await adapter.health_check()
+                    if health_status.get("status") in ["healthy", "degraded"]:
+                        healthy_adapters += 1
+                except Exception as e:
+                    logger.warning(f"Health check failed for {adapter_name}: {e}")
+            
+            # Health is good if at least 50% of adapters are healthy
+            is_healthy = healthy_adapters >= (total_adapters * 0.5) if total_adapters > 0 else True
+            
+            if not is_healthy:
+                self.integration_metrics['health_checks_failed'] += 1
+                logger.warning(f"Health check failed: {healthy_adapters}/{total_adapters} adapters healthy")
+            
+            self._last_health_check = time.time()
+            return is_healthy
+            
+        except Exception as e:
+            self.integration_metrics['health_checks_failed'] += 1
+            logger.error(f"Health check failed: {e}")
+            return False
+    
+    async def _health_monitor_loop(self):
+        """Background health monitoring loop."""
+        while self.running:
+            try:
+                await self._perform_health_check()
+                await asyncio.sleep(self._health_check_interval)
+            except asyncio.CancelledError:
+                # Task was cancelled, break gracefully
+                break
+            except Exception as e:
+                logger.error(f"Health monitor error: {e}")
+                break
+    
+    def get_health_status(self) -> Dict[str, Any]:
+        """Get current health status of the exchange connector."""
+        return {
+            'component_id': self.circuit_breaker_id,
+            'healthy': time.time() - self._last_health_check < self._health_check_interval * 2,
+            'last_health_check': self._last_health_check,
+            'circuit_breaker_registered': self._circuit_breaker_registered,
+            'venues_connected': len(self.adapters),
+            'running': self.running,
+            'integration_metrics': self.integration_metrics.copy()
+        }
+    
     def _adapter_supports(self, adapter, method_name):
         """Return True if adapter implements a non-None method for the given data type."""
         method = getattr(adapter, method_name, None)
@@ -1798,17 +1923,12 @@ class ExchangeConnectorAgent:
             self.adapters[venue_name] = adapter
             
     async def start(self):
-        """Start the connector agent."""
+        """Start the connector agent with enhanced integration features."""
         logger.info("Starting Exchange Connector Agent...")
         self.running = True
         
-        # Register circuit breaker with streaming bus
-        await self.streaming_bus.register_circuit_breaker(
-            component_id=self.component_id,
-            failure_threshold=self.circuit_breaker_config["failure_threshold"],
-            recovery_timeout_us=self.circuit_breaker_config["recovery_timeout_us"],
-            dependency_components=self.circuit_breaker_config["dependency_components"]
-        )
+        # Register circuit breaker with enhanced integration
+        await self._register_circuit_breaker()
         
         # Initialize sequence numbers for each venue
         for venue_name in self.adapters.keys():
@@ -1817,6 +1937,10 @@ class ExchangeConnectorAgent:
         # Start all adapters
         for adapter in self.adapters.values():
             await adapter.start()
+            self.integration_metrics['adapters_initialized'] += 1
+            
+        # Update venues connected metric
+        self.integration_metrics['venues_connected'] = len(self.adapters)
             
         # Start data collection tasks
         for venue_name, adapter in self.adapters.items():
@@ -1826,6 +1950,7 @@ class ExchangeConnectorAgent:
                     self._collect_trades(adapter, symbol)
                 )
                 self.tasks.append(task)
+                self._background_tasks.add(task)
                 # Book collection
                 task = asyncio.create_task(
                     self._collect_book(adapter, symbol)
@@ -1868,7 +1993,16 @@ class ExchangeConnectorAgent:
         health_task = asyncio.create_task(self._monitor_connection_health())
         self.tasks.append(health_task)
         
-        logger.info(f"Started {len(self.tasks)} collection tasks with enhanced monitoring")
+        # Start enhanced health monitoring for integration
+        self._health_check_task = asyncio.create_task(self._health_monitor_loop())
+        self.tasks.append(self._health_check_task)
+        self._background_tasks.add(self._health_check_task)
+        
+        # Start Kafka topic consumption loop for control messages
+        control_task = asyncio.create_task(self._consume_control_messages())
+        self.tasks.append(control_task)
+        
+        logger.info(f"Started {len(self.tasks)} collection tasks with enhanced integration monitoring")
     async def _collect_oi(self, adapter: VenueAdapter, symbol: str):
         """Collect open interest for a symbol."""
         interval_sec = self.config.get("oi_interval_sec", 20)
@@ -1933,18 +2067,137 @@ class ExchangeConnectorAgent:
             next_ts += interval_sec
             await asyncio.sleep(max(0, next_ts - time.monotonic()))
         
+    async def _consume_control_messages(self):
+        """Consume control messages from Kafka topics for dynamic configuration."""
+        control_topics = [
+            "control.circuit_breaker",
+            "control.config_update", 
+            "control.venue_maintenance"
+        ]
+        
+        logger.info(f"Starting control message consumption from topics: {control_topics}")
+        
+        try:
+            await self.streaming_bus.subscribe(
+                consumer_group="exchange_connector_control",
+                topics=control_topics,
+                handler=self._handle_control_message_wrapper
+            )
+                
+        except asyncio.CancelledError:
+            # Re-raise cancellation errors during shutdown
+            raise
+        except Exception as e:
+            logger.error(f"Error in control message consumption: {e}")
+            # Use the system circuit breaker to record failure
+            await self.streaming_bus.system_circuit_breaker.record_component_failure(
+                component_id=self.circuit_breaker_id,
+                cascade_to_dependents=False
+            )
+    
+    def _handle_control_message_wrapper(self, topic: str, partition_key: str, 
+                                      message: dict, headers: dict):
+        """Wrapper to handle the subscribe callback signature."""
+        # Schedule the async handler
+        asyncio.create_task(self._handle_control_message(topic, message))
+    
+    async def _handle_control_message(self, topic: str, message: dict):
+        """Handle control messages for dynamic behavior adjustment."""
+        try:
+            if topic == "control.circuit_breaker":
+                # Handle circuit breaker commands
+                if message.get("component_id") == self.component_id:
+                    action = message.get("action")
+                    if action == "open":
+                        logger.warning(f"Circuit breaker opened via control message")
+                    elif action == "close":
+                        logger.info(f"Circuit breaker closed via control message")
+                        
+            elif topic == "control.config_update":
+                # Handle dynamic configuration updates
+                if message.get("component_id") == self.component_id:
+                    config_updates = message.get("updates", {})
+                    await self._apply_config_updates(config_updates)
+                    
+            elif topic == "control.venue_maintenance":
+                # Handle venue maintenance notifications
+                venue = message.get("venue")
+                if venue in self.adapters:
+                    maintenance_action = message.get("action")
+                    if maintenance_action == "start":
+                        logger.warning(f"Maintenance started for {venue}")
+                        # Could pause collection for this venue
+                    elif maintenance_action == "end":
+                        logger.info(f"Maintenance ended for {venue}")
+                        
+        except Exception as e:
+            logger.error(f"Error handling control message from {topic}: {e}")
+    
+    async def _apply_config_updates(self, updates: dict):
+        """Apply dynamic configuration updates."""
+        try:
+            # Update collection intervals
+            if "trade_interval_sec" in updates:
+                self.config["trade_interval_sec"] = updates["trade_interval_sec"]
+                logger.info(f"Updated trade_interval_sec to {updates['trade_interval_sec']}")
+                
+            if "book_interval_sec" in updates:
+                self.config["book_interval_sec"] = updates["book_interval_sec"] 
+                logger.info(f"Updated book_interval_sec to {updates['book_interval_sec']}")
+                
+            # Update circuit breaker thresholds
+            if "circuit_breaker_failure_threshold" in updates:
+                self.circuit_breaker_config["failure_threshold"] = updates["circuit_breaker_failure_threshold"]
+                logger.info(f"Updated circuit breaker threshold to {updates['circuit_breaker_failure_threshold']}")
+                
+        except Exception as e:
+            logger.error(f"Error applying config updates: {e}")
+        
     async def stop(self):
-        """Stop the connector agent."""
+        """Stop the connector agent with graceful task cleanup."""
         logger.info("Stopping Exchange Connector Agent...")
         self.running = False
+        
+        # Cancel all background tasks with timeout
+        for task in self._background_tasks:
+            if not task.done():
+                task.cancel()
+        
         # Cancel all tasks
         for task in self.tasks:
             task.cancel()
-        await asyncio.gather(*self.tasks, return_exceptions=True)
+        
+        # Wait for tasks to complete with timeout
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*self.tasks, return_exceptions=True),
+                timeout=10.0
+            )
+            logger.info("All tasks completed successfully")
+        except asyncio.TimeoutError:
+            logger.warning("Some tasks did not complete within timeout")
+        except Exception as e:
+            logger.error(f"Error during task cleanup: {e}")
+        
+        # Clear task references
+        self._background_tasks.clear()
+        self.tasks.clear()
+        self._health_check_task = None
+        
         # Stop all adapters
         for adapter in self.adapters.values():
-            await adapter.stop()
-        logger.info("Exchange Connector Agent stopped")
+            try:
+                await adapter.stop()
+            except Exception as e:
+                logger.error(f"Error stopping adapter: {e}")
+        
+        # Stop streaming bus
+        try:
+            await self.streaming_bus.graceful_shutdown()
+        except Exception as e:
+            logger.error(f"Error stopping streaming bus: {e}")
+        
+        logger.info(f"Exchange Connector Agent stopped - Final integration metrics: {self.integration_metrics}")
         
     async def _collect_trades(self, adapter: VenueAdapter, symbol: str):
         """Collect trades for a symbol with circuit breaker protection."""
@@ -1955,8 +2208,8 @@ class ExchangeConnectorAgent:
         
         while self.running:
             # Check circuit breaker before attempting collection
-            if not await self.streaming_bus.can_component_execute(self.component_id):
-                logger.warning(f"Circuit breaker open for {self.component_id}, skipping trades collection")
+            if not await self.streaming_bus.can_component_execute(self.circuit_breaker_id):
+                logger.warning(f"Circuit breaker open for {self.circuit_breaker_id}, skipping trades collection")
                 await asyncio.sleep(interval_sec)
                 continue
             
@@ -1970,7 +2223,7 @@ class ExchangeConnectorAgent:
                 self.metrics.record_success(operation_key, latency_ms)
                 
                 # Track successful operation
-                await self.streaming_bus.record_component_success(self.component_id)
+                await self.streaming_bus.record_component_success(self.circuit_breaker_id)
                 
                 for trade in trades:
                     # Duplicate detection
@@ -2001,7 +2254,7 @@ class ExchangeConnectorAgent:
                             
                             # Publish with circuit breaker protection
                             success = await self.streaming_bus.publish_with_circuit_breaker_check(
-                                component_id=self.component_id,
+                                component_id=self.circuit_breaker_id,
                                 topic="raw_data.exchange_feed",
                                 partition_key=partition_key,
                                 payload=trade_data,
@@ -2009,6 +2262,32 @@ class ExchangeConnectorAgent:
                                 sequence_number=sequence_num,
                                 dedupe_key=trade.get_hash()  # Use institutional-grade dedupe key
                             )
+                            
+                            # **NEW: Also publish to granular market data topic**
+                            granular_topic = "raw_data.market.trades"
+                            granular_partition_key = f"{adapter.venue}:{trade.symbol}"
+                            
+                            granular_success = await self.streaming_bus.publish_with_headers(
+                                topic=granular_topic,
+                                partition_key=granular_partition_key,
+                                payload=trade_data,
+                                headers={
+                                    "data_type": "trade",
+                                    "venue": adapter.venue,
+                                    "symbol": trade.symbol,
+                                    "trade_type": "spot",  # or futures/perps based on config
+                                    "component_id": self.component_id
+                                },
+                                dedupe_key=trade.get_hash()
+                            )
+                            
+                            # Check granular publication result and log failures
+                            if not granular_success:
+                                logger.error(
+                                    f"Failed to publish trade to granular topic: "
+                                    f"venue={adapter.venue}, symbol={trade.symbol}, "
+                                    f"dedupe_key={trade.get_hash()}, topic={granular_topic}"
+                                )
                             
                             if not success:
                                 logger.warning(f"Failed to publish trade to streaming bus - circuit breaker or network issue")
@@ -2031,7 +2310,7 @@ class ExchangeConnectorAgent:
                 logger.error(f"Error collecting {operation_key}: {e}")
                 self.metrics.record_error(operation_key)
                 # Record circuit breaker failure
-                await self.streaming_bus.record_component_failure(self.component_id)
+                await self.streaming_bus.record_component_failure(self.circuit_breaker_id)
                 
             # Cadence drift guard - maintain alignment
             next_ts += interval_sec

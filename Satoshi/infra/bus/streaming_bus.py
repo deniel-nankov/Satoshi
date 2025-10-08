@@ -54,6 +54,77 @@ except ImportError:
     ConfigResourceType = None
     print("⚠️  aiokafka not installed. Install with: pip install aiokafka kafka-python")
 
+# Compression library detection with graceful fallbacks
+COMPRESSION_LIBRARIES = {}
+
+try:
+    import lz4
+    COMPRESSION_LIBRARIES['lz4'] = True
+    print("✅ LZ4 compression available")
+except ImportError:
+    COMPRESSION_LIBRARIES['lz4'] = False
+    print("⚠️  LZ4 compression not available - install with: pip install lz4")
+
+try:
+    import snappy
+    COMPRESSION_LIBRARIES['snappy'] = True  
+    print("✅ Snappy compression available")
+except ImportError:
+    COMPRESSION_LIBRARIES['snappy'] = False
+    print("⚠️  Snappy compression not available - install with: pip install python-snappy")
+
+try:
+    import zstandard
+    COMPRESSION_LIBRARIES['zstd'] = True
+    print("✅ ZSTD compression available")
+except ImportError:
+    COMPRESSION_LIBRARIES['zstd'] = False
+    print("⚠️  ZSTD compression not available - install with: pip install zstandard")
+
+try:
+    import gzip
+    COMPRESSION_LIBRARIES['gzip'] = True
+    print("✅ GZIP compression available (built-in)")
+except ImportError:
+    COMPRESSION_LIBRARIES['gzip'] = False
+
+def get_best_available_compression() -> str:
+    """
+    Get the best available compression algorithm based on installed libraries.
+    Priority: zstd > lz4 > snappy > gzip > none
+    """
+    if COMPRESSION_LIBRARIES.get('zstd', False):
+        return 'zstd'
+    elif COMPRESSION_LIBRARIES.get('lz4', False):
+        return 'lz4'
+    elif COMPRESSION_LIBRARIES.get('snappy', False):
+        return 'snappy'
+    elif COMPRESSION_LIBRARIES.get('gzip', False):
+        return 'gzip'
+    else:
+        return 'none'
+
+def validate_compression_type(compression_type: str) -> str:
+    """
+    Validate compression type and fallback to available alternative if needed.
+    """
+    # Convert to lowercase string
+    compression_type = str(compression_type).lower()
+    
+    if compression_type == 'none':
+        return 'none'
+        
+    # Check if requested compression is available
+    if COMPRESSION_LIBRARIES.get(compression_type, False):
+        return compression_type
+    
+    # Fallback to best available
+    fallback = get_best_available_compression()
+    if fallback != compression_type:
+        print(f"⚠️  Compression '{compression_type}' not available, falling back to '{fallback}'")
+    
+    return fallback
+
 logger = logging.getLogger(__name__)
 
 def generate_uuidv7() -> str:
@@ -217,7 +288,7 @@ class CircuitBreakerConfig:
     recovery_timeout_us: int = 300_000_000  # 5 minutes recovery timeout
     half_open_max_calls: int = 3         # Max calls in half-open state
     success_threshold: int = 2           # Successes needed to close circuit
-    dependency_components: List[str] = None  # Components this depends on
+    dependency_components: Optional[List[str]] = None  # Components this depends on
     
     def __post_init__(self):
         if self.dependency_components is None:
@@ -308,13 +379,14 @@ class SystemCircuitBreakerManager:
             self.breakers[config.component_id] = CircuitBreakerState_Instance(config)
             
             # Build dependency graphs
-            self.dependency_graph[config.component_id] = config.dependency_components.copy()
+            self.dependency_graph[config.component_id] = config.dependency_components.copy() if config.dependency_components else []
             
             # Update dependents graph
-            for dependency in config.dependency_components:
-                if dependency not in self.dependents_graph:
-                    self.dependents_graph[dependency] = []
-                self.dependents_graph[dependency].append(config.component_id)
+            if config.dependency_components:
+                for dependency in config.dependency_components:
+                    if dependency not in self.dependents_graph:
+                        self.dependents_graph[dependency] = []
+                    self.dependents_graph[dependency].append(config.component_id)
     
     async def can_component_execute(self, component_id: str) -> bool:
         """Check if component can execute considering dependencies."""
@@ -598,18 +670,20 @@ class ProducerPool:
         if not KAFKA_AVAILABLE or AIOKafkaProducer is None:
             raise RuntimeError("Kafka not available")
         
+        # Validate and potentially fallback compression type
+        validated_compression = validate_compression_type(compression_type)
+        
         # Apply rate limiting
-        await self._rate_limit_check(compression_type)
+        await self._rate_limit_check(validated_compression)
             
-        if compression_type not in self.producers:
+        if validated_compression not in self.producers:
             producer_config = {
                 "bootstrap_servers": self.bootstrap_servers,
-                "client_id": f"{self.client_id}-{compression_type}",
-                "compression_type": compression_type,
-                "batch_size": 16384,
+                "client_id": f"{self.client_id}-{validated_compression}",
+                "compression_type": validated_compression,
+                "max_batch_size": 16384,
                 "linger_ms": 1,
                 "acks": "all",
-                "retries": 3,
                 "enable_idempotence": True,
                 "value_serializer": lambda v: json.dumps(v).encode('utf-8') if isinstance(v, dict) else v
             }
@@ -619,9 +693,9 @@ class ProducerPool:
             
             producer = AIOKafkaProducer(**producer_config)
             await producer.start()
-            self.producers[compression_type] = producer
+            self.producers[validated_compression] = producer
             
-        return self.producers[compression_type]
+        return self.producers[validated_compression]
     
     async def _rate_limit_check(self, compression_type: str) -> None:
         """Check and apply rate limiting for producer."""
@@ -1043,9 +1117,13 @@ class StreamingBus:
                 # Get appropriate producer
                 producer = await self.producer_pool.get_producer(compression_type)
                 
-                # Convert headers to Kafka format
-                kafka_headers = [(k, v if isinstance(v, bytes) else v.encode('utf-8')) 
-                               for k, v in transport_headers.items()]
+                # Convert headers to Kafka format - handle all possible types
+                kafka_headers = []
+                for k, v in transport_headers.items():
+                    if isinstance(v, (bytes, bytearray, memoryview)):
+                        kafka_headers.append((k, bytes(v)))
+                    else:
+                        kafka_headers.append((k, str(v).encode('utf-8')))
                 
                 # Send message
                 await producer.send_and_wait(
@@ -1101,10 +1179,16 @@ class StreamingBus:
                 
                 # Get topic config for compression (transport concern)
                 topic_config = self.topic_configs.get(topic)
-                compression_type = topic_config.compression_type.value if topic_config else "lz4"
+                if topic_config and hasattr(topic_config.compression_type, 'value'):
+                    compression_type = topic_config.compression_type.value
+                elif topic_config:
+                    compression_type = str(topic_config.compression_type)
+                else:
+                    compression_type = "lz4"
                 
-                # Get appropriate producer
-                producer = await self.producer_pool.get_producer(compression_type)
+                # Validate and get appropriate producer (with fallback)
+                validated_compression = validate_compression_type(compression_type)
+                producer = await self.producer_pool.get_producer(validated_compression)
                 
                 # Pass through headers without inspection
                 kafka_headers = []
@@ -1546,6 +1630,63 @@ class StreamingBus:
             enable_compaction=True
         ))
         
+        # Alpha Signal Feature Topics (Pure Alpha Generation)
+        self.register_topic_config(TopicConfig(
+            name="features.flow_pressure",
+            partitions=12,
+            replication_factor=3,
+            retention_ms=21600000,  # 6 hours (flow signals decay fast)
+            compression_type=CompressionType.LZ4,
+            cleanup_policy="delete",
+            segment_ms=30000  # 30-second segments for ultra-low latency
+        ))
+        
+        self.register_topic_config(TopicConfig(
+            name="features.momentum_exhaustion",
+            partitions=8,
+            replication_factor=3,
+            retention_ms=43200000,  # 12 hours (momentum signals)
+            compression_type=CompressionType.LZ4,
+            cleanup_policy="delete"
+        ))
+        
+        self.register_topic_config(TopicConfig(
+            name="features.liquidity_stress",
+            partitions=16,
+            replication_factor=3,
+            retention_ms=7200000,  # 2 hours (ultra-high frequency)
+            compression_type=CompressionType.NONE,  # No compression for speed
+            cleanup_policy="delete",
+            segment_ms=10000  # 10-second segments
+        ))
+        
+        self.register_topic_config(TopicConfig(
+            name="features.onchain_flow",
+            partitions=6,
+            replication_factor=3,
+            retention_ms=86400000,  # 24 hours (onchain signals)
+            compression_type=CompressionType.LZ4,
+            cleanup_policy="delete"
+        ))
+        
+        self.register_topic_config(TopicConfig(
+            name="features.ohlcv_signals",
+            partitions=10,
+            replication_factor=3,
+            retention_ms=172800000,  # 48 hours (OHLCV-based alpha signals)
+            compression_type=CompressionType.ZSTD,
+            cleanup_policy="delete"
+        ))
+        
+        self.register_topic_config(TopicConfig(
+            name="features.spread_analysis",
+            partitions=8,
+            replication_factor=3,
+            retention_ms=21600000,  # 6 hours (spread-based alpha signals)
+            compression_type=CompressionType.LZ4,
+            cleanup_policy="delete"
+        ))
+        
         # Label topics
         self.register_topic_config(TopicConfig(
             name="labels.tb",
@@ -1697,6 +1838,101 @@ class StreamingBus:
             compression_type=CompressionType.GZIP,
             cleanup_policy="compact",
             enable_compaction=True
+        ))
+        
+        # ========== CURATED/GOLD LAYER TOPICS ==========
+        # ❌ REMOVED: Alpha computation topics moved to features.* (leakage prevention)
+        # curated.market.ohlcv_1s → features.ohlcv_signals (OHLCV is alpha generation)
+        # curated.market.ohlcv_1m → features.ohlcv_signals (momentum indicators)
+        # curated.market.spreads → features.spread_analysis (spread signals are alpha)
+        
+        self.register_topic_config(TopicConfig(
+            name="curated.market.depth_metrics",
+            partitions=10,
+            replication_factor=3,
+            retention_ms=14400000,  # 4 hours
+            compression_type=CompressionType.LZ4,
+            cleanup_policy="delete"
+        ))
+        
+        # Priority 2: Cross-Venue Normalization
+        self.register_topic_config(TopicConfig(
+            name="curated.venues.normalized_book",
+            partitions=16,
+            replication_factor=3,
+            retention_ms=28800000,  # 8 hours
+            compression_type=CompressionType.ZSTD,
+            cleanup_policy="delete"
+        ))
+        
+        # ❌ REMOVED: Alpha signal topics moved to features.* (leakage prevention)
+        # curated.venues.spread_matrix → features.spread_analysis
+        # curated.venues.flow_divergence → features.flow_pressure
+        
+        # Priority 3: Safe Gold Layer - Business Data Preparation (NO ALPHA)
+        self.register_topic_config(TopicConfig(
+            name="curated.data.trades_1s",
+            partitions=12,
+            replication_factor=3,
+            retention_ms=86400000,  # 24 hours (performance-optimized trades)
+            compression_type=CompressionType.LZ4,
+            cleanup_policy="delete",
+            segment_ms=30000  # 30-second segments for performance
+        ))
+        
+        self.register_topic_config(TopicConfig(
+            name="curated.data.book_snapshots",
+            partitions=16,
+            replication_factor=3,
+            retention_ms=21600000,  # 6 hours (format-standardized books)
+            compression_type=CompressionType.LZ4,
+            cleanup_policy="delete"
+        ))
+        
+        self.register_topic_config(TopicConfig(
+            name="curated.data.indexed_blocks",
+            partitions=6,
+            replication_factor=3,
+            retention_ms=2592000000,  # 30 days (indexed blockchain data)
+            compression_type=CompressionType.GZIP,
+            cleanup_policy="delete"
+        ))
+        
+        self.register_topic_config(TopicConfig(
+            name="curated.data.unified_symbols",
+            partitions=4,
+            replication_factor=3,
+            retention_ms=172800000,  # 48 hours (symbol normalization)
+            compression_type=CompressionType.GZIP,
+            cleanup_policy="delete"
+        ))
+        
+        # Priority 4: Options & Derivatives
+        self.register_topic_config(TopicConfig(
+            name="curated.options.implied_vol_surface",
+            partitions=6,
+            replication_factor=3,
+            retention_ms=604800000,  # 7 days
+            compression_type=CompressionType.ZSTD,
+            cleanup_policy="delete"
+        ))
+        
+        self.register_topic_config(TopicConfig(
+            name="curated.options.flow_analysis",
+            partitions=8,
+            replication_factor=3,
+            retention_ms=43200000,  # 12 hours
+            compression_type=CompressionType.LZ4,
+            cleanup_policy="delete"
+        ))
+        
+        self.register_topic_config(TopicConfig(
+            name="curated.carry.basis_signals",
+            partitions=4,
+            replication_factor=3,
+            retention_ms=604800000,  # 7 days
+            compression_type=CompressionType.GZIP,
+            cleanup_policy="delete"
         ))
         
         # Additional Data Ingestion Layer Topics
@@ -1851,7 +2087,8 @@ class StreamingBus:
         """Get summary of configured topics by category."""
         summary = {
             "raw_data": 0,
-            "clean": 0, 
+            "clean": 0,
+            "curated": 0,
             "incidents": 0,
             "control": 0,
             "other": 0
@@ -1862,6 +2099,8 @@ class StreamingBus:
                 summary["raw_data"] += 1
             elif topic_name.startswith("clean."):
                 summary["clean"] += 1
+            elif topic_name.startswith("curated."):
+                summary["curated"] += 1
             elif topic_name.startswith("incidents."):
                 summary["incidents"] += 1
             elif topic_name.startswith("control."):
@@ -2084,8 +2323,21 @@ class StreamingBus:
     
     async def publish(self, topic: str, partition_key: str, payload: Dict[str, Any], 
                      headers: Optional[Dict[str, str]] = None) -> bool:
-        """Legacy method - use publish_with_headers."""
-        return await self.publish_with_headers(topic, partition_key, payload, headers)
+        """
+        Simplified publish method using canonical headers for institutional compliance.
+        
+        For advanced use cases with full header control, use publish_with_canonical_headers.
+        """
+        return await self.publish_with_canonical_headers(
+            topic=topic,
+            partition_key=partition_key,
+            payload=payload,
+            source_id="simple_publisher",
+            sequence_number=int(time.time() * 1000000),  # Auto-generated from timestamp
+            correlation_id=None,   # Auto-generated
+            producer_version="1.0",
+            time_alignment_id=None
+        )
     
     async def subscribe(self, consumer_group: str, topics: List[str], 
                        handler: Callable[[str, str, Dict[str, Any], Dict[str, str]], None]) -> None:
@@ -2308,6 +2560,124 @@ class StreamingBus:
         """Get basic transport metrics (legacy method)."""
         return self.metrics.copy()
     
+    def get_compression_status(self) -> Dict[str, Any]:
+        """Get comprehensive compression library status and capabilities."""
+        return {
+            "available_libraries": COMPRESSION_LIBRARIES.copy(),
+            "best_available": get_best_available_compression(),
+            "recommendations": {
+                "high_frequency": "lz4" if COMPRESSION_LIBRARIES.get('lz4') else "snappy",
+                "time_series": "zstd" if COMPRESSION_LIBRARIES.get('zstd') else "lz4", 
+                "events": "gzip" if COMPRESSION_LIBRARIES.get('gzip') else "none",
+                "general": get_best_available_compression()
+            },
+            "installation_commands": {
+                "lz4": "pip install lz4",
+                "snappy": "pip install python-snappy", 
+                "zstd": "pip install zstandard",
+                "gzip": "built-in (always available)"
+            }
+        }
+    
+    async def validate_compression_performance(self) -> Dict[str, Any]:
+        """Test compression performance with sample data for optimization guidance."""
+        # Sample time series data (typical market data structure)
+        sample_data = {
+            "timestamp": int(time.time() * 1000000),
+            "symbol": "BTCUSDT",
+            "side": "buy",
+            "price": 45678.91,
+            "quantity": 0.12345,
+            "venue": "binance",
+            "metadata": {
+                "latency_us": 150,
+                "sequence": 12345,
+                "trade_id": "abc123def456"
+            }
+        }
+        
+        # Serialize to JSON for testing
+        json_data = json.dumps(sample_data).encode('utf-8')
+        results = {}
+        
+        # Test each available compression
+        for comp_type, available in COMPRESSION_LIBRARIES.items():
+            if not available:
+                results[comp_type] = {"available": False, "reason": "library_not_installed"}
+                continue
+                
+            try:
+                start_time = time.perf_counter()
+                compressed = b''
+                decompressed = b''
+                
+                if comp_type == 'gzip':
+                    import gzip
+                    compressed = gzip.compress(json_data)
+                    decompressed = gzip.decompress(compressed)
+                elif comp_type == 'lz4':
+                    import lz4.frame
+                    compressed = lz4.frame.compress(json_data)
+                    decompressed = lz4.frame.decompress(compressed)
+                elif comp_type == 'snappy':
+                    import snappy
+                    compressed = snappy.compress(json_data)
+                    decompressed = snappy.decompress(compressed)
+                elif comp_type == 'zstd':
+                    import zstandard
+                    cctx = zstandard.ZstdCompressor()
+                    compressed = cctx.compress(json_data)
+                    dctx = zstandard.ZstdDecompressor()
+                    decompressed = dctx.decompress(compressed)
+                else:
+                    results[comp_type] = {"available": False, "reason": "unknown_compression_type"}
+                    continue
+                
+                end_time = time.perf_counter()
+                
+                # Verify round-trip integrity
+                if decompressed != json_data:
+                    results[comp_type] = {"available": False, "reason": "integrity_check_failed"}
+                    continue
+                
+                results[comp_type] = {
+                    "available": True,
+                    "original_size": len(json_data),
+                    "compressed_size": len(compressed),
+                    "compression_ratio": len(json_data) / len(compressed) if len(compressed) > 0 else 0,
+                    "time_us": (end_time - start_time) * 1000000,
+                    "throughput_mb_per_sec": (len(json_data) / (1024 * 1024)) / (end_time - start_time) if (end_time - start_time) > 0 else 0
+                }
+                
+            except Exception as e:
+                results[comp_type] = {"available": False, "reason": f"test_error: {str(e)}"}
+        
+        # Add recommendations based on results
+        recommendations = {}
+        if results:
+            # Find fastest compression for low-latency scenarios
+            fastest = min([r for r in results.values() if r.get("available", False)], 
+                         key=lambda x: x.get("time_us", float('inf')), default=None)
+            if fastest:
+                fastest_name = [k for k, v in results.items() if v == fastest][0]
+                recommendations["lowest_latency"] = fastest_name
+                
+            # Find best compression ratio for storage efficiency
+            best_ratio = max([r for r in results.values() if r.get("available", False)], 
+                           key=lambda x: x.get("compression_ratio", 0), default=None)
+            if best_ratio:
+                best_ratio_name = [k for k, v in results.items() if v == best_ratio][0]
+                recommendations["best_compression"] = best_ratio_name
+        
+        return {
+            "test_results": results,
+            "recommendations": recommendations,
+            "summary": {
+                "total_libraries_tested": len([r for r in results.values() if r.get("available", False)]),
+                "best_available_compression": get_best_available_compression()
+            }
+        }
+    
     async def graceful_shutdown(self) -> None:
         """Enhanced graceful shutdown with final commits and health monitoring cleanup."""
         logger.info("Starting graceful shutdown of streaming bus...")
@@ -2357,10 +2727,27 @@ class StreamingBus:
         
         logger.info("Enhanced streaming bus shutdown complete")
     
+    def __del__(self):
+        """Destructor to ensure cleanup if shutdown wasn't called."""
+        # Check if there are any unclosed producers
+        if hasattr(self, 'producer_pool') and self.producer_pool:
+            if hasattr(self.producer_pool, 'producers') and self.producer_pool.producers:
+                logger.warning("StreamingBus deleted without proper shutdown - some resources may not be cleaned up")
+                # Can't await in __del__, but log the issue
+    
     # Alias for backward compatibility
     async def shutdown(self) -> None:
         """Gracefully shutdown all producers and consumers."""
         await self.graceful_shutdown()
+    
+    async def __aenter__(self):
+        """Async context manager entry."""
+        return self
+    
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        """Async context manager exit with guaranteed cleanup."""
+        await self.graceful_shutdown()
+        return False
 
 # Pure transport example usage
 async def main():

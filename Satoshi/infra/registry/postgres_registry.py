@@ -573,9 +573,9 @@ async def main():
     config = RegistryConfig(
         host="localhost",
         port=5432,
-        database="satoshi_registry_demo",
-        username="postgres",
-        password=""
+        database="satoshi_registry",
+        username="satoshi",
+        password="secure_password"
     )
     
     registry = PostgreSQLRegistry(config)

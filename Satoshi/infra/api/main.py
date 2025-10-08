@@ -12,12 +12,21 @@ Endpoints:
 - /circuits - Circuit breaker states
 """
 
+from __future__ import annotations
+
+# Smart dependency management
+try:
+    from smart_deps import suppress_optional_warnings
+    suppress_optional_warnings()
+except ImportError:
+    pass  # Graceful fallback
+
 import asyncio
 import time
 import os
-from typing import Dict, Any, List, Optional
 from datetime import datetime, timezone
 import logging
+from typing import Any, Union, Optional
 
 from fastapi import FastAPI, HTTPException, Depends, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -25,14 +34,19 @@ from fastapi.responses import PlainTextResponse
 from pydantic import BaseModel
 import uvicorn
 
-# Import internal components
+# Import internal components with graceful fallbacks
+StreamingBus = None
+MetricsCollector = None
+
 try:
     from infra.bus.streaming_bus import StreamingBus
+except ImportError as e:
+    logging.warning(f"StreamingBus import warning: {e}")
+
+try:
     from infra.monitoring.prometheus_metrics import MetricsCollector
 except ImportError as e:
-    logging.warning(f"Import warning: {e}")
-    StreamingBus = None
-    MetricsCollector = None
+    logging.warning(f"MetricsCollector import warning: {e}")
 
 logger = logging.getLogger(__name__)
 
@@ -49,16 +63,14 @@ class HealthStatus(BaseModel):
     timestamp: datetime
     uptime_seconds: float
     version: str = APP_VERSION
-    components: Dict[str, Any]
+    components: dict[str, Any]
 
-class ComponentHealth(BaseModel):
-    """Individual component health."""
+class ComponentStatus(BaseModel):
+    """Status of a system component."""
     name: str
-    status: str
+    status: str  # "healthy", "degraded", "unhealthy"
     last_check: datetime
-    latency_ms: Optional[float] = None
-    error_rate: Optional[float] = None
-    details: Dict[str, Any] = {}
+    components: dict[str, object]
 
 class CircuitBreakerStatus(BaseModel):
     """Circuit breaker state."""
@@ -114,7 +126,16 @@ async def get_current_service_token(request: Request) -> str:
     
     token = auth_header.split(" ", 1)[1]
     # In production, validate against proper token store/service
-    if token != "dev-admin-token":  # Simple dev token for demo
+    expected_token = os.getenv("ADMIN_SERVICE_TOKEN")
+    if not expected_token:
+        logger.error("ADMIN_SERVICE_TOKEN not configured")
+        raise HTTPException(
+            status_code=503,
+            detail="Authentication service unavailable",
+            headers={"WWW-Authenticate": "Bearer"}
+        )
+    
+    if token != expected_token:
         raise HTTPException(
             status_code=401,
             detail="Invalid service token",
@@ -133,11 +154,11 @@ async def verify_admin_permissions(token: str = Depends(get_current_service_toke
 # DEPENDENCY INJECTION
 # =============================
 
-async def get_streaming_bus(request: Request) -> Optional[StreamingBus]:
+async def get_streaming_bus(request: Request) -> Any:
     """Get streaming bus instance from app state."""
     return getattr(request.app.state, 'streaming_bus', None)
 
-async def get_metrics_collector(request: Request) -> Optional[MetricsCollector]:
+async def get_metrics_collector(request: Request) -> Any:
     """Get metrics collector instance from app state."""
     return getattr(request.app.state, 'metrics_collector', None)
 
@@ -147,8 +168,8 @@ async def get_metrics_collector(request: Request) -> Optional[MetricsCollector]:
 
 @app.get("/health", response_model=HealthStatus)
 async def health_check(
-    streaming_bus: Optional[StreamingBus] = Depends(get_streaming_bus),
-    metrics: Optional[MetricsCollector] = Depends(get_metrics_collector)
+    streaming_bus: Any = Depends(get_streaming_bus),
+    metrics: Any = Depends(get_metrics_collector)
 ) -> HealthStatus:
     """
     Comprehensive system health check.
@@ -166,46 +187,44 @@ async def health_check(
     if streaming_bus:
         try:
             bus_health = streaming_bus.get_health_status()
-            components["streaming_bus"] = ComponentHealth(
+            components["streaming_bus"] = ComponentStatus(
                 name="streaming_bus",
                 status="healthy" if bus_health.get("healthy", False) else "unhealthy",
                 last_check=current_time,
-                latency_ms=bus_health.get("avg_latency_ms"),
-                error_rate=bus_health.get("error_rate"),
-                details=bus_health
+                components=bus_health
             )
             if not bus_health.get("healthy", False):
                 overall_status = "degraded"
         except Exception as e:
-            components["streaming_bus"] = ComponentHealth(
+            components["streaming_bus"] = ComponentStatus(
                 name="streaming_bus",
                 status="unhealthy",
                 last_check=current_time,
-                details={"error": str(e)}
+                components={"error": str(e)}
             )
             overall_status = "unhealthy"
     else:
-        components["streaming_bus"] = ComponentHealth(
+        components["streaming_bus"] = ComponentStatus(
             name="streaming_bus",
-            status="not_configured",
+            status="unavailable",
             last_check=current_time,
-            details={"message": "Streaming bus not initialized"}
+            components={"reason": "not_initialized"}
         )
     
     # Check metrics collector
     if metrics:
-        components["metrics"] = ComponentHealth(
+        components["metrics"] = ComponentStatus(
             name="metrics_collector",
             status="healthy",
             last_check=current_time,
-            details={"collectors_active": True}
+            components={"collectors_active": True}
         )
     else:
-        components["metrics"] = ComponentHealth(
+        components["metrics"] = ComponentStatus(
             name="metrics_collector",
             status="not_configured",
             last_check=current_time,
-            details={"message": "Metrics collector not initialized"}
+            components={"message": "Metrics collector not initialized"}
         )
     
     return HealthStatus(
@@ -216,7 +235,7 @@ async def health_check(
     )
 
 @app.get("/health/live")
-async def liveness_probe() -> Dict[str, str]:
+async def liveness_probe() -> dict[str, str]:
     """
     Kubernetes liveness probe endpoint.
     Simple check that the service is running.
@@ -225,8 +244,8 @@ async def liveness_probe() -> Dict[str, str]:
 
 @app.get("/health/ready")
 async def readiness_probe(
-    streaming_bus: Optional[StreamingBus] = Depends(get_streaming_bus)
-) -> Dict[str, str]:
+    streaming_bus: Any = Depends(get_streaming_bus)
+) -> dict[str, str]:
     """
     Kubernetes readiness probe endpoint.
     Checks if service is ready to accept traffic.
@@ -248,7 +267,7 @@ async def readiness_probe(
 
 @app.get("/metrics", response_class=PlainTextResponse)
 async def prometheus_metrics(
-    metrics: Optional[MetricsCollector] = Depends(get_metrics_collector)
+    metrics: Any = Depends(get_metrics_collector)
 ) -> str:
     """
     Prometheus metrics endpoint.
@@ -274,8 +293,8 @@ satoshi_build_info{{version="{APP_VERSION}"}} 1
 
 @app.get("/status")
 async def detailed_status(
-    streaming_bus: Optional[StreamingBus] = Depends(get_streaming_bus)
-) -> Dict[str, Any]:
+    streaming_bus: Any = Depends(get_streaming_bus)
+) -> dict[str, Any]:
     """
     Detailed system status for operations dashboard.
     Includes performance metrics, error rates, and operational data.
@@ -309,10 +328,10 @@ async def detailed_status(
 # CIRCUIT BREAKER ENDPOINTS
 # =============================
 
-@app.get("/circuits", response_model=List[CircuitBreakerStatus])
+@app.get("/circuits", response_model=list[CircuitBreakerStatus])
 async def circuit_breaker_status(
-    streaming_bus: Optional[StreamingBus] = Depends(get_streaming_bus)
-) -> List[CircuitBreakerStatus]:
+    streaming_bus: Any = Depends(get_streaming_bus)
+) -> list[CircuitBreakerStatus]:
     """Get status of all circuit breakers."""
     circuits = []
     
@@ -332,8 +351,8 @@ async def circuit_breaker_status(
 async def reset_circuit_breaker(
     component_id: str,
     _admin_auth: bool = Depends(verify_admin_permissions),
-    streaming_bus: Optional[StreamingBus] = Depends(get_streaming_bus)
-) -> Dict[str, str]:
+    streaming_bus: Any = Depends(get_streaming_bus)
+) -> dict[str, str]:
     """Reset a specific circuit breaker. Requires admin authentication."""
     if not streaming_bus:
         raise HTTPException(status_code=503, detail="Streaming bus not available")

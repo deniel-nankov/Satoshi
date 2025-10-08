@@ -87,6 +87,8 @@ from typing import Dict, List, Optional, Any, Set, Tuple, Union, Callable
 from enum import Enum
 import numpy as np
 
+from infra.bus.streaming_bus import StreamingBus
+
 
 class DiscrepancyType(Enum):
     """Types of data discrepancies that can be detected."""
@@ -215,6 +217,13 @@ class ReconcilerConfig:
     # Field-specific tolerances
     field_tolerances: Dict[str, Dict[str, Any]] = field(default_factory=dict)
     
+    # Streaming bus configuration
+    streaming_bus: Optional[Dict[str, Any]] = field(default_factory=lambda: {
+        "bootstrap_servers": "localhost:9092",
+        "enable_ssl": False,
+        "enable_sasl": False
+    })
+    
     # Severity policy overrides for operational tuning
     severity_overrides: Dict[str, str] = field(default_factory=dict)  # field_name -> {low|medium|high|critical}
 
@@ -232,22 +241,56 @@ class ReconcilerAgent:
         self.data_sources: Dict[str, DataSource] = {}
         self.session_id = self._generate_session_id()
         
+        # Circuit Breaker Integration - Unique ID for this component
+        self.circuit_breaker_id = f"reconciler_agent_{id(self)}"
+        
+        # Streaming Bus Integration  
+        streaming_config = config.streaming_bus or {
+            "bootstrap_servers": "localhost:9092",
+            "enable_ssl": False,
+            "enable_sasl": False
+        }
+        self.streaming_bus = StreamingBus(streaming_config)
+        
+        # Health monitoring
+        self.health_check_interval = 30.0  # seconds
+        self.last_successful_reconciliation = time.time()
+        self.consecutive_failures = 0
+        self.max_consecutive_failures = 3
+        
         # Concurrency control
         self.fetch_semaphore = asyncio.Semaphore(config.max_concurrent_sources)
         
-        # Statistics tracking
+        # Enhanced statistics tracking with comprehensive metrics
         self.reconciliation_stats = {
             "total_runs": 0,
             "total_discrepancies": 0,
             "total_approval_requests": 0,
             "avg_processing_time": 0.0,
-            "sources_registered": 0
+            "sources_registered": 0,
+            "successful_reconciliations": 0,
+            "failed_reconciliations": 0,
+            "total_records_processed": 0,
+            "avg_discrepancy_rate": 0.0,
+            "circuit_breaker_trips": 0,
+            "approval_requests_generated": 0,
+            "high_severity_discrepancies": 0,
+            "critical_severity_discrepancies": 0,
+            "auto_approval_eligible": 0,
+            "manual_review_required": 0,
+            "source_comparison_pairs": 0,
+            "cache_hit_rate": 0.0
         }
         
         # Cache for deduplication and idempotency
         self.discrepancy_cache: Dict[str, Discrepancy] = {}
         self.approval_cache: Dict[str, Tuple[int, str]] = {}  # discrepancy_id -> (last_request_time, request_signature)
         self.recent_reports: deque = deque(maxlen=100)
+        
+        # Task management for control message handlers
+        self._pending_tasks: set = set()
+        self._shutdown_event = asyncio.Event()
+        self._monitoring_task: Optional[asyncio.Task] = None
         
     def register_data_source(self, source: DataSource) -> None:
         """Register a data source for reconciliation."""
@@ -849,7 +892,6 @@ class ReconcilerAgent:
     def _compare_source_pairs(self, sources: List[DataSource], record_maps: Dict[str, Dict]) -> List[Discrepancy]:
         """Compare all source pairs for discrepancies."""
         discrepancies = []
-        approval_requests = []
         
         for i, source_a in enumerate(sources):
             for source_b in sources[i + 1:]:
@@ -1043,7 +1085,7 @@ class ReconcilerAgent:
     async def reconcile_sources(self, source_names: List[str], 
                               query_params: Optional[Dict[str, Any]] = None) -> ReconciliationReport:
         """
-        Perform reconciliation between specified data sources.
+        Perform reconciliation between specified data sources with circuit breaker protection.
         
         Args:
             source_names: List of source names to reconcile
@@ -1052,6 +1094,17 @@ class ReconcilerAgent:
         Returns:
             ReconciliationReport with discrepancies and approval requests
         """
+        # Check circuit breaker before starting
+        can_execute = True
+        if hasattr(self.streaming_bus, 'can_component_execute'):
+            try:
+                can_execute = await self.streaming_bus.can_component_execute(self.circuit_breaker_id)
+            except Exception as e:
+                print(f"🔄 Reconciler Agent: Circuit breaker check failed: {e}")
+        
+        if not can_execute:
+            raise RuntimeError(f"Reconciler Agent circuit breaker is open - component {self.circuit_breaker_id} cannot execute")
+        
         start_time = int(time.time() * 1_000_000)
         
         # Prune expired approval cache entries to keep memory flat
@@ -1083,7 +1136,7 @@ class ReconcilerAgent:
             source_data = {}
             fetch_errors = {}
             for source in sources:
-                data, error = await self._fetch_data(source, query_params)
+                data, error = await self._fetch_data_with_retry(source, query_params)
                 source_data[source.name] = data
                 if error:
                     fetch_errors[source.name] = error
@@ -1115,11 +1168,24 @@ class ReconcilerAgent:
                     # Cache this request to prevent duplicates
                     self._cache_approval_request(approval_request)
             
-            # Calculate summary statistics
+            # Calculate summary statistics with enhanced metrics
             total_records = total_records_processed
             severity_counts = defaultdict(int)
             for discrepancy in discrepancies:
                 severity_counts[discrepancy.severity.value] += 1
+                # Track high/critical severity counts
+                if discrepancy.severity == ReconciliationSeverity.HIGH:
+                    self.reconciliation_stats["high_severity_discrepancies"] += 1
+                elif discrepancy.severity == ReconciliationSeverity.CRITICAL:
+                    self.reconciliation_stats["critical_severity_discrepancies"] += 1
+            
+            # Track approval request types
+            for approval_request in approval_requests:
+                self.reconciliation_stats["approval_requests_generated"] += 1
+                if approval_request.metadata.get("auto_approve_eligible", False):
+                    self.reconciliation_stats["auto_approval_eligible"] += 1
+                if approval_request.action == ApprovalAction.MANUAL_REVIEW:
+                    self.reconciliation_stats["manual_review_required"] += 1
             
             # Update report with enhanced metadata for reproducibility
             report.completed_at = int(time.time() * 1_000_000)
@@ -1164,7 +1230,8 @@ class ReconcilerAgent:
                     "timestamp_tolerance_seconds": self.config.timestamp_tolerance_seconds,
                     "batch_size": self.config.batch_size,
                     "max_discrepancies_per_run": self.config.max_discrepancies_per_run
-                }
+                },
+                "circuit_breaker_id": self.circuit_breaker_id
             })
             
             report.summary_stats = {
@@ -1174,16 +1241,38 @@ class ReconcilerAgent:
                 "discrepancy_rate": len(discrepancies) / max(total_records, 1),
                 "sources_in_sync": len(discrepancies) == 0
             }
+            
+            processing_time_seconds = (report.completed_at - report.started_at) / 1_000_000
             report.performance_metrics = {
-                "processing_time_seconds": (report.completed_at - report.started_at) / 1_000_000,
-                "records_per_second": total_records / max((report.completed_at - report.started_at) / 1_000_000, 0.001),
-                "discrepancies_per_second": len(discrepancies) / max((report.completed_at - report.started_at) / 1_000_000, 0.001)
+                "processing_time_seconds": processing_time_seconds,
+                "records_per_second": total_records / max(processing_time_seconds, 0.001),
+                "discrepancies_per_second": len(discrepancies) / max(processing_time_seconds, 0.001),
+                "source_comparison_pairs": len(sources) * (len(sources) - 1) // 2
             }
             
-            # Update statistics
+            # Update comprehensive statistics
             self.reconciliation_stats["total_runs"] += 1
+            self.reconciliation_stats["successful_reconciliations"] += 1
             self.reconciliation_stats["total_discrepancies"] += len(discrepancies)
             self.reconciliation_stats["total_approval_requests"] += len(approval_requests)
+            self.reconciliation_stats["total_records_processed"] += total_records
+            self.reconciliation_stats["source_comparison_pairs"] += report.performance_metrics["source_comparison_pairs"]
+            
+            # Update running averages
+            if self.reconciliation_stats["total_runs"] > 0:
+                self.reconciliation_stats["avg_processing_time"] = (
+                    (self.reconciliation_stats["avg_processing_time"] * (self.reconciliation_stats["total_runs"] - 1) + 
+                     processing_time_seconds) / self.reconciliation_stats["total_runs"]
+                )
+            
+            # Record success with circuit breaker
+            if hasattr(self.streaming_bus, 'record_component_success'):
+                try:
+                    await self.streaming_bus.record_component_success(self.circuit_breaker_id)
+                    self.consecutive_failures = 0
+                    self.last_successful_reconciliation = time.time()
+                except Exception as cb_error:
+                    print(f"🔄 Reconciler Agent: Failed to record circuit breaker success: {cb_error}")
             
             # Cache report
             self.recent_reports.append(report)
@@ -1195,7 +1284,53 @@ class ReconcilerAgent:
             report.completed_at = int(time.time() * 1_000_000)
             report.metadata["error"] = str(e)
             report.metadata["error_type"] = type(e).__name__
+            
+            # Update failure statistics
+            self.reconciliation_stats["failed_reconciliations"] += 1
+            self.consecutive_failures += 1
+            
+            # Record failure with circuit breaker
+            if hasattr(self.streaming_bus, 'record_component_failure'):
+                try:
+                    await self.streaming_bus.record_component_failure(self.circuit_breaker_id)
+                except Exception as cb_error:
+                    print(f"🔄 Reconciler Agent: Failed to record circuit breaker failure: {cb_error}")
+            
             raise
+    
+    async def _fetch_data_with_retry(self, source: DataSource, query_params: Optional[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Optional[str]]:
+        """Fetch data from a source with exponential backoff retry logic and circuit breaker integration."""
+        max_retries = 3
+        base_delay = 1.0
+        
+        for attempt in range(max_retries):
+            try:
+                # Check circuit breaker before each attempt
+                can_execute = True
+                if hasattr(self.streaming_bus, 'can_component_execute'):
+                    try:
+                        can_execute = await self.streaming_bus.can_component_execute(self.circuit_breaker_id)
+                    except Exception:
+                        pass  # Continue on circuit breaker check failure
+                
+                if not can_execute:
+                    return [], f"Circuit breaker open for component {self.circuit_breaker_id}"
+                
+                # Attempt to fetch data
+                data, error = await self._fetch_data(source, query_params)
+                return data, error  # Success, return immediately
+                
+            except Exception as e:
+                if attempt == max_retries - 1:  # Last attempt
+                    return [], f"Failed after {max_retries} attempts: {str(e)}"
+                else:
+                    # Exponential backoff with jitter
+                    delay = base_delay * (2 ** attempt) + (0.1 * attempt)
+                    await asyncio.sleep(delay)
+                    print(f"🔄 Reconciler Agent: Retry {attempt + 1}/{max_retries} for {source.name} after {delay:.2f}s: {e}")
+        
+        # This should never be reached, but just in case
+        return [], "Unexpected end of retry loop"
     
     def get_reconciliation_stats(self) -> Dict[str, Any]:
         """Get comprehensive reconciliation statistics."""
@@ -1210,6 +1345,554 @@ class ReconcilerAgent:
     def get_recent_reports(self, limit: int = 10) -> List[ReconciliationReport]:
         """Get recent reconciliation reports."""
         return list(self.recent_reports)[-limit:]
+    
+    async def start(self):
+        """Start the reconciler agent with Kafka control consumption and health monitoring."""
+        print("🔄 Starting Reconciler Agent...")
+        
+        # Register with circuit breaker system
+        try:
+            if hasattr(self.streaming_bus, 'register_circuit_breaker'):
+                await self.streaming_bus.register_circuit_breaker(
+                    component_id=self.circuit_breaker_id,
+                    failure_threshold=self.max_consecutive_failures
+                )
+                print(f"🔄 Reconciler Agent: Registered circuit breaker with ID: {self.circuit_breaker_id}")
+        except Exception as e:
+            print(f"🔄 Reconciler Agent: Warning - Could not register circuit breaker: {e}")
+        
+        # Start health monitoring
+        self._monitoring_task = asyncio.create_task(self._health_monitoring_loop())
+        
+        # Start Kafka control message consumption
+        control_task = asyncio.create_task(self._consume_control_messages())
+        
+        # Start clean data consumption for real-time reconciliation
+        data_task = asyncio.create_task(self._consume_clean_data())
+        
+        print("🔄 Reconciler Agent started with control and data consumption")
+    
+    async def _health_monitoring_loop(self):
+        """Health monitoring loop with circuit breaker integration."""
+        while not self._shutdown_event.is_set():
+            try:
+                await asyncio.sleep(self.health_check_interval)
+                
+                if self._shutdown_event.is_set():
+                    break
+                
+                # Check if circuit breaker allows execution
+                can_execute = True
+                if hasattr(self.streaming_bus, 'can_component_execute'):
+                    try:
+                        can_execute = await self.streaming_bus.can_component_execute(self.circuit_breaker_id)
+                    except Exception as e:
+                        print(f"🔄 Reconciler Agent: Circuit breaker check failed: {e}")
+                
+                if not can_execute:
+                    print(f"🔄 Reconciler Agent: Circuit breaker open, skipping health check")
+                    continue
+                
+                # Perform health check
+                await self._perform_health_check()
+                
+                # Update metrics
+                await self._update_health_metrics()
+                
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                print(f"🔄 Reconciler Agent: Health monitoring error: {e}")
+                self.consecutive_failures += 1
+                
+                # Trip circuit breaker on repeated failures
+                if (self.consecutive_failures >= self.max_consecutive_failures and 
+                    hasattr(self.streaming_bus, 'record_component_failure')):
+                    try:
+                        await self.streaming_bus.record_component_failure(
+                            component_id=self.circuit_breaker_id
+                        )
+                        self.reconciliation_stats["circuit_breaker_trips"] += 1
+                        print(f"🔄 Reconciler Agent: Circuit breaker tripped after {self.consecutive_failures} failures")
+                    except Exception as cb_error:
+                        print(f"🔄 Reconciler Agent: Failed to record circuit breaker failure: {cb_error}")
+    
+    async def _perform_health_check(self):
+        """Perform health check on registered data sources."""
+        try:
+            health_check_start = time.time()
+            
+            # Check connectivity to registered data sources
+            healthy_sources = 0
+            total_sources = len(self.data_sources)
+            
+            for source_name, source in self.data_sources.items():
+                try:
+                    # Simplified health check - in production would check actual connectivity
+                    if source.connection_params:
+                        healthy_sources += 1
+                except Exception as source_error:
+                    print(f"🔄 Reconciler Agent: Health check failed for source {source_name}: {source_error}")
+            
+            # Consider healthy if at least half of sources are accessible
+            health_ratio = healthy_sources / max(total_sources, 1)
+            is_healthy = health_ratio >= 0.5 or total_sources == 0  # Healthy if no sources registered yet
+            
+            if is_healthy:
+                self.consecutive_failures = 0
+                self.last_successful_reconciliation = time.time()
+                
+                # Record success with circuit breaker
+                if hasattr(self.streaming_bus, 'record_component_success'):
+                    await self.streaming_bus.record_component_success(self.circuit_breaker_id)
+            else:
+                self.consecutive_failures += 1
+                print(f"🔄 Reconciler Agent: Health check failed - {healthy_sources}/{total_sources} sources healthy")
+            
+            health_check_duration = time.time() - health_check_start
+            print(f"🔄 Reconciler Agent: Health check completed in {health_check_duration:.3f}s - {healthy_sources}/{total_sources} sources healthy")
+            
+        except Exception as e:
+            print(f"🔄 Reconciler Agent: Health check error: {e}")
+            self.consecutive_failures += 1
+    
+    async def _update_health_metrics(self):
+        """Update health and performance metrics."""
+        try:
+            current_time = time.time()
+            
+            # Calculate cache hit rate
+            total_cache_access = (self.reconciliation_stats.get("total_discrepancies", 0) + 
+                                len(self.discrepancy_cache))
+            cache_hits = len(self.discrepancy_cache)
+            self.reconciliation_stats["cache_hit_rate"] = (
+                cache_hits / max(total_cache_access, 1)
+            ) * 100.0
+            
+            # Update averages
+            total_runs = self.reconciliation_stats["total_runs"]
+            if total_runs > 0:
+                self.reconciliation_stats["avg_discrepancy_rate"] = (
+                    self.reconciliation_stats["total_discrepancies"] / 
+                    max(self.reconciliation_stats["total_records_processed"], 1)
+                ) * 100.0
+            
+            # Publish metrics to Kafka (optional)
+            if hasattr(self.streaming_bus, 'publish'):
+                try:
+                    metrics_message = {
+                        "component_id": self.circuit_breaker_id,
+                        "timestamp": int(current_time * 1_000_000),
+                        "metrics": {
+                            "consecutive_failures": self.consecutive_failures,
+                            "last_successful_reconciliation": self.last_successful_reconciliation,
+                            "cache_hit_rate": self.reconciliation_stats["cache_hit_rate"],
+                            "avg_discrepancy_rate": self.reconciliation_stats["avg_discrepancy_rate"],
+                            "sources_registered": len(self.data_sources),
+                            "pending_tasks": len(self._pending_tasks)
+                        }
+                    }
+                    
+                    # Use fire-and-forget publishing to avoid blocking health monitoring
+                    asyncio.create_task(self.streaming_bus.publish(
+                        topic="metrics.reconciler",
+                        partition_key=self.circuit_breaker_id,
+                        payload=metrics_message
+                    ))
+                except Exception as pub_error:
+                    # Don't fail health monitoring due to metrics publishing issues
+                    pass
+                    
+        except Exception as e:
+            print(f"🔄 Reconciler Agent: Metrics update error: {e}")
+    
+    async def _consume_clean_data(self):
+        """Consume clean data streams for real-time reconciliation monitoring."""
+        clean_data_topics = [
+            "clean.market.trades",
+            "clean.market.book", 
+            "clean.market.funding",
+            "clean.market.oi",
+            "clean.market.onchain",
+            "clean.market.options",
+            "clean.market.events"
+        ]
+        
+        print(f"🔄 Reconciler Agent: Starting clean data consumption from topics: {clean_data_topics}")
+        
+        try:
+            # Use worker pool for parallel reconciliation processing
+            await self.streaming_bus.subscribe_with_worker_pool(
+                consumer_group="reconciler_data_monitor",
+                topics=clean_data_topics,
+                handler=self._handle_clean_data_message_smart,
+                pool_size=8  # Parallel reconciliation checks
+            )
+                
+        except Exception as e:
+            print(f"🔄 Reconciler Agent: Error in clean data consumption: {e}")
+            # Record failure with circuit breaker
+            await self.streaming_bus.system_circuit_breaker.record_component_failure(
+                component_id="reconciler_agent",
+                cascade_to_dependents=False
+            )
+    
+    def _handle_clean_data_wrapper(self, topic: str, partition_key: str, 
+                                 message: dict, headers: dict):
+        """Wrapper to handle clean data messages."""
+        # Schedule the async handler
+        asyncio.create_task(self._handle_clean_data_message(topic, message, headers))
+    
+    def _handle_clean_data_message_smart(self, topic: str, partition_key: str, payload: Dict[str, Any], headers: Dict[str, str]) -> None:
+        """Smart handler for clean data messages with real-time reconciliation triggers."""
+        try:
+            # Extract reconciliation metadata
+            table_name = payload.get("table_name") or self._extract_table_from_topic(topic)
+            venue = headers.get("venue", "unknown")
+            timestamp = payload.get("timestamp", int(time.time_ns() // 1000))
+            
+            # Schedule async reconciliation analysis
+            asyncio.create_task(self._process_reconciliation_trigger_async(table_name, venue, payload, headers, timestamp))
+            
+        except Exception as e:
+            print(f"🔄 Reconciler Agent: Error handling clean data from {topic}: {e}")
+    
+    def _extract_table_from_topic(self, topic: str) -> str:
+        """Extract table name from topic for reconciliation grouping."""
+        if "trades" in topic:
+            return "market_trades"
+        elif "book" in topic:
+            return "market_book"
+        elif "funding" in topic:
+            return "market_funding"
+        elif "options" in topic:
+            return "options_surface"
+        elif "onchain" in topic:
+            return "onchain_flows"
+        else:
+            return "unknown_table"
+    
+    async def _process_reconciliation_trigger_async(self, table_name: str, venue: str, payload: Dict[str, Any], 
+                                                  headers: Dict[str, str], timestamp: int) -> None:
+        """Asynchronously process reconciliation triggers with smart pattern detection."""
+        try:
+            # Track data arrival by venue and table
+            data_key = f"{table_name}_{venue}"
+            instrument_id = payload.get("instrument_id") or payload.get("symbol", "unknown")
+            
+            # Smart reconciliation logic
+            if table_name in ["market_trades", "options_surface", "market_book"]:
+                # Check if we have recent data from multiple venues for same instrument
+                if instrument_id and instrument_id != "unknown":
+                    await self._check_cross_venue_reconciliation(table_name, instrument_id, venue, payload, timestamp)
+            
+            # Check for temporal reconciliation opportunities
+            if table_name == "market_trades":
+                await self._check_temporal_patterns(venue, payload, timestamp)
+            
+            # Check for data completeness 
+            await self._check_data_completeness(table_name, venue, payload, timestamp)
+            
+            print(f"🔄 Reconciler Agent: Processed {table_name} from {venue} (instrument: {instrument_id})")
+            
+        except Exception as e:
+            print(f"🔄 Reconciler Agent: Error in reconciliation processing for {table_name}: {e}")
+    
+    async def _check_temporal_patterns(self, venue: str, payload: Dict[str, Any], timestamp: int) -> None:
+        """Check for temporal reconciliation patterns."""
+        try:
+            # Simple temporal analysis - check for data ordering issues
+            trade_timestamp = payload.get("timestamp", timestamp)
+            time_diff = timestamp - trade_timestamp
+            
+            if time_diff > 300_000_000:  # More than 5 minutes delay
+                print(f"🔄 Reconciler Agent: Detected temporal anomaly for {venue} - {time_diff/1_000_000:.1f}s delay")
+                
+        except Exception as e:
+            print(f"🔄 Reconciler Agent: Error in temporal pattern check: {e}")
+    
+    async def _check_data_completeness(self, table_name: str, venue: str, payload: Dict[str, Any], timestamp: int) -> None:
+        """Check for data completeness reconciliation opportunities."""
+        try:
+            # Track data completeness metrics
+            required_fields = self._get_required_fields_for_table(table_name)
+            missing_fields = [field for field in required_fields if field not in payload]
+            
+            if missing_fields:
+                print(f"🔄 Reconciler Agent: Data completeness issue for {table_name} from {venue} - missing: {missing_fields}")
+                
+        except Exception as e:
+            print(f"🔄 Reconciler Agent: Error in data completeness check: {e}")
+    
+    def _get_required_fields_for_table(self, table_name: str) -> List[str]:
+        """Get required fields for a data table."""
+        field_mapping = {
+            "market_trades": ["price", "volume", "timestamp", "side"],
+            "market_book": ["bids", "asks", "timestamp"],
+            "options_surface": ["strike", "expiry", "iv", "timestamp"],
+            "market_funding": ["rate", "timestamp"],
+            "onchain_flows": ["block_height", "timestamp"]
+        }
+        return field_mapping.get(table_name, [])
+    
+    async def _check_cross_venue_reconciliation(self, table_name: str, instrument_id: str, venue: str, 
+                                              payload: Dict[str, Any], timestamp: int) -> None:
+        """Check for cross-venue reconciliation opportunities."""
+        try:
+            # Store recent data point for cross-venue comparison
+            reconciliation_key = f"{table_name}_{instrument_id}"
+            
+            # Simple heuristic: if we haven't seen this data combination recently, store it
+            # In production, this would trigger sophisticated reconciliation logic
+            if reconciliation_key not in getattr(self, '_recent_data_cache', {}):
+                if not hasattr(self, '_recent_data_cache'):
+                    self._recent_data_cache = {}
+                
+                self._recent_data_cache[reconciliation_key] = {
+                    'venue': venue,
+                    'timestamp': timestamp,
+                    'payload_sample': payload
+                }
+                
+                print(f"🔄 Reconciler Agent: Cached {reconciliation_key} from {venue} for cross-venue reconciliation")
+                
+        except Exception as e:
+            print(f"🔄 Reconciler Agent: Error in cross-venue reconciliation check: {e}")
+    
+    async def _handle_clean_data_message(self, topic: str, message: dict, headers: dict):
+        """Handle clean data messages for potential reconciliation triggers."""
+        try:
+            table_name = message.get("table_name")
+            venue = headers.get("venue", "unknown")
+            
+            # Track data arrival for reconciliation scheduling
+            data_key = f"{table_name}_{venue}"
+            
+            # Simple heuristic: if we have data from multiple venues for same table,
+            # we might want to trigger reconciliation
+            if table_name in ["exchange_trades", "market_trades", "options_surface"]:
+                print(f"🔄 Reconciler Agent: Received {table_name} data from {venue}")
+                # Could implement smart reconciliation triggers here
+                # For now, just log the data flow
+                
+        except Exception as e:
+            print(f"🔄 Reconciler Agent: Error handling clean data from {topic}: {e}")
+    
+    async def _consume_control_messages(self):
+        """Consume control messages from Kafka topics for dynamic configuration."""
+        control_topics = [
+            "control.circuit_breaker",
+            "control.config_update", 
+            "control.reconciliation_schedule",
+            "control.data_sources"
+        ]
+        
+        print(f"🔄 Reconciler Agent: Starting control message consumption from topics: {control_topics}")
+        
+        try:
+            await self.streaming_bus.subscribe(
+                consumer_group="reconciler_agent_control",
+                topics=control_topics,
+                handler=self._handle_control_message_wrapper
+            )
+                
+        except Exception as e:
+            print(f"🔄 Reconciler Agent: Error in control message consumption: {e}")
+            # Use the system circuit breaker to record failure
+            await self.streaming_bus.system_circuit_breaker.record_component_failure(
+                component_id="reconciler_agent",
+                cascade_to_dependents=False
+            )
+    
+    def _handle_control_message_wrapper(self, topic: str, partition_key: str, 
+                                      message: dict, headers: dict):
+        """Wrapper to handle the subscribe callback signature."""
+        # Schedule the async handler and store task reference
+        task = asyncio.create_task(self._handle_control_message(topic, message))
+        self._pending_tasks.add(task)
+        
+        # Add callback to remove task when done
+        def task_done_callback(completed_task):
+            self._pending_tasks.discard(completed_task)
+            # Check for exceptions
+            exc = completed_task.exception()
+            if exc:
+                print(f"🔄 Reconciler Agent: Control message handler failed: {exc}")
+        
+        task.add_done_callback(task_done_callback)
+    
+    async def _handle_control_message(self, topic: str, message: dict):
+        """Handle control messages for dynamic behavior adjustment."""
+        try:
+            if topic == "control.circuit_breaker":
+                # Handle circuit breaker commands
+                component_id = message.get("component_id")
+                if component_id == "reconciler_agent" or component_id == "all":
+                    action = message.get("action")
+                    if action == "open":
+                        print(f"🔄 Reconciler Agent: Circuit breaker opened via control message")
+                        await self.streaming_bus.system_circuit_breaker.record_component_failure(
+                            component_id="reconciler_agent",
+                            cascade_to_dependents=False
+                        )
+                    elif action == "close":
+                        print(f"🔄 Reconciler Agent: Circuit breaker closed via control message")
+                        await self.streaming_bus.system_circuit_breaker.record_component_success(
+                            component_id="reconciler_agent"
+                        )
+                        
+            elif topic == "control.config_update":
+                # Handle dynamic configuration updates
+                component_id = message.get("component_id")
+                if component_id == "reconciler_agent" or component_id == "all":
+                    config_updates = message.get("updates", {})
+                    await self._apply_config_updates(config_updates)
+                    
+            elif topic == "control.reconciliation_schedule":
+                # Handle scheduled reconciliation requests
+                source_names = message.get("source_names", [])
+                priority = message.get("priority", "normal")
+                if source_names:
+                    print(f"🔄 Reconciler Agent: Scheduled reconciliation for sources: {source_names} (priority: {priority})")
+                    try:
+                        # Trigger immediate reconciliation
+                        report = await self.reconcile_sources(source_names)
+                        print(f"🔄 Reconciler Agent: Reconciliation completed. Found {len(report.discrepancies)} discrepancies")
+                    except Exception as recon_error:
+                        print(f"🔄 Reconciler Agent: Reconciliation failed: {recon_error}")
+                        
+            elif topic == "control.data_sources":
+                # Handle data source configuration changes
+                action = message.get("action")
+                source_config = message.get("source_config", {})
+                try:
+                    if action == "add":
+                        source_name = source_config.get('name')
+                        if source_name:
+                            print(f"🔄 Reconciler Agent: Adding data source: {source_name}")
+                            # Create and register new data source
+                            # DataSource is already defined in this file
+                            new_source = DataSource(
+                                name=source_name,
+                                connection_params=source_config.get('connection_params', {}),
+                                priority=source_config.get('priority', 1),
+                                key_fields=source_config.get('key_fields', ['id'])
+                            )
+                            self.register_data_source(new_source)
+                    elif action == "remove":
+                        source_name = message.get("source_name")
+                        if source_name and source_name in self.data_sources:
+                            print(f"🔄 Reconciler Agent: Removing data source: {source_name}")
+                            del self.data_sources[source_name]
+                            self.reconciliation_stats["sources_registered"] = len(self.data_sources)
+                    elif action == "update":
+                        source_name = source_config.get('name')
+                        if source_name and source_name in self.data_sources:
+                            print(f"🔄 Reconciler Agent: Updating data source: {source_name}")
+                            # Update existing data source properties
+                            existing_source = self.data_sources[source_name]
+                            if 'priority' in source_config:
+                                existing_source.priority = source_config['priority']
+                            if 'key_fields' in source_config:
+                                existing_source.key_fields = source_config['key_fields']
+                except Exception as ds_error:
+                    print(f"🔄 Reconciler Agent: Data source operation failed: {ds_error}")
+                        
+        except Exception as e:
+            print(f"🔄 Reconciler Agent: Error handling control message from {topic}: {e}")
+    
+    async def _apply_config_updates(self, updates: dict):
+        """Apply dynamic configuration updates."""
+        try:
+            # Update tolerance settings
+            if "float_tolerance" in updates:
+                self.config.float_tolerance = updates["float_tolerance"]
+                print(f"🔄 Reconciler Agent: Updated float_tolerance to {updates['float_tolerance']}")
+                
+            if "timestamp_tolerance_seconds" in updates:
+                self.config.timestamp_tolerance_seconds = updates["timestamp_tolerance_seconds"]
+                print(f"🔄 Reconciler Agent: Updated timestamp_tolerance_seconds to {updates['timestamp_tolerance_seconds']}")
+                
+            # Update batch processing
+            if "batch_size" in updates:
+                self.config.batch_size = updates["batch_size"]
+                print(f"🔄 Reconciler Agent: Updated batch_size to {updates['batch_size']}")
+                
+            if "max_concurrent_sources" in updates:
+                self.config.max_concurrent_sources = updates["max_concurrent_sources"]
+                # Update the semaphore
+                self.fetch_semaphore = asyncio.Semaphore(self.config.max_concurrent_sources)
+                print(f"🔄 Reconciler Agent: Updated max_concurrent_sources to {updates['max_concurrent_sources']}")
+                
+        except Exception as e:
+            print(f"🔄 Reconciler Agent: Error applying config updates: {e}")
+    
+    async def stop(self):
+        """Stop the reconciler agent and clean up pending tasks."""
+        print("🔄 Stopping Reconciler Agent...")
+        
+        # Signal shutdown
+        self._shutdown_event.set()
+        
+        # Stop health monitoring
+        if self._monitoring_task and not self._monitoring_task.done():
+            print("🔄 Reconciler Agent: Stopping health monitoring...")
+            self._monitoring_task.cancel()
+            try:
+                await self._monitoring_task
+            except asyncio.CancelledError:
+                pass
+            except Exception as e:
+                print(f"🔄 Reconciler Agent: Error stopping health monitoring: {e}")
+        
+        # Cancel all pending control message handler tasks
+        if hasattr(self, '_pending_tasks'):
+            print(f"🔄 Reconciler Agent: Cancelling {len(self._pending_tasks)} pending tasks")
+            
+            # Cancel all pending tasks
+            for task in list(self._pending_tasks):
+                if not task.done():
+                    task.cancel()
+            
+            # Wait for cancelled tasks to complete
+            if self._pending_tasks:
+                try:
+                    await asyncio.gather(*self._pending_tasks, return_exceptions=True)
+                except Exception as e:
+                    print(f"🔄 Reconciler Agent: Error during task cleanup: {e}")
+            
+            # Clear the task set
+            self._pending_tasks.clear()
+        
+        # Publish final metrics before shutdown
+        if hasattr(self.streaming_bus, 'publish'):
+            try:
+                final_metrics = {
+                    "component_id": self.circuit_breaker_id,
+                    "timestamp": int(time.time() * 1_000_000),
+                    "event": "shutdown",
+                    "final_stats": self.reconciliation_stats
+                }
+                
+                await self.streaming_bus.publish(
+                    topic="metrics.reconciler",
+                    partition_key=self.circuit_breaker_id,
+                    payload=final_metrics
+                )
+                print("🔄 Reconciler Agent: Published final metrics")
+            except Exception as e:
+                print(f"🔄 Reconciler Agent: Failed to publish final metrics: {e}")
+        
+        # Close streaming bus connections
+        if hasattr(self, 'streaming_bus'):
+            try:
+                await self.streaming_bus.shutdown()
+                print("🔄 Reconciler Agent: Streaming bus shutdown")
+            except Exception as e:
+                print(f"🔄 Reconciler Agent: Error shutting down streaming bus: {e}")
+        
+        print("🔄 Reconciler Agent stopped")
+        print(f"🔄 Final Statistics: {self.reconciliation_stats}")
 
 
 # Example usage and demo

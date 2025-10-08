@@ -28,13 +28,25 @@ try:
     from pyiceberg.catalog.sql import SqlCatalog
     from pyiceberg.table import Table
     from pyiceberg.schema import Schema
-    from pyiceberg.types import *
+    from pyiceberg.types import (
+        StringType, IntegerType, LongType, DoubleType, FloatType, 
+        BooleanType, DateType, TimestampType, BinaryType, NestedField
+    )
     from pyiceberg.partitioning import PartitionSpec, PartitionField
     from pyiceberg.transforms import YearTransform, MonthTransform, DayTransform, IdentityTransform
     ICEBERG_AVAILABLE = True
 except ImportError:
     ICEBERG_AVAILABLE = False
     print("⚠️  PyIceberg not installed. Install with: pip install pyiceberg")
+    # Create stub types for when Iceberg is not available
+    SqlCatalog = None
+    Table = None
+    Schema = None
+    PartitionSpec = None
+    PartitionField = None
+    StringType = IntegerType = LongType = DoubleType = FloatType = None
+    BooleanType = DateType = TimestampType = BinaryType = NestedField = None
+    YearTransform = MonthTransform = DayTransform = IdentityTransform = None
 
 # PyArrow for Parquet
 try:
@@ -45,6 +57,9 @@ try:
 except ImportError:
     ARROW_AVAILABLE = False
     print("⚠️  PyArrow not installed. Install with: pip install pyarrow")
+    pa = None
+    pq = None
+    ds = None
 
 import pandas as pd
 import numpy as np
@@ -283,25 +298,38 @@ class LakehouseManager:
             logger.error(f"Failed to create table {dataset_name}: {e}")
             return False
     
-    def _create_iceberg_schema(self, schema_def: Dict[str, str]) -> Schema:
+    def _create_iceberg_schema(self, schema_def: Dict[str, str]) -> Any:
         """Convert schema definition to Iceberg schema."""
+        if not ICEBERG_AVAILABLE or not StringType:
+            logger.warning("Iceberg not available, returning None schema")
+            return None
+            
         fields = []
         field_id = 1
         
-        type_mapping = {
-            "string": StringType(),
-            "int32": IntegerType(),
-            "int64": LongType(),
-            "double": DoubleType(),
-            "float": FloatType(),
-            "boolean": BooleanType(),
-            "date32": DateType(),
-            "timestamp": TimestampType(),
-            "binary": BinaryType()
-        }
-        
         for field_name, field_type in schema_def.items():
-            iceberg_type = type_mapping.get(field_type, StringType())
+            # Map string types to Iceberg types
+            if field_type == "string":
+                iceberg_type = StringType()
+            elif field_type == "int32":
+                iceberg_type = IntegerType()
+            elif field_type == "int64":
+                iceberg_type = LongType()
+            elif field_type == "double":
+                iceberg_type = DoubleType()
+            elif field_type == "float":
+                iceberg_type = FloatType()
+            elif field_type == "boolean":
+                iceberg_type = BooleanType()
+            elif field_type == "date32":
+                iceberg_type = DateType()
+            elif field_type == "timestamp":
+                iceberg_type = TimestampType()
+            elif field_type == "binary":
+                iceberg_type = BinaryType()
+            else:
+                iceberg_type = StringType()  # Default fallback
+                
             fields.append(NestedField(
                 field_id=field_id,
                 name=field_name,

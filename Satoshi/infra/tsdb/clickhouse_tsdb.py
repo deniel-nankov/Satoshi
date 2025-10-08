@@ -74,7 +74,27 @@ class ClickHouseTSDB:
         
         if CLICKHOUSE_AVAILABLE:
             try:
-                self.client = clickhouse_connect.get_client(
+                # Create initial client to set up database
+                temp_client = clickhouse_connect.get_client(  # type: ignore
+                    host=config.host,
+                    port=config.port,
+                    username=config.username,
+                    password=config.password,
+                    secure=config.secure,
+                    compress=config.compress,
+                    settings={
+                        'max_execution_time': config.max_execution_time,
+                        'max_memory_usage': config.max_memory_usage,
+                        'max_threads': config.max_threads
+                    }
+                )
+                # Create database if it doesn't exist
+                temp_client.command(f"CREATE DATABASE IF NOT EXISTS {config.database}")
+                # Close temporary client to avoid resource leak
+                temp_client.close()
+                
+                # Create persistent client connected to the database
+                self.client = clickhouse_connect.get_client(  # type: ignore
                     host=config.host,
                     port=config.port,
                     database=config.database,
@@ -88,7 +108,7 @@ class ClickHouseTSDB:
                         'max_threads': config.max_threads
                     }
                 )
-                logger.info(f"Connected to ClickHouse at {config.host}:{config.port}")
+                logger.info(f"Connected to ClickHouse at {config.host}:{config.port}/{config.database}")
             except Exception as e:
                 logger.error(f"Failed to connect to ClickHouse: {e}")
                 self.client = None

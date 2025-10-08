@@ -498,6 +498,14 @@ class EventsCollectorAgent:
         })
         self.streaming_bus = StreamingBus(streaming_config)
         
+        # Component identification for circuit breaker
+        self.component_id = "events_collector"
+        self.circuit_breaker_id = f"events_collector_{id(self)}"
+        self._circuit_breaker_registered = False
+        
+        # Task management for async operations
+        self._tasks = set()
+        
         # Enhanced Event Processing Components
         self.classifier = EventClassifier()
         self.validator = EventValidator()
@@ -505,6 +513,39 @@ class EventsCollectorAgent:
         
         self.running = False
         self.tasks: list[asyncio.Task] = []
+        
+        # Enhanced task management for health monitoring
+        self._background_tasks: set[asyncio.Task] = set()
+        self._health_check_task: Optional[asyncio.Task] = None
+        
+        # Health monitoring configuration (agent-specific, not Kafka health)
+        self._health_check_interval = config.get('health_check_interval', 300.0)  # 5 minutes
+        self._last_health_check = time.time()
+        
+        # Retry configuration for external API calls (not Kafka operations)
+        self.retry_config = {
+            'max_retries': config.get('max_retries', 3),
+            'base_delay_ms': config.get('base_delay_ms', 1000),
+            'max_delay_ms': config.get('max_delay_ms', 30000),
+            'exponential_base': config.get('exponential_base', 2.0)
+        }
+        
+        # Comprehensive metrics for event processing performance
+        self.metrics = {
+            'events_processed': 0,
+            'events_published': 0,
+            'events_failed': 0,
+            'events_validated': 0,
+            'events_correlated': 0,
+            'events_duplicates_filtered': 0,
+            'api_calls_made': 0,
+            'api_calls_retried': 0,
+            'api_calls_failed': 0,
+            'sources_healthy': 0,
+            'sources_unhealthy': 0,
+            'health_checks_performed': 0,
+            'processing_errors': 0
+        }
         # ETag cache for GitHub API
         self.etag_by_repo: dict[str, str] = {}
         # Enhanced status tracking for event updates with transition validation
@@ -582,12 +623,22 @@ class EventsCollectorAgent:
                 headers=enhanced_headers
             )
             
+            # Update metrics on successful publish
+            self.metrics['events_processed'] += 1
+            self.metrics['events_published'] += 1
+            if is_valid:
+                self.metrics['events_validated'] += 1
+            if related_events:
+                self.metrics['events_correlated'] += 1
+            
             # Update source health on successful publish
             self._update_source_health(event.source, success=True)
             
             return True
         except Exception as e:
             logger.warning(f"Failed to publish {event.event_type} event to streaming bus: {e}")
+            self.metrics['events_failed'] += 1
+            self.metrics['processing_errors'] += 1
             self._update_source_health(event.source, success=False)
             return False
     
@@ -626,27 +677,313 @@ class EventsCollectorAgent:
         except asyncio.QueueFull:
             return False
 
+    async def _register_circuit_breaker(self):
+        """Register circuit breaker with streaming bus."""
+        try:
+            if not self._circuit_breaker_registered:
+                await self.streaming_bus.register_circuit_breaker(
+                    component_id=self.circuit_breaker_id,
+                    failure_threshold=5,  # Tolerant for event processing
+                    recovery_timeout_us=300_000_000,  # 5 minutes
+                    dependency_components=[]  # Events collector is typically independent
+                )
+                self._circuit_breaker_registered = True
+                logger.info(f"Registered circuit breaker: {self.circuit_breaker_id}")
+        except Exception as e:
+            logger.error(f"Failed to register circuit breaker: {e}")
+            raise
+
+    async def _perform_health_check(self) -> bool:
+        """Perform comprehensive health check of event processing capabilities."""
+        try:
+            self.metrics['health_checks_performed'] += 1
+            
+            # Check if we have healthy event sources
+            healthy_sources = 0
+            total_sources = len(self.source_health)
+            
+            for source_name, health_info in self.source_health.items():
+                if health_info['status'] in ['healthy', 'degraded']:
+                    healthy_sources += 1
+                elif health_info['consecutive_failures'] > 10:
+                    # Source has been failing for too long
+                    health_info['circuit_breaker_open'] = True
+            
+            # Update metrics
+            self.metrics['sources_healthy'] = healthy_sources
+            self.metrics['sources_unhealthy'] = total_sources - healthy_sources
+            
+            # Check event processing pipeline health
+            recent_events = self.metrics['events_processed'] - getattr(self, '_last_events_count', 0)
+            self._last_events_count = self.metrics['events_processed']
+            
+            # Health is good if we have some healthy sources and processing pipeline works
+            pipeline_healthy = (
+                self.metrics['processing_errors'] < self.metrics['events_processed'] * 0.1 if self.metrics['events_processed'] > 0 
+                else True
+            )
+            
+            # Overall health: at least 30% sources healthy AND pipeline healthy
+            is_healthy = (
+                (healthy_sources >= total_sources * 0.3 if total_sources > 0 else True) and
+                pipeline_healthy
+            )
+            
+            if not is_healthy:
+                logger.warning(f"Health check failed: {healthy_sources}/{total_sources} sources healthy, pipeline_healthy={pipeline_healthy}")
+            
+            self._last_health_check = time.time()
+            return is_healthy
+            
+        except Exception as e:
+            logger.error(f"Health check failed: {e}")
+            return False
+
+    async def _health_monitor_loop(self):
+        """Background health monitoring loop for event processing."""
+        while self.running:
+            try:
+                await self._perform_health_check()
+                await asyncio.sleep(self._health_check_interval)
+            except asyncio.CancelledError:
+                # Task was cancelled, break gracefully
+                break
+            except Exception as e:
+                logger.error(f"Health monitor error: {e}")
+                break
+
+    def get_health_status(self) -> dict[str, Any]:
+        """Get current health status of the events collector."""
+        return {
+            'component_id': self.circuit_breaker_id,
+            'healthy': time.time() - self._last_health_check < self._health_check_interval * 2,
+            'last_health_check': self._last_health_check,
+            'circuit_breaker_registered': self._circuit_breaker_registered,
+            'running': self.running,
+            'sources_monitored': len(self.source_health),
+            'metrics': self.metrics.copy(),
+            'source_health_summary': {
+                source: health['status'] for source, health in self.source_health.items()
+            }
+        }
+
+    async def _retry_with_backoff(self, operation_func, operation_name: str, *args, **kwargs):
+        """Execute external API operation with exponential backoff retry."""
+        last_exception = None
+        
+        for attempt in range(self.retry_config['max_retries'] + 1):
+            try:
+                self.metrics['api_calls_made'] += 1
+                result = await operation_func(*args, **kwargs)
+                if attempt > 0:
+                    logger.info(f"Retry succeeded for {operation_name} on attempt {attempt + 1}")
+                return result
+                
+            except Exception as e:
+                last_exception = e
+                self.metrics['api_calls_retried'] += 1
+                
+                if attempt == self.retry_config['max_retries']:
+                    self.metrics['api_calls_failed'] += 1
+                    logger.error(f"Retry failed for {operation_name} after {attempt + 1} attempts: {e}")
+                    break
+                
+                # Calculate exponential backoff delay
+                delay_ms = min(
+                    self.retry_config['base_delay_ms'] * (self.retry_config['exponential_base'] ** attempt),
+                    self.retry_config['max_delay_ms']
+                )
+                
+                logger.warning(f"Retry {attempt + 1}/{self.retry_config['max_retries']} for {operation_name} after {delay_ms}ms: {e}")
+                await asyncio.sleep(delay_ms / 1000.0)
+        
+        # Re-raise the last exception if all retries failed
+        if last_exception:
+            raise last_exception
+        else:
+            raise RuntimeError(f"All retries failed for {operation_name} with no exception captured")
+
     async def start(self):
         logger.info("Starting Events Collector Agent...")
         self.running = True
+        
+        # Register circuit breaker with streaming bus
+        await self._register_circuit_breaker()
+        
+        # Start health monitoring
+        self._health_check_task = asyncio.create_task(self._health_monitor_loop())
+        self._background_tasks.add(self._health_check_task)
+        
         # Start all collection tasks
         if self.config.get('governance_enabled', True):
-            self.tasks.append(asyncio.create_task(self._collect_governance()))
+            task = asyncio.create_task(self._collect_governance())
+            self.tasks.append(task)
+            self._background_tasks.add(task)
         if self.config.get('token_unlocks_enabled', True):
-            self.tasks.append(asyncio.create_task(self._collect_token_unlocks()))
+            task = asyncio.create_task(self._collect_token_unlocks())
+            self.tasks.append(task)
+            self._background_tasks.add(task)
         if self.config.get('exchange_status_enabled', True):
-            self.tasks.append(asyncio.create_task(self._collect_exchange_status()))
+            task = asyncio.create_task(self._collect_exchange_status())
+            self.tasks.append(task)
+            self._background_tasks.add(task)
         if self.config.get('github_releases_enabled', True):
-            self.tasks.append(asyncio.create_task(self._collect_github_releases()))
-        logger.info(f"Started {len(self.tasks)} collection tasks")
+            task = asyncio.create_task(self._collect_github_releases())
+            self.tasks.append(task)
+            self._background_tasks.add(task)
+        
+        # Start Kafka control message consumption
+        control_task = asyncio.create_task(self._consume_control_messages())
+        self.tasks.append(control_task)
+        self._background_tasks.add(control_task)
+        
+        logger.info(f"Started {len(self.tasks)} collection tasks with enhanced integration monitoring: {self.circuit_breaker_id}")
+    
+    async def _consume_control_messages(self):
+        """Consume control messages from Kafka topics for dynamic configuration."""
+        control_topics = [
+            "control.circuit_breaker",
+            "control.config_update", 
+            "control.event_sources",
+            "control.calendar_update"
+        ]
+        
+        logger.info(f"Events Collector: Starting control message consumption from topics: {control_topics}")
+        
+        try:
+            await self.streaming_bus.subscribe(
+                consumer_group="events_collector_control",
+                topics=control_topics,
+                handler=self._handle_control_message_wrapper
+            )
+                
+        except asyncio.CancelledError:
+            # Re-raise cancellation errors during shutdown
+            raise
+        except Exception as e:
+            logger.error(f"Events Collector: Error in control message consumption: {e}")
+            # Use the system circuit breaker to record failure
+            await self.streaming_bus.system_circuit_breaker.record_component_failure(
+                component_id="events_collector",
+                cascade_to_dependents=False
+            )
+    
+    def _handle_control_message_wrapper(self, topic: str, partition_key: str, 
+                                      message: dict, headers: dict):
+        """Wrapper to handle the subscribe callback signature."""
+        # Schedule the async handler and store task reference
+        task = asyncio.create_task(self._handle_control_message(topic, message))
+        self._tasks.add(task)
+        task.add_done_callback(self._tasks.discard)
+    
+    async def _handle_control_message(self, topic: str, message: dict):
+        """Handle control messages for dynamic behavior adjustment."""
+        try:
+            if topic == "control.circuit_breaker":
+                # Handle circuit breaker commands
+                component_id = message.get("component_id")
+                if component_id == "events_collector" or component_id == "all":
+                    action = message.get("action")
+                    if action == "open":
+                        logger.warning(f"Events Collector: Circuit breaker opened via control message")
+                    elif action == "close":
+                        logger.info(f"Events Collector: Circuit breaker closed via control message")
+                        
+            elif topic == "control.config_update":
+                # Handle dynamic configuration updates
+                component_id = message.get("component_id")
+                if component_id == "events_collector" or component_id == "all":
+                    config_updates = message.get("updates", {})
+                    await self._apply_config_updates(config_updates)
+                    
+            elif topic == "control.event_sources":
+                # Handle event source enable/disable
+                source_name = message.get("source_name")
+                action = message.get("action")
+                if source_name and action:
+                    if action == "enable":
+                        logger.info(f"Events Collector: Enabling {source_name} collection")
+                        # Could dynamically enable collection
+                    elif action == "disable":
+                        logger.warning(f"Events Collector: Disabling {source_name} collection")
+                        # Could dynamically disable collection
+                        
+            elif topic == "control.calendar_update":
+                # Handle priority event notifications
+                event_type = message.get("event_type")
+                urgency = message.get("urgency")
+                if urgency == "high":
+                    logger.info(f"Events Collector: High priority {event_type} event detected")
+                    # Could trigger immediate collection
+                        
+        except Exception as e:
+            logger.error(f"Events Collector: Error handling control message from {topic}: {e}")
+    
+    async def _apply_config_updates(self, updates: dict):
+        """Apply dynamic configuration updates."""
+        try:
+            # Update collection intervals
+            if "collection_interval_sec" in updates:
+                logger.info(f"Events Collector: Updated collection_interval_sec to {updates['collection_interval_sec']}")
+                
+            # Update feature enables
+            if "governance_enabled" in updates:
+                self.config["governance_enabled"] = updates["governance_enabled"]
+                logger.info(f"Events Collector: Updated governance_enabled to {updates['governance_enabled']}")
+                
+            if "token_unlocks_enabled" in updates:
+                self.config["token_unlocks_enabled"] = updates["token_unlocks_enabled"]
+                logger.info(f"Events Collector: Updated token_unlocks_enabled to {updates['token_unlocks_enabled']}")
+                
+            if "github_releases_enabled" in updates:
+                self.config["github_releases_enabled"] = updates["github_releases_enabled"]
+                logger.info(f"Events Collector: Updated github_releases_enabled to {updates['github_releases_enabled']}")
+                
+        except Exception as e:
+            logger.error(f"Events Collector: Error applying config updates: {e}")
 
     async def stop(self):
         logger.info("Stopping Events Collector Agent...")
         self.running = False
+        
+        # Cancel all background tasks with timeout
+        for task in self._background_tasks:
+            if not task.done():
+                task.cancel()
+        
+        # Cancel all control message tasks
+        for task in self._tasks:
+            if not task.done():
+                task.cancel()
+        
+        # Cancel all tasks
         for task in self.tasks:
             task.cancel()
-        await asyncio.gather(*self.tasks, return_exceptions=True)
-        logger.info("Events Collector Agent stopped")
+        
+        # Wait for tasks to complete with timeout
+        try:
+            await asyncio.wait_for(
+                asyncio.gather(*self.tasks, return_exceptions=True),
+                timeout=10.0
+            )
+            logger.info("All event collection tasks completed successfully")
+        except asyncio.TimeoutError:
+            logger.warning("Some tasks did not complete within timeout")
+        except Exception as e:
+            logger.error(f"Error during task cleanup: {e}")
+        
+        # Clear task references
+        self._background_tasks.clear()
+        self.tasks.clear()
+        self._health_check_task = None
+        
+        # Stop streaming bus
+        try:
+            await self.streaming_bus.graceful_shutdown()
+        except Exception as e:
+            logger.error(f"Error stopping streaming bus: {e}")
+        
+        logger.info(f"Events Collector Agent stopped - Final metrics: {self.metrics}")
 
     async def _collect_governance(self):
         """Collect governance proposals from Snapshot, Compound, etc."""

@@ -208,6 +208,19 @@ class SchemaValidatorAgent:
         self.running = False
         self._semantic_patterns: Dict[str, Pattern[str]] = {}  # Will be initialized below
         
+        # Data Engineering Enhancement - Safe data curation only
+        self.enable_data_curation = config.get('enable_data_curation', True)
+        self.curation_config = config.get('curation', {
+            'normalize_prices': True,         # Price/size normalization
+            'temporal_bucketing': True,       # Time bucket organization  
+            'venue_normalization': True,      # Cross-venue name consistency
+            'quality_scoring': True           # Data completeness scoring
+        })
+        
+        # Initialize data structures for safe curation
+        self.venue_books = {}         # symbol -> venue -> book_data  
+        self.normalization_cache = {} # Cached normalized values
+        
         # Streaming Bus Integration
         streaming_config = self.config.get("streaming_bus", {
             "bootstrap_servers": "localhost:9092",
@@ -215,6 +228,40 @@ class SchemaValidatorAgent:
             "enable_sasl": False
         })
         self.streaming_bus = StreamingBus(streaming_config)
+        
+        # Task lifecycle management for consumer tasks
+        self._consumer_task: Optional[asyncio.Task] = None
+        self._pending_validation_tasks: Set[asyncio.Task] = set()
+        
+        # Circuit breaker integration for resilience
+        self.circuit_breaker_id = f"schema_validator_{id(self)}"
+        self._circuit_breaker_registered = False
+        
+        # Health monitoring
+        self._health_check_task: Optional[asyncio.Task] = None
+        self._last_health_check = 0.0
+        self._health_check_interval = config.get('health_check_interval', 30.0)
+        
+        # Retry configuration with exponential backoff
+        self.retry_config = {
+            'max_retries': config.get('max_retries', 3),
+            'base_delay': config.get('retry_base_delay', 1.0),
+            'max_delay': config.get('retry_max_delay', 60.0),
+            'exponential_base': config.get('retry_exponential_base', 2.0)
+        }
+        
+        # Metrics and telemetry
+        self.metrics = {
+            'validations_processed': 0,
+            'validations_passed': 0,
+            'validations_failed': 0,
+            'schema_violations': 0,
+            'circuit_breaker_trips': 0,
+            'retry_attempts': 0,
+            'health_checks_performed': 0,
+            'avg_validation_time_ms': 0.0,
+            'last_validation_timestamp': 0
+        }
         
         # Strict mode disables all coercion
         self.strict_mode = config.get('strict_mode', False)
@@ -524,16 +571,45 @@ class SchemaValidatorAgent:
                     
                     # Check if timestamps are in order
                     for i in range(1, len(timestamps)):
-                        if timestamps[i][1] < timestamps[i-1][1]:
-                            violations.append(SchemaViolation(
-                                table_name=schema.name,
-                                field_name=f"{timestamps[i-1][0]},{timestamps[i][0]}",
-                                violation_type="temporal_ordering_violation",
-                                expected=f"{timestamps[i-1][0]} <= {timestamps[i][0]}",
-                                actual=f"{timestamps[i-1][1]} > {timestamps[i][1]}",
-                                row_identifier=row_id,
-                                severity=rule.severity
-                            ))
+                        try:
+                            prev_timestamp = timestamps[i-1][1]
+                            curr_timestamp = timestamps[i][1]
+                            
+                            # Ensure both are comparable (same type)
+                            if type(prev_timestamp) != type(curr_timestamp):
+                                # Try to convert to same type
+                                if isinstance(prev_timestamp, str) and isinstance(curr_timestamp, (int, float)):
+                                    try:
+                                        prev_timestamp = float(prev_timestamp)
+                                    except ValueError:
+                                        continue
+                                elif isinstance(curr_timestamp, str) and isinstance(prev_timestamp, (int, float)):
+                                    try:
+                                        curr_timestamp = float(curr_timestamp)
+                                    except ValueError:
+                                        continue
+                                elif isinstance(prev_timestamp, str) and isinstance(curr_timestamp, str):
+                                    try:
+                                        prev_timestamp = float(prev_timestamp)
+                                        curr_timestamp = float(curr_timestamp)
+                                    except ValueError:
+                                        continue
+                            
+                            # Only compare if both are numeric
+                            if isinstance(prev_timestamp, (int, float)) and isinstance(curr_timestamp, (int, float)):
+                                if curr_timestamp < prev_timestamp:
+                                    violations.append(SchemaViolation(
+                                        table_name=schema.name,
+                                        field_name=f"{timestamps[i-1][0]},{timestamps[i][0]}",
+                                        violation_type="temporal_ordering_violation",
+                                        expected=f"{timestamps[i-1][0]} <= {timestamps[i][0]}",
+                                        actual=f"{prev_timestamp} > {curr_timestamp}",
+                                        row_identifier=row_id,
+                                        severity=rule.severity
+                                    ))
+                        except (TypeError, ValueError):
+                            # Skip comparison if types are incompatible
+                            continue
             
             elif rule.rule_type == "field_relationship":
                 # Validate field relationships using custom condition
@@ -564,144 +640,167 @@ class SchemaValidatorAgent:
     
     async def validate_row(self, table_name: str, row: Dict[str, Any], row_id: str) -> Tuple[Dict[str, Any], List[SchemaViolation], ValidationFlags]:
         """
-        Validate a single row against its schema.
+        Validate a single row against its schema with metrics tracking.
         
         Returns:
             (cleaned_row, violations, validation_flags)
         """
+        start_time = time.time()
         flags = ValidationFlags()
         
-        if table_name not in self.schemas:
-            violation = SchemaViolation(
-                table_name=table_name,
-                field_name=None,
-                violation_type="unknown_table",
-                expected="registered table schema",
-                actual=f"table '{table_name}' not registered",
-                row_identifier=row_id,
-                severity="error"
-            )
-            return row, [violation], flags
-        
-        schema = self.schemas[table_name]
-        violations = []
-        cleaned_row = {}
-        
-        # Check all required fields are present
-        for field_schema in schema.fields:
-            field_name = field_schema.name
-            value = row.get(field_name)
-            
-            # Required field validation
-            if field_schema.required and (value is None or value == ""):
-                violations.append(SchemaViolation(
+        try:
+            if table_name not in self.schemas:
+                violation = SchemaViolation(
                     table_name=table_name,
-                    field_name=field_name,
-                    violation_type="required_field_missing",
-                    expected="non-null value",
-                    actual="null/empty",
-                    row_identifier=row_id
-                ))
-                continue
-            
-            # Nullable field validation
-            if value is None:
-                if field_schema.nullable:
-                    cleaned_row[field_name] = None
-                    continue
-                else:
+                    field_name=None,
+                    violation_type="unknown_table",
+                    expected="registered table schema",
+                    actual=f"table '{table_name}' not registered",
+                    row_identifier=row_id,
+                    severity="error"
+                )
+                self._update_validation_metrics((time.time() - start_time) * 1000, False, 1)
+                return row, [violation], flags
+        
+            schema = self.schemas[table_name]
+            violations = []
+            cleaned_row = {}
+        
+            # Check all required fields are present
+            for field_schema in schema.fields:
+                field_name = field_schema.name
+                value = row.get(field_name)
+                
+                # Required field validation
+                if field_schema.required and (value is None or value == ""):
                     violations.append(SchemaViolation(
                         table_name=table_name,
                         field_name=field_name,
-                        violation_type="null_not_allowed",
+                        violation_type="required_field_missing",
                         expected="non-null value",
-                        actual="null",
+                        actual="null/empty",
                         row_identifier=row_id
                     ))
                     continue
-            
-            # Validate and potentially coerce the field
-            validated_value, field_violations = await self._validate_field(
-                field_schema, value, table_name, row_id
-            )
-            
-            violations.extend(field_violations)
-            cleaned_row[field_name] = validated_value
-        
-        # Check for unexpected fields
-        for field_name in row:
-            if field_name not in schema.field_map:
-                if not schema.allow_extra_fields:
-                    severity = schema.unexpected_field_severity
-                    if severity != "ignore":
+                
+                # Nullable field validation
+                if value is None:
+                    if field_schema.nullable:
+                        cleaned_row[field_name] = None
+                        continue
+                    else:
                         violations.append(SchemaViolation(
                             table_name=table_name,
                             field_name=field_name,
-                            violation_type="unexpected_field",
-                            expected="field not in schema",
-                            actual=f"unexpected field '{field_name}'",
-                            row_identifier=row_id,
-                            severity=severity
+                            violation_type="null_not_allowed",
+                            expected="non-null value",
+                            actual="null",
+                            row_identifier=row_id
                         ))
+                        continue
                 
-                # Always preserve in cleaned_row (never actually drop fields)
-                cleaned_row[field_name] = row[field_name]
+                # Validate and potentially coerce the field
+                validated_value, field_violations = await self._validate_field(
+                    field_schema, value, table_name, row_id
+                )
                 
-                # Log dropping intention if configured (but don't actually drop)
-                if schema.drop_extra_fields and schema.allow_extra_fields:
-                    # Use consistent severity - always "info" for dropping intentions
-                    violations.append(SchemaViolation(
-                        table_name=table_name,
-                        field_name=field_name,
-                        violation_type="field_would_be_dropped",
-                        expected="field removal (not performed)",
-                        actual=f"would drop '{field_name}' (preserved per no-reshape policy)",
-                        row_identifier=row_id,
-                        severity="info"
-                    ))
+                violations.extend(field_violations)
+                cleaned_row[field_name] = validated_value
         
-        # Validate primary key nullability
-        if schema.primary_key:
-            for pk_field in schema.primary_key:
-                if cleaned_row.get(pk_field) is None:
-                    violations.append(SchemaViolation(
-                        table_name=table_name,
-                        field_name=pk_field,
-                        violation_type="primary_key_null",
-                        expected="non-null primary key value",
-                        actual="null",
-                        row_identifier=row_id,
-                        severity="error"
-                    ))
+            # Check for unexpected fields
+            for field_name in row:
+                if field_name not in schema.field_map:
+                    if not schema.allow_extra_fields:
+                        severity = schema.unexpected_field_severity
+                        if severity != "ignore":
+                            violations.append(SchemaViolation(
+                                table_name=table_name,
+                                field_name=field_name,
+                                violation_type="unexpected_field",
+                                expected="field not in schema",
+                                actual=f"unexpected field '{field_name}'",
+                                row_identifier=row_id,
+                                severity=severity
+                            ))
+                    
+                    # Always preserve in cleaned_row (never actually drop fields)
+                    cleaned_row[field_name] = row[field_name]
+                    
+                    # Log dropping intention if configured (but don't actually drop)
+                    if schema.drop_extra_fields and schema.allow_extra_fields:
+                        # Use consistent severity - always "info" for dropping intentions
+                        violations.append(SchemaViolation(
+                            table_name=table_name,
+                            field_name=field_name,
+                            violation_type="field_would_be_dropped",
+                            expected="field removal (not performed)",
+                                actual=f"would drop '{field_name}' (preserved per no-reshape policy)",
+                            row_identifier=row_id,
+                            severity="info"
+                        ))
+            
+            # Validate primary key nullability
+            if schema.primary_key:
+                for pk_field in schema.primary_key:
+                    if cleaned_row.get(pk_field) is None:
+                        violations.append(SchemaViolation(
+                            table_name=table_name,
+                            field_name=pk_field,
+                            violation_type="primary_key_null",
+                            expected="non-null primary key value",
+                            actual="null",
+                            row_identifier=row_id,
+                            severity="error"
+                        ))
+                        flags.had_null_error = True
+            
+            # Validate referential integrity
+            ref_violations = await self._validate_referential_integrity(
+                schema, cleaned_row, table_name, row_id
+            )
+            violations.extend(ref_violations)
+            for v in ref_violations:
+                if v.violation_type.endswith("foreign_key_violation"):
+                    flags.had_foreign_key_error = True
+            
+            # Set row-level flags based on violations
+            for violation in violations:
+                if "pattern" in violation.violation_type:
+                    flags.had_pattern_error = True
+                elif "range" in violation.violation_type or "minimum" in violation.violation_type or "maximum" in violation.violation_type:
+                    flags.had_range_error = True
+                elif violation.violation_type == "type_coerced" or violation.violation_type.endswith("_type_coerced"):
+                    flags.had_coercion = True  # Include list/dict item coercions as benign coercions
+                elif "type" in violation.violation_type and violation.violation_type != "type_coerced" and not violation.violation_type.endswith("_type_coerced"):
+                    flags.had_type_error = True  # Only for actual type errors, not coercions
+                elif "null" in violation.violation_type:
                     flags.had_null_error = True
-        
-        # Validate referential integrity
-        ref_violations = await self._validate_referential_integrity(
-            schema, cleaned_row, table_name, row_id
-        )
-        violations.extend(ref_violations)
-        for v in ref_violations:
-            if v.violation_type.endswith("foreign_key_violation"):
-                flags.had_foreign_key_error = True
-        
-        # Set row-level flags based on violations
-        for violation in violations:
-            if "pattern" in violation.violation_type:
-                flags.had_pattern_error = True
-            elif "range" in violation.violation_type or "minimum" in violation.violation_type or "maximum" in violation.violation_type:
-                flags.had_range_error = True
-            elif violation.violation_type == "type_coerced" or violation.violation_type.endswith("_type_coerced"):
-                flags.had_coercion = True  # Include list/dict item coercions as benign coercions
-            elif "type" in violation.violation_type and violation.violation_type != "type_coerced" and not violation.violation_type.endswith("_type_coerced"):
-                flags.had_type_error = True  # Only for actual type errors, not coercions
-            elif "null" in violation.violation_type:
-                flags.had_null_error = True
-        
-        # Enhanced cross-field validation
-        cross_field_violations = self._validate_cross_field_rules(schema, cleaned_row, row_id)
-        violations.extend(cross_field_violations)
-        
-        return cleaned_row, violations, flags
+            
+            # Enhanced cross-field validation
+            cross_field_violations = self._validate_cross_field_rules(schema, cleaned_row, row_id)
+            violations.extend(cross_field_violations)
+            
+            # Update metrics for successful validation
+            validation_time_ms = (time.time() - start_time) * 1000
+            passed = len(violations) == 0
+            self._update_validation_metrics(validation_time_ms, passed, len(violations))
+            
+            return cleaned_row, violations, flags
+            
+        except Exception as e:
+            # Handle unexpected validation errors
+            logger.error(f"Unexpected error during validation of {table_name}: {e}")
+            violation = SchemaViolation(
+                table_name=table_name,
+                field_name=None,
+                violation_type="validation_error",
+                expected="successful validation",
+                actual=f"validation error: {str(e)}",
+                row_identifier=row_id,
+                severity="error"
+            )
+            self._update_validation_metrics((time.time() - start_time) * 1000, False, 1)
+            return row, [violation], flags
     
     async def _validate_field(self, field_schema: FieldSchema, value: Any, table_name: str, row_id: str) -> tuple[Any, List[SchemaViolation]]:
         """Validate a single field value."""
@@ -1613,25 +1712,820 @@ class SchemaValidatorAgent:
                     
                     if len(values) > 1:
                         for i in range(1, len(values)):
-                            if values[i][0] < values[i-1][0]:
-                                violations.append(SchemaViolation(
-                                    table_name=schema.name,
-                                    field_name=field_name,
-                                    violation_type="batch_not_monotonic",
-                                    expected="monotonically increasing values",
-                                    actual=f"{values[i-1][0]} > {values[i][0]} at position {i}",
-                                    row_identifier=values[i][1],
-                                    severity="warning"
-                                ))
+                            try:
+                                # Ensure comparable types for temporal ordering
+                                prev_val = values[i-1][0]
+                                curr_val = values[i][0]
+                                
+                                # Convert to same numeric type if needed
+                                if isinstance(prev_val, str) and isinstance(curr_val, (int, float)):
+                                    try:
+                                        prev_val = float(prev_val)
+                                    except ValueError:
+                                        continue
+                                elif isinstance(curr_val, str) and isinstance(prev_val, (int, float)):
+                                    try:
+                                        curr_val = float(curr_val)
+                                    except ValueError:
+                                        continue
+                                elif isinstance(prev_val, str) and isinstance(curr_val, str):
+                                    # Try to convert both to float
+                                    try:
+                                        prev_val = float(prev_val)
+                                        curr_val = float(curr_val)
+                                    except ValueError:
+                                        continue
+                                
+                                # Only compare if both are numeric
+                                if isinstance(prev_val, (int, float)) and isinstance(curr_val, (int, float)):
+                                    if curr_val < prev_val:
+                                        violations.append(SchemaViolation(
+                                            table_name=schema.name,
+                                            field_name=field_name,
+                                            violation_type="batch_not_monotonic",
+                                            expected="monotonically increasing values",
+                                            actual=f"{prev_val} > {curr_val} at position {i}",
+                                            row_identifier=values[i][1],
+                                            severity="warning"
+                                        ))
+                            except (TypeError, ValueError) as e:
+                                # Skip comparison if types are incompatible
+                                logger.debug(f"Skipping temporal comparison for incompatible types: {e}")
+                                continue
         
         return violations
+    
+    async def _register_circuit_breaker(self):
+        """Register circuit breaker with the streaming bus."""
+        if not self._circuit_breaker_registered:
+            try:
+                await self.streaming_bus.register_circuit_breaker(
+                    component_id=self.circuit_breaker_id,
+                    failure_threshold=self.config.get('circuit_breaker_failure_threshold', 5),
+                    recovery_timeout_us=self.config.get('circuit_breaker_recovery_timeout_us', 300_000_000),
+                    dependency_components=self.config.get('circuit_breaker_dependencies', [])
+                )
+                self._circuit_breaker_registered = True
+                logger.info(f"Circuit breaker registered for {self.circuit_breaker_id}")
+            except Exception as e:
+                logger.warning(f"Failed to register circuit breaker: {e}")
+    
+    async def _perform_health_check(self):
+        """Perform health check and update metrics."""
+        try:
+            # Check streaming bus health via system status
+            system_health = await self.streaming_bus.get_system_health_status()
+            bus_health = system_health.get('streaming_bus_healthy', True)
+            
+            # Check schema registry health (verify we have schemas loaded)
+            schema_health = len(self.schemas) > 0
+            
+            # Check task health
+            task_health = (
+                (self._consumer_task is None or not self._consumer_task.done()) and
+                len(self._pending_validation_tasks) < 1000  # Reasonable task backlog
+            )
+            
+            overall_health = bus_health and schema_health and task_health
+            
+            # Update metrics
+            self.metrics['health_checks_performed'] += 1
+            self._last_health_check = time.time()
+            
+            return overall_health
+            
+        except Exception as e:
+            logger.error(f"Health check failed: {e}")
+            return False
+    
+    async def _health_monitor_loop(self):
+        """Background health monitoring loop."""
+        while self.running:
+            try:
+                await self._perform_health_check()
+                await asyncio.sleep(self._health_check_interval)
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Health monitor error: {e}")
+                await asyncio.sleep(self._health_check_interval)
+    
+    async def _retry_with_backoff(self, operation_func, operation_name: str, *args, **kwargs):
+        """Execute operation with exponential backoff retry."""
+        last_exception = None
+        
+        for attempt in range(self.retry_config['max_retries'] + 1):
+            try:
+                # Check circuit breaker
+                if self._circuit_breaker_registered:
+                    can_execute = await self.streaming_bus.can_component_execute(self.circuit_breaker_id)
+                    if not can_execute:
+                        self.metrics['circuit_breaker_trips'] += 1
+                        raise Exception("Circuit breaker is open")
+                
+                # Execute operation
+                result = await operation_func(*args, **kwargs)
+                
+                # Record success
+                if self._circuit_breaker_registered:
+                    await self.streaming_bus.record_component_success(self.circuit_breaker_id)
+                
+                return result
+                
+            except Exception as e:
+                last_exception = e
+                self.metrics['retry_attempts'] += 1
+                
+                # Record failure
+                if self._circuit_breaker_registered:
+                    await self.streaming_bus.record_component_failure(self.circuit_breaker_id, cascade_failure=True)
+                
+                if attempt < self.retry_config['max_retries']:
+                    # Calculate backoff delay
+                    delay = min(
+                        self.retry_config['base_delay'] * (self.retry_config['exponential_base'] ** attempt),
+                        self.retry_config['max_delay']
+                    )
+                    logger.warning(f"Attempt {attempt + 1} failed for {operation_name}: {e}. Retrying in {delay:.1f}s")
+                    await asyncio.sleep(delay)
+                else:
+                    logger.error(f"All {self.retry_config['max_retries']} retry attempts failed for {operation_name}")
+        
+        if last_exception:
+            raise last_exception
+        else:
+            raise Exception(f"Operation {operation_name} failed with no recorded exception")
+    
+    def _update_validation_metrics(self, validation_time_ms: float, passed: bool, violations_count: int):
+        """Update validation metrics."""
+        self.metrics['validations_processed'] += 1
+        if passed:
+            self.metrics['validations_passed'] += 1
+        else:
+            self.metrics['validations_failed'] += 1
+        
+        self.metrics['schema_violations'] += violations_count
+        self.metrics['last_validation_timestamp'] = time.time()
+        
+        # Update running average of validation time
+        current_avg = self.metrics['avg_validation_time_ms']
+        processed = self.metrics['validations_processed']
+        self.metrics['avg_validation_time_ms'] = ((current_avg * (processed - 1)) + validation_time_ms) / processed
+    
+    def _register_data_ingestion_schemas(self):
+        """Register schemas for all data ingestion topics consumed by this agent."""
+        logger.info("Registering data ingestion schemas...")
+        
+        # Exchange trades schema (from exchange_connector output)
+        exchange_trades_schema = TableSchema(
+            name="exchange_trades",
+            fields=[
+                FieldSchema(
+                    name="venue",
+                    field_type=FieldType.STRING,
+                    required=True,
+                    max_length=50,
+                    trim_whitespace=True
+                ),
+                FieldSchema(
+                    name="symbol",
+                    field_type=FieldType.STRING,
+                    required=True,
+                    max_length=20,
+                    pattern=r"^[A-Z0-9]{2,}[/-]?[A-Z0-9]{2,}$",
+                    trim_whitespace=True
+                ),
+                FieldSchema(
+                    name="data_type",
+                    field_type=FieldType.ENUM,
+                    required=True,
+                    enum_values={"trades"}
+                ),
+                FieldSchema(
+                    name="timestamp",
+                    field_type=FieldType.TIMESTAMP_US,
+                    required=True
+                ),
+                FieldSchema(
+                    name="capture_timestamp",
+                    field_type=FieldType.TIMESTAMP_US,
+                    required=True
+                ),
+                FieldSchema(
+                    name="side",
+                    field_type=FieldType.ENUM,
+                    required=True,
+                    enum_values={"buy", "sell"},
+                    allow_enum_case_insensitive=True
+                ),
+                FieldSchema(
+                    name="quantity",
+                    field_type=FieldType.STRING,  # Decimal as string for precision
+                    required=True,
+                    pattern=r"^\d+(\.\d+)?$"  # Positive decimal
+                ),
+                FieldSchema(
+                    name="price",
+                    field_type=FieldType.STRING,  # Decimal as string for precision
+                    required=True,
+                    pattern=r"^\d+(\.\d+)?$"  # Positive decimal
+                ),
+                FieldSchema(
+                    name="trade_id",
+                    field_type=FieldType.STRING,
+                    required=True,
+                    max_length=100
+                )
+            ],
+            primary_key=["venue", "symbol", "trade_id"],
+            foreign_keys={
+                "venue": "venues.name",
+                "symbol": "symbols.symbol"
+            },
+            cross_field_rules=[
+                CrossFieldRule(
+                    rule_type="temporal_ordering",
+                    fields=["timestamp", "capture_timestamp"],
+                    error_message="timestamp must be <= capture_timestamp",
+                    severity="warning"
+                )
+            ],
+            strict_foreign_keys=False  # Don't fail on missing reference data
+        )
+        self.register_schema(exchange_trades_schema)
+        
+        # Market trades schema (granular market data)
+        market_trades_schema = TableSchema(
+            name="market_trades",
+            fields=[
+                FieldSchema(
+                    name="venue",
+                    field_type=FieldType.STRING,
+                    required=True,
+                    max_length=50
+                ),
+                FieldSchema(
+                    name="symbol",
+                    field_type=FieldType.STRING,
+                    required=True,
+                    max_length=20
+                ),
+                FieldSchema(
+                    name="timestamp",
+                    field_type=FieldType.TIMESTAMP_US,
+                    required=True
+                ),
+                FieldSchema(
+                    name="price",
+                    field_type=FieldType.STRING,
+                    required=True,
+                    pattern=r"^\d+(\.\d+)?$"
+                ),
+                FieldSchema(
+                    name="quantity",
+                    field_type=FieldType.STRING,
+                    required=True,
+                    pattern=r"^\d+(\.\d+)?$"
+                ),
+                FieldSchema(
+                    name="side",
+                    field_type=FieldType.ENUM,
+                    required=True,
+                    enum_values={"buy", "sell"},
+                    allow_enum_case_insensitive=True
+                ),
+                FieldSchema(
+                    name="trade_id",
+                    field_type=FieldType.STRING,
+                    required=True
+                )
+            ],
+            primary_key=["venue", "symbol", "trade_id"],
+            foreign_keys={
+                "venue": "venues.name",
+                "symbol": "symbols.symbol"
+            },
+            strict_foreign_keys=False
+        )
+        self.register_schema(market_trades_schema)
+        
+        # Market book schema
+        market_book_schema = TableSchema(
+            name="market_book",
+            fields=[
+                FieldSchema(
+                    name="venue",
+                    field_type=FieldType.STRING,
+                    required=True,
+                    max_length=50
+                ),
+                FieldSchema(
+                    name="symbol",
+                    field_type=FieldType.STRING,
+                    required=True,
+                    max_length=20
+                ),
+                FieldSchema(
+                    name="timestamp",
+                    field_type=FieldType.TIMESTAMP_US,
+                    required=True
+                ),
+                FieldSchema(
+                    name="bids",
+                    field_type=FieldType.LIST,
+                    required=True,
+                    list_item_type=FieldType.DICT
+                ),
+                FieldSchema(
+                    name="asks",
+                    field_type=FieldType.LIST,
+                    required=True,
+                    list_item_type=FieldType.DICT
+                ),
+                FieldSchema(
+                    name="sequence_number",
+                    field_type=FieldType.INTEGER,
+                    nullable=True
+                )
+            ],
+            primary_key=["venue", "symbol", "timestamp"],
+            strict_foreign_keys=False
+        )
+        self.register_schema(market_book_schema)
+        
+        # Market funding schema
+        market_funding_schema = TableSchema(
+            name="market_funding",
+            fields=[
+                FieldSchema(
+                    name="venue",
+                    field_type=FieldType.STRING,
+                    required=True,
+                    max_length=50
+                ),
+                FieldSchema(
+                    name="symbol",
+                    field_type=FieldType.STRING,
+                    required=True,
+                    max_length=20
+                ),
+                FieldSchema(
+                    name="timestamp",
+                    field_type=FieldType.TIMESTAMP_US,
+                    required=True
+                ),
+                FieldSchema(
+                    name="funding_rate",
+                    field_type=FieldType.STRING,
+                    required=True,
+                    pattern=r"^-?\d+(\.\d+)?$"  # Allow negative rates
+                ),
+                FieldSchema(
+                    name="next_funding_time",
+                    field_type=FieldType.TIMESTAMP_US,
+                    nullable=True
+                )
+            ],
+            primary_key=["venue", "symbol", "timestamp"],
+            strict_foreign_keys=False
+        )
+        self.register_schema(market_funding_schema)
+        
+        # Market open interest schema
+        market_oi_schema = TableSchema(
+            name="market_oi",
+            fields=[
+                FieldSchema(
+                    name="venue",
+                    field_type=FieldType.STRING,
+                    required=True,
+                    max_length=50
+                ),
+                FieldSchema(
+                    name="symbol",
+                    field_type=FieldType.STRING,
+                    required=True,
+                    max_length=20
+                ),
+                FieldSchema(
+                    name="timestamp",
+                    field_type=FieldType.TIMESTAMP_US,
+                    required=True
+                ),
+                FieldSchema(
+                    name="open_interest",
+                    field_type=FieldType.STRING,
+                    required=True,
+                    pattern=r"^\d+(\.\d+)?$"
+                ),
+                FieldSchema(
+                    name="open_interest_usd",
+                    field_type=FieldType.STRING,
+                    nullable=True,
+                    pattern=r"^\d+(\.\d+)?$"
+                )
+            ],
+            primary_key=["venue", "symbol", "timestamp"],
+            strict_foreign_keys=False
+        )
+        self.register_schema(market_oi_schema)
+        
+        # Options surface schema
+        options_surface_schema = TableSchema(
+            name="options_surface",
+            fields=[
+                FieldSchema(
+                    name="venue",
+                    field_type=FieldType.STRING,
+                    required=True,
+                    max_length=50
+                ),
+                FieldSchema(
+                    name="underlying",
+                    field_type=FieldType.STRING,
+                    required=True,
+                    max_length=20
+                ),
+                FieldSchema(
+                    name="timestamp",
+                    field_type=FieldType.TIMESTAMP_US,
+                    required=True
+                ),
+                FieldSchema(
+                    name="expiry",
+                    field_type=FieldType.TIMESTAMP_US,
+                    required=True
+                ),
+                FieldSchema(
+                    name="strike",
+                    field_type=FieldType.STRING,
+                    required=True,
+                    pattern=r"^\d+(\.\d+)?$"
+                ),
+                FieldSchema(
+                    name="option_type",
+                    field_type=FieldType.ENUM,
+                    required=True,
+                    enum_values={"call", "put"},
+                    allow_enum_case_insensitive=True
+                ),
+                FieldSchema(
+                    name="implied_volatility",
+                    field_type=FieldType.STRING,
+                    nullable=True,
+                    pattern=r"^\d+(\.\d+)?$"
+                ),
+                FieldSchema(
+                    name="bid",
+                    field_type=FieldType.STRING,
+                    nullable=True,
+                    pattern=r"^\d+(\.\d+)?$"
+                ),
+                FieldSchema(
+                    name="ask",
+                    field_type=FieldType.STRING,
+                    nullable=True,
+                    pattern=r"^\d+(\.\d+)?$"
+                )
+            ],
+            primary_key=["venue", "underlying", "expiry", "strike", "option_type"],
+            cross_field_rules=[
+                CrossFieldRule(
+                    rule_type="temporal_ordering",
+                    fields=["timestamp", "expiry"],
+                    error_message="timestamp must be <= expiry",
+                    severity="error"
+                )
+            ],
+            strict_foreign_keys=False
+        )
+        self.register_schema(options_surface_schema)
+        
+        # OnChain flows schema (from onchain_collector)
+        onchain_flows_schema = TableSchema(
+            name="onchain_flows",
+            fields=[
+                FieldSchema(
+                    name="chain",
+                    field_type=FieldType.STRING,
+                    required=True,
+                    max_length=20,
+                    enum_values={"ethereum", "bitcoin", "polygon", "arbitrum", "optimism", "base"},
+                    allow_enum_case_insensitive=True
+                ),
+                FieldSchema(
+                    name="event_type",
+                    field_type=FieldType.STRING,
+                    required=True,
+                    max_length=50,
+                    enum_values={"erc20_transfer", "dex_swap", "cex_hot_wallet", "bridge", "lst", "lrt"}
+                ),
+                FieldSchema(
+                    name="tx_hash",
+                    field_type=FieldType.HASH,
+                    required=True,
+                    pattern=r"^0x[a-fA-F0-9]{64}$",
+                    coercion_rules=[LOWERCASE_HASH_RULE]
+                ),
+                FieldSchema(
+                    name="block_number",
+                    field_type=FieldType.INTEGER,
+                    required=True,
+                    min_value=0
+                ),
+                FieldSchema(
+                    name="timestamp_utc_us",
+                    field_type=FieldType.TIMESTAMP_US,
+                    required=True
+                ),
+                FieldSchema(
+                    name="from_address",
+                    field_type=FieldType.ADDRESS,
+                    required=True,
+                    pattern=r"^0x[a-fA-F0-9]{40}$",
+                    coercion_rules=[LOWERCASE_ADDRESS_RULE]
+                ),
+                FieldSchema(
+                    name="to_address",
+                    field_type=FieldType.ADDRESS,
+                    required=True,
+                    pattern=r"^0x[a-fA-F0-9]{40}$",
+                    coercion_rules=[LOWERCASE_ADDRESS_RULE]
+                ),
+                FieldSchema(
+                    name="token",
+                    field_type=FieldType.STRING,
+                    nullable=True,
+                    max_length=50
+                ),
+                FieldSchema(
+                    name="amount",
+                    field_type=FieldType.STRING,
+                    nullable=True,
+                    pattern=r"^\d+(\.\d+)?$"
+                ),
+                FieldSchema(
+                    name="value_usd",
+                    field_type=FieldType.STRING,
+                    nullable=True,
+                    pattern=r"^\d+(\.\d+)?$"
+                )
+            ],
+            primary_key=["chain", "tx_hash", "from_address", "to_address"],
+            foreign_keys={
+                "chain": "chains.name"
+            },
+            batch_constraints=["monotonic_increasing"],  # Block numbers should increase
+            strict_foreign_keys=False
+        )
+        self.register_schema(onchain_flows_schema)
+        
+        # OnChain blocks schema
+        onchain_blocks_schema = TableSchema(
+            name="onchain_blocks",
+            fields=[
+                FieldSchema(
+                    name="chain",
+                    field_type=FieldType.STRING,
+                    required=True,
+                    max_length=20
+                ),
+                FieldSchema(
+                    name="block_number",
+                    field_type=FieldType.INTEGER,
+                    required=True,
+                    min_value=0
+                ),
+                FieldSchema(
+                    name="block_hash",
+                    field_type=FieldType.HASH,
+                    required=True,
+                    pattern=r"^0x[a-fA-F0-9]{64}$",
+                    coercion_rules=[LOWERCASE_HASH_RULE]
+                ),
+                FieldSchema(
+                    name="timestamp",
+                    field_type=FieldType.TIMESTAMP_US,
+                    required=True
+                ),
+                FieldSchema(
+                    name="transaction_count",
+                    field_type=FieldType.INTEGER,
+                    required=True,
+                    min_value=0
+                ),
+                FieldSchema(
+                    name="gas_used",
+                    field_type=FieldType.INTEGER,
+                    nullable=True,
+                    min_value=0
+                ),
+                FieldSchema(
+                    name="gas_limit",
+                    field_type=FieldType.INTEGER,
+                    nullable=True,
+                    min_value=0
+                )
+            ],
+            primary_key=["chain", "block_number"],
+            unique_constraints=[["chain", "block_hash"]],
+            batch_constraints=["monotonic_increasing"],
+            strict_foreign_keys=False
+        )
+        self.register_schema(onchain_blocks_schema)
+        
+        # OnChain mempool schema
+        onchain_mempool_schema = TableSchema(
+            name="onchain_mempool",
+            fields=[
+                FieldSchema(
+                    name="chain",
+                    field_type=FieldType.STRING,
+                    required=True,
+                    max_length=20
+                ),
+                FieldSchema(
+                    name="tx_hash",
+                    field_type=FieldType.HASH,
+                    required=True,
+                    pattern=r"^0x[a-fA-F0-9]{64}$",
+                    coercion_rules=[LOWERCASE_HASH_RULE]
+                ),
+                FieldSchema(
+                    name="timestamp",
+                    field_type=FieldType.TIMESTAMP_US,
+                    required=True
+                ),
+                FieldSchema(
+                    name="gas_price",
+                    field_type=FieldType.STRING,
+                    required=True,
+                    pattern=r"^\d+(\.\d+)?$"
+                ),
+                FieldSchema(
+                    name="gas_limit",
+                    field_type=FieldType.INTEGER,
+                    required=True,
+                    min_value=0
+                ),
+                FieldSchema(
+                    name="nonce",
+                    field_type=FieldType.INTEGER,
+                    required=True,
+                    min_value=0
+                ),
+                FieldSchema(
+                    name="from_address",
+                    field_type=FieldType.ADDRESS,
+                    required=True,
+                    pattern=r"^0x[a-fA-F0-9]{40}$",
+                    coercion_rules=[LOWERCASE_ADDRESS_RULE]
+                ),
+                FieldSchema(
+                    name="to_address",
+                    field_type=FieldType.ADDRESS,
+                    nullable=True,
+                    pattern=r"^0x[a-fA-F0-9]{40}$",
+                    coercion_rules=[LOWERCASE_ADDRESS_RULE]
+                )
+            ],
+            primary_key=["chain", "tx_hash"],
+            strict_foreign_keys=False
+        )
+        self.register_schema(onchain_mempool_schema)
+        
+        # OffChain events schema
+        offchain_events_schema = TableSchema(
+            name="offchain_events",
+            fields=[
+                FieldSchema(
+                    name="event_type",
+                    field_type=FieldType.STRING,
+                    required=True,
+                    max_length=100,
+                    enum_values={"governance_proposal", "token_unlock", "exchange_maintenance", "software_release", "market_news", "regulatory_update"}
+                ),
+                FieldSchema(
+                    name="source",
+                    field_type=FieldType.STRING,
+                    required=True,
+                    max_length=50,
+                    enum_values={"snapshot", "github", "binance", "coinbase", "twitter", "discord", "telegram", "reddit"}
+                ),
+                FieldSchema(
+                    name="source_id",
+                    field_type=FieldType.STRING,
+                    required=True,
+                    max_length=100
+                ),
+                FieldSchema(
+                    name="timestamp",
+                    field_type=FieldType.TIMESTAMP_US,
+                    required=True
+                ),
+                FieldSchema(
+                    name="title",
+                    field_type=FieldType.STRING,
+                    required=True,
+                    min_length=1,
+                    max_length=500,
+                    trim_whitespace=True
+                ),
+                FieldSchema(
+                    name="description",
+                    field_type=FieldType.STRING,
+                    nullable=True,
+                    max_length=2000,
+                    trim_whitespace=True
+                ),
+                FieldSchema(
+                    name="status",
+                    field_type=FieldType.STRING,
+                    required=True,
+                    enum_values={"active", "closed", "pending", "resolved", "cancelled"},
+                    allow_enum_case_insensitive=True
+                ),
+                FieldSchema(
+                    name="impact_score",
+                    field_type=FieldType.INTEGER,
+                    nullable=True,
+                    min_value=1,
+                    max_value=10
+                )
+            ],
+            primary_key=["source", "source_id"],
+            unique_constraints=[["source", "source_id"]],
+            strict_foreign_keys=False
+        )
+        self.register_schema(offchain_events_schema)
+        
+        logger.info(f"Registered {len(self.schemas)} data ingestion schemas: {list(self.schemas.keys())}")
+    
+    async def _load_reference_data(self):
+        """Load reference data for foreign key validation from configuration."""
+        logger.info("Loading reference data for foreign key validation...")
+        
+        # Load venues from config or use defaults
+        venues = set(self.config.get("valid_venues", [
+            "binance", "binance_futures", "coinbase", "gemini", "kraken", "okx",
+            "bybit", "deribit", "ftx", "kucoin", "huobi", "bitfinex", "gate"
+        ]))
+        self.update_reference_data("venues", "name", venues)
+        
+        # Load symbols from config or use defaults
+        symbols = set(self.config.get("valid_symbols", [
+            "BTCUSDT", "ETHUSDT", "ADAUSDT", "SOLUSDT", "DOTUSDT", "LINKUSDT",
+            "BTCUSD", "ETHUSD", "BTCEUR", "ETHEUR", "USDCUSDT", "BUSDUSDT",
+            "BTC-USD", "ETH-USD", "BTC-EUR", "ETH-EUR", "XBT-USD", "ETH-XBT"
+        ]))
+        self.update_reference_data("symbols", "symbol", symbols)
+        
+        # Load chains from config or use defaults
+        chains = set(self.config.get("valid_chains", [
+            "ethereum", "bitcoin", "polygon", "arbitrum", "optimism", "base",
+            "avalanche", "bsc", "fantom", "solana", "cosmos", "terra"
+        ]))
+        self.update_reference_data("chains", "name", chains)
+        
+        # Load currencies from config or use defaults
+        currencies = set(self.config.get("valid_currencies", [
+            "USD", "EUR", "GBP", "JPY", "AUD", "CAD", "CHF", "CNY", "HKD", "SGD",
+            "USDT", "USDC", "BUSD", "DAI", "BTC", "ETH", "BNB", "ADA", "SOL", "DOT"
+        ]))
+        self.update_reference_data("currencies", "code", currencies)
+        
+        logger.info(f"Loaded reference data: {len(venues)} venues, {len(symbols)} symbols, {len(chains)} chains, {len(currencies)} currencies")
+    
+    async def get_health_status(self) -> Dict[str, Any]:
+        """Get comprehensive health status."""
+        return {
+            'component_id': self.circuit_breaker_id,
+            'running': self.running,
+            'last_health_check': self._last_health_check,
+            'schemas_loaded': len(self.schemas),
+            'pending_tasks': len(self._pending_validation_tasks),
+            'circuit_breaker_registered': self._circuit_breaker_registered,
+            'metrics': self.metrics.copy()
+        }
     
     async def start(self):
         """Start the schema validator agent with streaming bus consumer."""
         self.running = True
         
-        # Subscribe to raw data topics for validation
-        raw_data_topics = [
+        # Register circuit breaker
+        await self._register_circuit_breaker()
+        
+        # Register data ingestion schemas
+        self._register_data_ingestion_schemas()
+        
+        # Load reference data for foreign key validation
+        await self._load_reference_data()
+        
+        # Start health monitoring
+        self._health_check_task = asyncio.create_task(self._health_monitor_loop())
+        
+        # Subscribe to raw data topics for validation (configurable)
+        raw_data_topics = self.config.get("validation_topics", [
             "raw_data.exchange_feed",
             "raw_data.options_chain", 
             "raw_data.onchain_events",
@@ -1642,17 +2536,30 @@ class SchemaValidatorAgent:
             "raw_data.market.oi",
             "raw_data.onchain.blocks",
             "raw_data.onchain.mempool"
-        ]
+        ])
         
-        # Start consumer with worker pool for parallel processing
-        await self.streaming_bus.subscribe_with_worker_pool(
-            consumer_group="schema-validator",
-            topics=raw_data_topics,
-            handler=self._handle_raw_message_sync,
-            pool_size=8  # Process validation in parallel
-        )
+        # Get pool size from config
+        pool_size = self.config.get("validation_pool_size", 8)
         
-        logger.info("Schema Validator Agent started with streaming bus consumer")
+        try:
+            # Start consumer as a managed task
+            self._consumer_task = asyncio.create_task(
+                self.streaming_bus.subscribe_with_worker_pool(
+                    consumer_group="schema-validator",
+                    topics=raw_data_topics,
+                    handler=self._handle_raw_message_sync,
+                    pool_size=pool_size  # Process validation in parallel
+                )
+            )
+            
+            logger.info(f"Schema Validator Agent started with streaming bus consumer (topics: {len(raw_data_topics)}, pool_size: {pool_size})")
+            
+        except Exception as e:
+            self.running = False
+            logger.error(f"Schema Validator startup failed: {e}")
+            logger.error(f"Error details - Topics: {raw_data_topics}, Pool size: {pool_size}")
+            logger.exception("Full startup error traceback:")
+            raise  # Re-raise to prevent silent failure
     
     def _handle_raw_message_sync(self, topic: str, partition_key: str, payload: Dict[str, Any], headers: Dict[str, str]) -> None:
         """Synchronous handler for incoming raw data messages for validation."""
@@ -1666,20 +2573,34 @@ class SchemaValidatorAgent:
             # Generate row identifier from payload and headers
             row_id = headers.get("record_id", f"{topic}_{partition_key}_{int(time.time_ns())}")
             
-            # Schedule async validation (avoid asyncio.run in potential async context)
-            if not hasattr(self, '_pending_tasks'):
-                self._pending_tasks = []
+            # Schedule async validation with proper task management
             validation_task = asyncio.create_task(self._async_validate_and_publish(table_name, payload, row_id, headers))
-            self._pending_tasks.append(validation_task)
+            self._pending_validation_tasks.add(validation_task)
+            
+            # Add callback to remove task when done and handle exceptions
+            def task_done_callback(completed_task):
+                self._pending_validation_tasks.discard(completed_task)
+                exc = completed_task.exception()
+                if exc:
+                    logger.error(f"Validation task failed for {table_name}: {exc}")
+            
+            validation_task.add_done_callback(task_done_callback)
             
         except Exception as e:
             logger.exception(f"Error validating message from {topic}: {e}")
             
-            # Schedule async error publishing and store task
-            if not hasattr(self, '_pending_tasks'):
-                self._pending_tasks = []
-            task = asyncio.create_task(self._publish_validation_error(topic, payload, str(e), headers))
-            self._pending_tasks.append(task)
+            # Schedule async error publishing with proper task management
+            error_task = asyncio.create_task(self._publish_validation_error(topic, payload, str(e), headers))
+            self._pending_validation_tasks.add(error_task)
+            
+            # Add callback to remove error task when done
+            def error_task_done_callback(completed_task):
+                self._pending_validation_tasks.discard(completed_task)
+                exc = completed_task.exception()
+                if exc:
+                    logger.error(f"Error publishing validation error: {exc}")
+            
+            error_task.add_done_callback(error_task_done_callback)
     
     async def _async_validate_and_publish(self, table_name: str, payload: Dict[str, Any], row_id: str, headers: Dict[str, str]) -> None:
         """Async helper to validate a row and publish results."""
@@ -1706,6 +2627,32 @@ class SchemaValidatorAgent:
         }
         
         return topic_mapping.get(topic)
+    
+    def _get_clean_topic_for_table(self, table_name: str) -> Optional[str]:
+        """Map table name to appropriate clean data topic."""
+        table_to_topic_mapping = {
+            # Market data tables
+            "exchange_trades": "clean.market.trades",
+            "market_trades": "clean.market.trades", 
+            "market_book": "clean.market.book",
+            "market_funding": "clean.market.funding",
+            "market_oi": "clean.market.oi",
+            
+            # Options data
+            "options_surface": "clean.market.options",
+            
+            # OnChain data
+            "onchain_flows": "clean.market.onchain",
+            "onchain_blocks": "clean.market.onchain",
+            "onchain_mempool": "clean.market.onchain",
+            
+            # Events data
+            "offchain_events": "clean.market.events",
+            "calendar_events": "clean.market.events",
+            "governance_events": "clean.market.events"
+        }
+        
+        return table_to_topic_mapping.get(table_name)
     
     async def _publish_validation_results(self, table_name: str, original_payload: Dict[str, Any], 
                                          cleaned_row: Dict[str, Any], violations: List[SchemaViolation], 
@@ -1743,6 +2690,41 @@ class SchemaValidatorAgent:
                 "had_coercion": flags.had_coercion
             }
         }
+        
+        # **NEW: Publish cleaned data to appropriate clean.* topic**
+        if status in ["PASS", "COERCED"]:  # Only publish clean data if validation passed
+            clean_topic = self._get_clean_topic_for_table(table_name)
+            if clean_topic:
+                # Create clean data payload
+                clean_payload = {
+                    "table_name": table_name,
+                    "timestamp": int(time.time() * 1_000_000),
+                    "data": cleaned_row,  # The validated and cleaned data
+                    "validation_status": status,
+                    "coercion_count": len([v for v in violations if v.violation_type.endswith("_coerced")]),
+                    "source_row_id": violations[0].row_identifier if violations else headers.get("record_id", "unknown")
+                }
+                
+                # Use source row ID as partition key for ordering
+                clean_partition_key = violations[0].row_identifier if violations else headers.get("record_id", table_name)
+                
+                await self.streaming_bus.publish_with_headers(
+                    topic=clean_topic,
+                    partition_key=clean_partition_key,
+                    payload=clean_payload,
+                    headers={
+                        "data_type": "clean_data",
+                        "table": table_name,
+                        "validation_status": status,
+                        "source_topic": headers.get("original_topic", "unknown"),
+                        "venue": headers.get("venue", "unknown"),
+                        "chain": headers.get("chain", "unknown")
+                    },
+                    dedupe_key=f"clean_{table_name}_{clean_payload['source_row_id']}_{clean_payload['timestamp']}"
+                )
+                
+                # Gold layer curation removed - handled by separate Gold Layer component
+                # Schema Validator only handles raw_data.* → clean.* transformation
         
         # Publish to clean.pass_fail topic
         partition_key = f"schema_validation_{table_name}"
@@ -1818,12 +2800,62 @@ class SchemaValidatorAgent:
             dedupe_key=f"schema_error_{topic}_{headers.get('record_id', int(time.time_ns()))}"
         )
     
+    # Gold layer functionality removed - belongs in separate Gold Layer component
+    # Schema Validator responsibility: raw_data.* → clean.* only
+    
     async def stop(self):
-        """Stop the schema validator agent."""
+        """Stop the schema validator agent with proper task cleanup."""
         self.running = False
         
+        logger.info("Stopping Schema Validator Agent...")
+        
+        # Cancel the health check task
+        if self._health_check_task and not self._health_check_task.done():
+            logger.info("Cancelling health check task...")
+            self._health_check_task.cancel()
+            try:
+                await self._health_check_task
+            except asyncio.CancelledError:
+                logger.info("Health check task cancelled successfully")
+            except Exception as e:
+                logger.error(f"Error during health check task cancellation: {e}")
+        
+        # Cancel the consumer task
+        if self._consumer_task and not self._consumer_task.done():
+            logger.info("Cancelling consumer task...")
+            self._consumer_task.cancel()
+            try:
+                await self._consumer_task
+            except asyncio.CancelledError:
+                logger.info("Consumer task cancelled successfully")
+            except Exception as e:
+                logger.error(f"Error during consumer task cancellation: {e}")
+        
+        # Cancel all pending validation tasks
+        if self._pending_validation_tasks:
+            logger.info(f"Cancelling {len(self._pending_validation_tasks)} pending validation tasks...")
+            
+            # Cancel all pending tasks
+            for task in list(self._pending_validation_tasks):
+                if not task.done():
+                    task.cancel()
+            
+            # Wait for cancelled tasks to complete
+            if self._pending_validation_tasks:
+                try:
+                    await asyncio.gather(*self._pending_validation_tasks, return_exceptions=True)
+                except Exception as e:
+                    logger.error(f"Error during validation task cleanup: {e}")
+            
+            # Clear the task set
+            self._pending_validation_tasks.clear()
+        
         # Stop streaming bus
-        await self.streaming_bus.graceful_shutdown()
+        try:
+            await self.streaming_bus.shutdown()
+            logger.info("Streaming bus shutdown completed")
+        except Exception as e:
+            logger.error(f"Error during streaming bus shutdown: {e}")
         
         logger.info("Schema Validator Agent stopped")
 
@@ -1832,14 +2864,14 @@ class SchemaValidatorAgent:
 LOWERCASE_ADDRESS_RULE = CoercionRule(
     from_type=str,
     to_type=str,
-    coercer=lambda x: x.lower() if isinstance(x, str) and x.startswith('0x') and len(x) == 42 else None,
+    coercer=lambda x: x.lower() if isinstance(x, str) and len(x) == 42 and x[:2].lower() == '0x' else None,
     description="Normalize Ethereum addresses to lowercase"
 )
 
 LOWERCASE_HASH_RULE = CoercionRule(
     from_type=str,
     to_type=str,
-    coercer=lambda x: x.lower() if isinstance(x, str) and x.startswith('0x') and len(x) == 66 else None,
+    coercer=lambda x: x.lower() if isinstance(x, str) and len(x) == 66 and x[:2].lower() == '0x' else None,
     description="Normalize transaction hashes to lowercase"
 )
 

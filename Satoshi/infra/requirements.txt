@@ -30,7 +30,12 @@ boto3>=1.28.0                # AWS KMS/Secrets Manager
 azure-keyvault-secrets>=4.7.0  # Azure Key Vault
 google-cloud-secret-manager>=2.16.0  # GCP Secret Manager
 
-# Data Processing
+# Compute Engine (Spark for Alpha Generation)
+pyspark>=3.5.0               # Apache Spark for sophisticated analytics
+py4j>=0.10.9.7               # Spark-Python integration
+findspark>=2.0.1             # Spark discovery utility
+
+# Data Processing  
 pandas>=2.1.0                # Data manipulation
 numpy>=1.24.0                # Numerical computing
 polars>=0.20.0               # Fast DataFrames (alternative)

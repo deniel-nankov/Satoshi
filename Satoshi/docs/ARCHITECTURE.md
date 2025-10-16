@@ -1,4 +1,110 @@
 
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+                    🏗️ INFRASTRUCTURE DEPLOYMENT STRATEGY 🏗️
+━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━
+
+## 📊 **DATA SOURCES CONFIGURATION**
+
+### **🏦 EXCHANGE DATA (Fully Configured)**
+- **Coinbase**: 70+ trading pairs via CDP API
+- **Gemini**: 40+ trading pairs via Standard API
+- **Status**: ✅ Production ready
+- **Cost**: $0 (free API access)
+
+### **⛓️ ON-CHAIN DATA (Phased Deployment Strategy)**
+
+#### **PHASE 1: Initial Launch ($49/month - Current)**
+
+**Ethereum Mainnet** - QuickNode Premium Endpoint
+- **Provider**: QuickNode Build Plan
+- **Endpoint**: `rough-boldest-bird.quiknode.pro`
+- **Coverage**: Stablecoin flows, CEX tracking, LST discounts, DeFi activity
+- **Alpha Contribution**: 50-100 bps daily (90% of on-chain alpha)
+- **Rationale**: Highest-value chain with premium reliability
+
+**L2 Chains** - Free Public RPC Endpoints
+- **Arbitrum**: `https://arb1.arbitrum.io/rpc`
+- **Base**: `https://mainnet.base.org`
+- **Polygon**: `https://polygon-rpc.com`
+- **Optimism**: `https://mainnet.optimism.io`
+- **Coverage**: DEX arbitrage, bridge flows, L2 DeFi
+- **Alpha Contribution**: 50-90 bps daily
+- **Trade-off**: Free but rate-limited, sufficient for initial validation
+
+**Phase 1 Performance:**
+- **Daily Alpha**: 100-190 bps
+- **Monthly Revenue (on $100k AUM)**: $3,000-5,700
+- **Infrastructure Cost**: $49/month
+- **Net Monthly Profit**: $2,951-5,651
+- **ROI**: 60-115x monthly
+
+---
+
+#### **PHASE 2: Scale Upgrade ($499/month - Future)**
+
+**Upgrade Triggers:**
+- ✅ AUM reaches $500k+
+- ✅ Free RPC rate limits become bottleneck (>1,000 req/min sustained)
+- ✅ Monthly revenue consistently exceeds $10k
+- ✅ Need for WebSocket streaming on L2s
+
+**Infrastructure Changes:**
+- Upgrade to QuickNode Scale Plan (5 premium endpoints included)
+- Replace all free public RPCs with dedicated QuickNode endpoints:
+  - `YOUR-ARBITRUM-ENDPOINT.arbitrum-mainnet.quiknode.pro`
+  - `YOUR-BASE-ENDPOINT.base-mainnet.quiknode.pro`
+  - `YOUR-POLYGON-ENDPOINT.matic.quiknode.pro`
+  - `YOUR-OPTIMISM-ENDPOINT.optimism.quiknode.pro`
+
+**Phase 2 Benefits:**
+- **Higher reliability**: 99.99% uptime SLA vs 99% public RPCs
+- **Lower latency**: <50ms vs 100-500ms public RPCs
+- **No rate limits**: Unlimited requests vs 100-300 req/min public
+- **WebSocket support**: Real-time streaming for all chains
+- **Archive node access**: Historical data for backtesting
+- **Trace API**: Deep transaction analysis
+
+**Phase 2 Performance:**
+- **Daily Alpha**: 150-290 bps (full optimization)
+- **Monthly Revenue (on $500k AUM)**: $22,500-43,500
+- **Infrastructure Cost**: $499/month
+- **Net Monthly Profit**: $22,001-43,001
+- **ROI**: 44-86x monthly
+
+---
+
+#### **PHASE 3: Enterprise Scale ($999-2,499/month - Institutional)**
+
+**Upgrade Triggers:**
+- ✅ AUM reaches $10M+
+- ✅ Need for dedicated nodes with custom performance SLAs
+- ✅ Regulatory compliance requirements
+
+**Infrastructure Changes:**
+- QuickNode Business or Enterprise plan
+- Dedicated RPC nodes with guaranteed performance
+- Priority support and custom SLAs
+- Enhanced security and compliance features
+
+---
+
+### **🎯 STRATEGIC RATIONALE**
+
+**Why Start with Hybrid (QuickNode + Free RPCs):**
+1. **Cost-Optimized Launch**: Proves architecture with minimal upfront investment
+2. **Risk Mitigation**: Validates alpha generation before scaling infrastructure spend
+3. **Ethereum First**: 90% of on-chain alpha comes from Ethereum mainnet
+4. **L2s Secondary**: L2 data provides incremental alpha, free RPCs sufficient initially
+5. **Clear Upgrade Path**: Seamless transition to premium endpoints when metrics justify
+
+**Decision Framework for Phase 2 Upgrade:**
+- **Revenue Test**: Monthly profit > $10k for 3 consecutive months
+- **Performance Test**: Free RPC latency exceeds 500ms p95
+- **Reliability Test**: Free RPC downtime > 0.5% in any month
+- **Scale Test**: Total RPC requests > 100M per month
+
+---
+
 ## ✅ **User's Correct Architecture**
 
 ```

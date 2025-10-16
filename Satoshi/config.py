@@ -309,21 +309,89 @@ ONCHAIN_CONFIG = {
 # =============================================================================
 
 EVENTS_CONFIG = {
-    "sources": {
-        # ===== GITHUB (DISABLED - Add token to enable) =====
-        "github": {
-            "enabled": False,  # Set to True after adding token
-            "token": "YOUR_GITHUB_TOKEN",
-            "tracked_repos": [
-                "ethereum/go-ethereum",
-                "bitcoin/bitcoin",
-                "solana-labs/solana"
-            ],
-            "poll_interval_sec": 600
-        },
+    # Collection intervals (priority-based processing)
+    "governance_interval_sec": 180,  # 3 min - High priority
+    "token_unlocks_interval_sec": 3600,  # 1 hour - Medium priority
+    "exchange_status_interval_sec": 300,  # 5 min - High priority (trading impact)
+    "github_releases_interval_sec": 1800,  # 30 min - Medium priority
+    
+    # ===== SNAPSHOT GOVERNANCE (FREE - No API key required) =====
+    "governance_enabled": True,
+    "snapshot_spaces": [
+        "compound",           # Compound governance
+        "aave.eth",          # Aave governance
+        "uniswap",           # Uniswap governance
+        "ens.eth",           # ENS governance
+        "gitcoin.eth",       # Gitcoin governance
+        "arbitrum.eth",      # Arbitrum governance
+        "optimism.eth",      # Optimism governance
+        "lido-snapshot.eth", # Lido governance
+        "polygon.eth",       # Polygon governance
+        "safe.eth"           # Safe governance
+    ],
+    
+    # ===== EXCHANGE STATUS (FREE - Public status pages) =====
+    "exchange_status_enabled": True,
+    "binance_status_enabled": True,   # Binance system status
+    "coinbase_status_enabled": True,  # Coinbase incidents
+    # Note: These use public status APIs, no authentication required
+    
+    # ===== GITHUB RELEASES (FREE with token - Higher rate limits) =====
+    "github_releases_enabled": True,
+    "github_token": None,  # Optional: Add GitHub Personal Access Token for higher rate limits
+                          # Create at: https://github.com/settings/tokens
+                          # Required scopes: public_repo (read-only)
+                          # Rate limits: 60 req/hr (no token) vs 5,000 req/hr (with token)
+    "github_repos": [
+        # Layer 1 protocols
+        "ethereum/go-ethereum",        # Ethereum client (Geth)
+        "bitcoin/bitcoin",             # Bitcoin Core
+        "solana-labs/solana",          # Solana
         
-        # Add more sources as needed (CryptoPanic, etc.)
-    },
+        # DeFi protocols (governance + technical changes)
+        "compound-finance/compound-protocol",  # Compound
+        "Uniswap/v3-core",                    # Uniswap v3
+        "aave/aave-protocol-v2",              # Aave v2
+        "Uniswap/v4-core",                    # Uniswap v4
+        "makerdao/dss",                       # MakerDAO
+        
+        # L2 infrastructure
+        "ethereum-optimism/optimism",   # Optimism
+        "OffchainLabs/arbitrum",       # Arbitrum
+        "matter-labs/zksync-era"       # zkSync
+    ],
+    
+    # ===== TOKEN UNLOCKS (DISABLED - No free API found) =====
+    "token_unlocks_enabled": False,
+    "token_unlocks_api_url": None,  # TODO: Add if you find free source
+    # Alternatives: Manual tracking, CoinGecko events scraping
+    
+    # Enhanced queue and correlation settings
+    "calendar_queue_size": 10000,
+    "correlation_window_hours": 48,  # Extended for better event correlation
+    
+    # Circuit breaker configuration
+    "source_health_check_interval": 300,  # 5 minutes
+    "max_consecutive_failures": 3,
+    
+    # Validation settings
+    "enable_strict_validation": True,
+    "log_validation_issues": True,
+    
+    # Priority processing
+    "priority_queue_enabled": True,
+    "max_priority_events_per_batch": 50,
+    
+    # Retry configuration for external API calls
+    "max_retries": 3,
+    "base_delay_ms": 1000,
+    "max_delay_ms": 30000,
+    "exponential_base": 2.0,
+    
+    # Health monitoring
+    "health_check_interval": 300.0,  # 5 minutes
+    
+    # Rate limiting
     "rate_limit_qps": 5
 }
 

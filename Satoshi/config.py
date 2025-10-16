@@ -162,22 +162,129 @@ OPTIONS_CONFIG = {
 
 ONCHAIN_CONFIG = {
     "chains": {
-        # ===== ETHEREUM (DISABLED - Add RPC URL to enable) =====
+        # ===== ETHEREUM MAINNET (QuickNode) =====
         "ethereum": {
-            "enabled": False,  # Set to True after adding RPC
-            "rpc_url": "https://eth-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY",
+            "enabled": True,
+            "rpc_url": "https://YOUR-ENDPOINT.quiknode.pro/YOUR-API-KEY/",  # Replace with your QuickNode Ethereum endpoint
             "fallback_rpcs": [
-                "https://mainnet.infura.io/v3/YOUR_INFURA_KEY",
+                "https://eth.llamarpc.com",
                 "https://rpc.ankr.com/eth"
             ],
             "block_polling_interval": 12.0,
             "confirmations_required": 12,
-            "chain_id": 1
+            "chain_id": 1,
+            "reorg_depth": 12,
+            "finality_blocks": 32,
+            # Alpha sources: Stablecoin mints/burns, CEX flows, LST discounts
+            "data_types": ["flows", "lst_state", "bridge"],
+            "priority": "critical"  # Highest alpha per your architecture
         },
         
-        # Add more chains as needed (BSC, Polygon, Arbitrum, etc.)
+        # ===== ARBITRUM (L2 - QuickNode) =====
+        "arbitrum": {
+            "enabled": True,
+            "rpc_url": "https://YOUR-ENDPOINT.arbitrum-mainnet.quiknode.pro/YOUR-API-KEY/",  # Replace with your QuickNode Arbitrum endpoint
+            "fallback_rpcs": [
+                "https://arb1.arbitrum.io/rpc",
+                "https://rpc.ankr.com/arbitrum"
+            ],
+            "block_polling_interval": 0.25,  # 250ms blocks
+            "confirmations_required": 1,
+            "chain_id": 42161,
+            "reorg_depth": 1,
+            "finality_blocks": 10,
+            # Optimized for high-throughput L2 batching (900 batch size)
+            "l2_optimized": True,
+            "batch_size": 900,
+            "queue_size": 60000,
+            "publish_concurrency": 12,
+            "data_types": ["flows", "bridge"],
+            "priority": "high"
+        },
+        
+        # ===== BASE (Coinbase L2 - QuickNode) =====
+        "base": {
+            "enabled": True,
+            "rpc_url": "https://YOUR-ENDPOINT.base-mainnet.quiknode.pro/YOUR-API-KEY/",  # Replace with your QuickNode Base endpoint
+            "fallback_rpcs": [
+                "https://mainnet.base.org",
+                "https://base.llamarpc.com"
+            ],
+            "block_polling_interval": 2.0,
+            "confirmations_required": 1,
+            "chain_id": 8453,
+            "reorg_depth": 1,
+            "finality_blocks": 10,
+            # Synergistic with your Coinbase exchange data
+            "l2_optimized": True,
+            "data_types": ["flows", "bridge"],
+            "priority": "high",
+            "note": "Pairs with Coinbase market data for CEX<->L2 arbitrage"
+        },
+        
+        # ===== POLYGON (QuickNode) =====
+        "polygon": {
+            "enabled": True,
+            "rpc_url": "https://YOUR-ENDPOINT.matic.quiknode.pro/YOUR-API-KEY/",  # Replace with your QuickNode Polygon endpoint
+            "fallback_rpcs": [
+                "https://polygon-rpc.com",
+                "https://rpc.ankr.com/polygon"
+            ],
+            "block_polling_interval": 2.0,
+            "confirmations_required": 256,  # Polygon checkpoint system
+            "chain_id": 137,
+            "reorg_depth": 256,
+            "finality_blocks": 256,
+            # High stablecoin volume, bridge flows
+            "l2_optimized": True,
+            "batch_size": 750,
+            "queue_size": 45000,
+            "data_types": ["flows", "bridge"],
+            "priority": "medium"
+        },
+        
+        # ===== OPTIMISM (QuickNode) =====
+        "optimism": {
+            "enabled": True,
+            "rpc_url": "https://YOUR-ENDPOINT.optimism.quiknode.pro/YOUR-API-KEY/",  # Replace with your QuickNode Optimism endpoint
+            "fallback_rpcs": [
+                "https://mainnet.optimism.io",
+                "https://rpc.ankr.com/optimism"
+            ],
+            "block_polling_interval": 2.0,
+            "confirmations_required": 1,
+            "chain_id": 10,
+            "reorg_depth": 1,
+            "finality_blocks": 12,
+            # Major DEX presence (Velodrome, Uniswap)
+            "l2_optimized": True,
+            "batch_size": 750,
+            "queue_size": 45000,
+            "publish_concurrency": 10,
+            "data_types": ["flows", "bridge"],
+            "priority": "medium"
+        }
     },
-    "rate_limit_qps": 10
+    
+    # Global on-chain settings
+    "rate_limit_qps": 10,
+    "circuit_breaker_failure_threshold": 5,
+    "health_check_interval": 60.0,
+    "max_retries": 5,
+    
+    # Dune Analytics API (for enhanced flow analysis)
+    "dune_api_key": "YOUR_DUNE_API_KEY",  # Optional but recommended
+    "dune_query_ids": {
+        "flows": 1234567,  # Your custom Dune query for flow analysis
+        "lst_state": 1234568,
+        "bridge": 1234569
+    },
+    
+    # High-throughput L2 optimization (matches your architecture)
+    "high_throughput_chains": ["arbitrum", "optimism", "polygon"],
+    "l2_batch_size": 600,
+    "l2_publish_concurrency": 8,
+    "l2_auto_tune_enabled": True
 }
 
 # =============================================================================

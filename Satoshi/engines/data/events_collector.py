@@ -148,7 +148,7 @@ class EventClassifier:
         
         # Exchange maintenance detection
         if ('maintenance' in raw_type or 'outage' in raw_type or 
-            'incident' in raw_type or source in {'binance', 'coinbase', 'kraken'}):
+            'incident' in raw_type or source in {'binance', 'coinbase', 'gemini', 'kraken'}):
             return 'exchange_maintenance'
         
         # GitHub release detection
@@ -1294,13 +1294,13 @@ class EventsCollectorAgent:
                 # Exchange status from multiple sources
                 exchanges = []
                 
-                # Binance system status
-                if self.config.get('binance_status_enabled', False):
-                    exchanges.append(('binance', 'https://www.binance.com/bapi/composite/v1/public/cms/article/list/query?type=1&pageSize=20'))
-                
                 # Coinbase status
                 if self.config.get('coinbase_status_enabled', False):
                     exchanges.append(('coinbase', 'https://status.coinbase.com/api/v2/incidents.json'))
+                
+                # Gemini status
+                if self.config.get('gemini_status_enabled', False):
+                    exchanges.append(('gemini', 'https://status.gemini.com/api/v2/incidents.json'))
                 
                 # Add more exchanges as needed
                 # if self.config.get('kraken_status_enabled', False):
@@ -1464,6 +1464,78 @@ class EventsCollectorAgent:
                                                     logger.warning("Failed to enqueue coinbase incident event - queue full")
                                                 except Exception as queue_e:
                                                     logger.warning(f"Failed to enqueue coinbase incident event to local queue: {queue_e}")
+                                        except Exception as row_exc:
+                                            logger.warning(f"Bad {exchange} incident: {row_exc} | {str(incident)[:300]}")
+                                            continue
+                                
+                                elif exchange == 'gemini' and "incidents" in result:
+                                    for incident in result["incidents"]:
+                                        try:
+                                            event = CalendarEvent(
+                                                event_type="exchange_maintenance",
+                                                title=incident.get("name", "Gemini Incident"),
+                                                description=incident.get("body", "")[:500],
+                                                start_time_utc_us=_normalize_timestamp(incident.get("created_at"), now),
+                                                source="gemini",
+                                                source_id=incident.get("id", ""),
+                                                status=incident.get("status", "unknown"),
+                                                metadata={
+                                                    "exchange": "gemini",
+                                                    "impact": incident.get("impact"),
+                                                    "shortlink": incident.get("shortlink")
+                                                },
+                                                capture_timestamp_utc_us=capture_now
+                                            )
+                                            
+                                            # Check for status updates
+                                            status_key = ("gemini", incident.get("id", ""))
+                                            last_status = self.last_status.get(status_key)
+                                            current_status = incident.get("status", "unknown")
+                                            is_status_update = last_status and last_status != current_status
+                                            
+                                            if is_status_update or not self.duplicate_detector.is_duplicate('calendar', event.get_hash(), key="gemini_status"):
+                                                # Update status tracking
+                                                self.last_status[status_key] = current_status
+                                                
+                                                # Streaming Bus: Publish to raw_data.offchain_events
+                                                try:
+                                                    event_data = {
+                                                        "source": "exchange_status",
+                                                        "exchange": "gemini",
+                                                        "event_type": event.event_type,
+                                                        "timestamp": event.start_time_utc_us,
+                                                        "capture_timestamp": event.capture_timestamp_utc_us,
+                                                        "title": event.title,
+                                                        "description": event.description[:500] if event.description else None,
+                                                        "status": event.status,
+                                                        "source_id": event.source_id,
+                                                        "extra": event.metadata
+                                                    }
+                                                    
+                                                    await self.streaming_bus.publish_with_headers(
+                                                        topic="raw_data.offchain_events",
+                                                        partition_key="exchange_gemini",
+                                                        payload=event_data,
+                                                        headers={"data_type": "exchange_status", "exchange": "gemini"}
+                                                    )
+                                                except Exception as e:
+                                                    logger.warning(f"Failed to publish gemini status event to streaming bus: {e}")
+                                                
+                                                # Local queue fallback with proper error handling
+                                                try:
+                                                    q = self.output_queues['calendar']
+                                                    if q.full():
+                                                        try: 
+                                                            q.get_nowait()
+                                                            logger.debug("Dropped old gemini incident event from full queue")
+                                                        except asyncio.QueueEmpty: 
+                                                            pass
+                                                    q.put_nowait(event)
+                                                    logger.debug("Enqueued gemini incident event to local queue")
+                                                except asyncio.QueueFull:
+                                                    logger.warning("Failed to enqueue gemini incident event - queue full")
+                                                except Exception as queue_e:
+                                                    logger.warning(f"Failed to enqueue gemini incident event to local queue: {queue_e}")
                                         except Exception as row_exc:
                                             logger.warning(f"Bad {exchange} incident: {row_exc} | {str(incident)[:300]}")
                                             continue

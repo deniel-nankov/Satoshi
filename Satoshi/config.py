@@ -332,9 +332,10 @@ EVENTS_CONFIG = {
     
     # ===== EXCHANGE STATUS (FREE - Public status pages) =====
     "exchange_status_enabled": True,
-    "binance_status_enabled": True,   # Binance system status
-    "coinbase_status_enabled": True,  # Coinbase incidents
+    "coinbase_status_enabled": True,  # Coinbase incidents (matches exchange_collector)
+    "gemini_status_enabled": True,    # Gemini system status (matches exchange_collector)
     # Note: These use public status APIs, no authentication required
+    # Monitors the same exchanges configured in EXCHANGE_CONFIG
     
     # ===== GITHUB RELEASES (FREE with token - Higher rate limits) =====
     "github_releases_enabled": True,

@@ -69,6 +69,42 @@ Qy6bDLkBfSwX/LQ777BuCtQF46kr7nQRAg==
             "ws_endpoint": "wss://advanced-trade-ws.coinbase.com"
         },
         
+        # ===== GEMINI EXCHANGE =====
+        "gemini": {
+            "enabled": True,
+            "api_key": "master-nnYtPydAmdPjufO8legi",
+            "api_secret": "3hibQDRv5SM4juUCngNc58TdMPpU",
+            # Major trading pairs available on Gemini
+            "symbols": [
+                # Top Market Cap
+                "BTCUSD", "ETHUSD", "SOLUSD", "ADAUSD", "AVAXUSD", "DOTUSD",
+                "MATICUSD", "LINKUSD", "UNIUSD", "ATOMUSD",
+                
+                # L2 & Infrastructure
+                "ARBUSD", "OPUSD", "APTUSD",
+                
+                # DeFi Blue Chips
+                "AAVEUSD", "MKRUSD", "COMPUSD", "YFIUSD",
+                
+                # Stablecoins
+                "USDCUSD", "DAIUSD", "USDTUSD",
+                
+                # Meme Tokens
+                "DOGEUSD", "SHIBUSD",
+                
+                # Other Major Assets
+                "BCHUSD", "LTCUSD", "ETCUSD", "ZECUSD",
+                "BATUSD", "ENJUSD", "MANAUSD", "SANDUSD",
+                
+                # Cross-pairs for arbitrage
+                "ETHBTC", "LTCBTC"
+            ],
+            "data_types": ["trades", "book"],
+            "rate_limit_qps": 100,
+            "rest_endpoint": "https://api.gemini.com",
+            "ws_endpoint": "wss://api.gemini.com/v1/marketdata"
+        },
+        
         # ===== BINANCE SPOT (DISABLED - Add your keys to enable) =====
         "binance": {
             "enabled": False,  # Set to True after adding keys

@@ -272,14 +272,6 @@ ONCHAIN_CONFIG = {
     "health_check_interval": 60.0,
     "max_retries": 5,
     
-    # Dune Analytics API (for enhanced flow analysis)
-    "dune_api_key": "YOUR_DUNE_API_KEY",  # Optional but recommended
-    "dune_query_ids": {
-        "flows": 1234567,  # Your custom Dune query for flow analysis
-        "lst_state": 1234568,
-        "bridge": 1234569
-    },
-    
     # High-throughput L2 optimization (matches your architecture)
     "high_throughput_chains": ["arbitrum", "optimism", "polygon"],
     "l2_batch_size": 600,

@@ -1742,7 +1742,7 @@ class ReconcilerAgent:
                             severity="medium"
                         )
                     elif action == "close":
-                        print(f"🔄 Reconciler Agent: Circuit breaker closed via control message")
+                        print("🔄 Reconciler Agent: Circuit breaker closed via control message")
                         await self.streaming_bus.record_component_success(
                             component_id="reconciler_agent",
                             reason="reconciler_control_close_request",

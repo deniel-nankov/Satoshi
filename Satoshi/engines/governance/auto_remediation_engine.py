@@ -21,7 +21,7 @@ import logging
 import time
 import psutil
 import json
-from typing import Dict, List, Optional, Any, Union, Callable
+from typing import Dict, List, Optional, Any, Union, Callable, Set
 from dataclasses import dataclass, field
 from enum import Enum
 from datetime import datetime, timezone
@@ -134,6 +134,10 @@ class AutoRemediationEngine:
         # Agent health tracking
         self.agent_health: Dict[str, Dict[str, Any]] = {}
         self.restart_history: Dict[str, List[datetime]] = defaultdict(list)
+        
+        # Circuit breaker registration tracking to prevent unbounded registrations
+        self._registered_isolation_breakers: Set[str] = set()
+        self._registered_cascade_breakers: Set[str] = set()
         
         # Metrics
         self.metrics = {
@@ -465,12 +469,17 @@ class AutoRemediationEngine:
             logger.info(f"🚫 Isolating component via circuit breaker: {component}")
             
             isolation_component_id = f"isolated_{component}"
-            await self.streaming_bus.register_circuit_breaker(
-                component_id=isolation_component_id,
-                failure_threshold=1,  # Immediate isolation
-                recovery_timeout_us=action.action_params.get("recovery_timeout", 1800_000_000),
-                dependency_components=[]
-            )
+            
+            # Only register if not already registered to prevent unbounded registrations
+            if isolation_component_id not in self._registered_isolation_breakers:
+                await self.streaming_bus.register_circuit_breaker(
+                    component_id=isolation_component_id,
+                    failure_threshold=1,  # Immediate isolation
+                    recovery_timeout_us=action.action_params.get("recovery_timeout", 1800_000_000),
+                    dependency_components=[]
+                )
+                self._registered_isolation_breakers.add(isolation_component_id)
+            
             await self.streaming_bus.publish_breaker_intent(
                 BreakerIntent(
                     component_id=isolation_component_id,
@@ -552,15 +561,26 @@ class AutoRemediationEngine:
             # Identify dependent components
             dependent_components = action.action_params.get("dependent_components", [])
             
+            # Limit cascade operations to prevent unbounded registrations
+            max_cascade_components = 10
+            if len(dependent_components) > max_cascade_components:
+                logger.warning(f"⚠️ Too many dependent components ({len(dependent_components)}), limiting to {max_cascade_components}")
+                dependent_components = dependent_components[:max_cascade_components]
+            
             # Open circuit breakers for dependent components
             for component in dependent_components:
                 cascade_component_id = f"cascade_protected_{component}"
-                await self.streaming_bus.register_circuit_breaker(
-                    component_id=cascade_component_id,
-                    failure_threshold=1,
-                    recovery_timeout_us=600_000_000,  # 10 minutes
-                    dependency_components=[]
-                )
+                
+                # Only register if not already registered
+                if cascade_component_id not in self._registered_cascade_breakers:
+                    await self.streaming_bus.register_circuit_breaker(
+                        component_id=cascade_component_id,
+                        failure_threshold=1,
+                        recovery_timeout_us=600_000_000,  # 10 minutes
+                        dependency_components=[]
+                    )
+                    self._registered_cascade_breakers.add(cascade_component_id)
+                
                 await self.streaming_bus.publish_breaker_intent(
                     BreakerIntent(
                         component_id=cascade_component_id,

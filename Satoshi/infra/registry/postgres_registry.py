@@ -1182,6 +1182,38 @@ class EnterprisePostgreSQLRegistry:
     
     # 📊 OPTIMAL: Quality metadata management with bulk operations
     
+    async def _insert_single_quality_metric(self, entity_type: str, entity_name: str,
+                                           quality_dimension: str, quality_score: float,
+                                           measurement_details: Optional[Dict[str, Any]] = None,
+                                           alert_threshold: Optional[float] = None,
+                                           sla_target: Optional[float] = None) -> bool:
+        """
+        Internal helper: Direct single-row INSERT for quality metric.
+        
+        Used by record_quality_metric and as fallback from batch operations.
+        Bypasses batch path to avoid recursion.
+        """
+        if not self.pool:
+            return False
+        
+        try:
+            async with self.pool.acquire() as conn:
+                await conn.execute(
+                    """
+                    INSERT INTO quality_metadata 
+                    (entity_type, entity_name, quality_dimension, quality_score, 
+                     measurement_details, alert_threshold, sla_target)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7)
+                    """,
+                    entity_type, entity_name, quality_dimension, quality_score,
+                    json.dumps(measurement_details) if measurement_details else None,
+                    alert_threshold, sla_target
+                )
+            return True
+        except Exception as e:
+            logger.error(f"Failed to insert single quality metric: {e}")
+            return False
+    
     async def record_quality_metric(self, entity_type: str, entity_name: str,
                                    quality_dimension: str, quality_score: float,
                                    measurement_details: Optional[Dict[str, Any]] = None,
@@ -1194,19 +1226,11 @@ class EnterprisePostgreSQLRegistry:
         TIP: For high-frequency recording, use record_quality_metrics_batch() 
              which is 10-20x faster via PostgreSQL COPY.
         """
-        # Convert to batch format for optimal performance path
-        metric_data = {
-            "entity_type": entity_type,
-            "entity_name": entity_name, 
-            "quality_dimension": quality_dimension,
-            "quality_score": quality_score,
-            "measurement_details": measurement_details,
-            "alert_threshold": alert_threshold,
-            "sla_target": sla_target
-        }
-        
-        # Use batch method even for single record - it's more efficient
-        return await self.record_quality_metrics_batch([metric_data])
+        # Use direct insert for single metric
+        return await self._insert_single_quality_metric(
+            entity_type, entity_name, quality_dimension, quality_score,
+            measurement_details, alert_threshold, sla_target
+        )
     
     async def record_quality_metrics_batch(self, metrics_batch: List[Dict[str, Any]]) -> bool:
         """
@@ -1254,10 +1278,10 @@ class EnterprisePostgreSQLRegistry:
             
         except Exception as e:
             logger.error(f"Failed to bulk record quality metrics: {e}")
-            # Fallback to individual inserts
+            # Fallback to individual inserts using direct helper
             success_count = 0
             for metric in metrics_batch:
-                if await self.record_quality_metric(**metric):
+                if await self._insert_single_quality_metric(**metric):
                     success_count += 1
             
             logger.warning(f"Fallback: {success_count}/{len(metrics_batch)} metrics recorded individually")

@@ -627,56 +627,6 @@ class QualityMonitoringTSDB:
     
     # ============= CORE INCIDENT PROCESSING METHODS =============
     
-    async def start_incident_consumption(self) -> None:
-        """Start consuming incidents from all incident topics."""
-        if not self.streaming_bus:
-            logger.warning("Streaming bus not available - incident consumption disabled")
-            return
-            
-        self.is_consuming = True
-        
-        # List of incident topics to consume
-        incident_topics = [
-            "incidents.SchemaViolation",
-            "incidents.Freshness", 
-            "incidents.Anomaly",
-            "incidents.Leakage",
-            "incidents.all"
-        ]
-        
-        try:
-            # Start consumers for all incident topics
-            consumer_tasks = []
-            for topic in incident_topics:
-                task = asyncio.create_task(
-                    self._consume_incident_topic(topic)
-                )
-                consumer_tasks.append(task)
-            
-            # Start periodic analytics and alerting
-            analytics_task = asyncio.create_task(self._periodic_incident_analysis())
-            consumer_tasks.append(analytics_task)
-            
-            logger.info(f"✅ Started incident consumption for {len(incident_topics)} topics")
-            
-            # Wait for shutdown signal
-            await self._shutdown_event.wait()
-            
-        except Exception as e:
-            logger.error(f"❌ Error in incident consumption: {e}")
-        finally:
-            self.is_consuming = False
-            
-            # Cancel all consumer tasks
-            for task in consumer_tasks:
-                task.cancel()
-                try:
-                    await task
-                except asyncio.CancelledError:
-                    pass
-            
-            logger.info("Incident consumption stopped")
-    
     async def _consume_incident_topic(self, topic: str) -> None:
         """Consume incidents from a specific topic."""
         try:
@@ -1035,19 +985,6 @@ class QualityMonitoringTSDB:
             self.incident_cache.popleft()
     
     async def stop_incident_consumption(self) -> None:
-        """Stop incident consumption gracefully."""
-        logger.info("Stopping incident consumption...")
-        self._shutdown_event.set()
-        
-        # Wait a bit for consumers to stop
-        await asyncio.sleep(2)
-        
-        if self.streaming_bus:
-            # Close streaming bus connections
-            # self.streaming_bus.close()  # TODO: Implement close method
-            pass
-        
-        logger.info("✅ Incident consumption stopped")
     
     # ============= ENHANCED INSERT METHODS =============
     

@@ -2910,7 +2910,7 @@ class StreamingBus:
                                        reason: str = "success",
                                        severity: str = "low",
                                        metadata: Optional[Dict[str, Any]] = None) -> None:
-        """Publish a recovery intent for the specified component."""
+        """Publish a recovery intent for the specified component and apply locally."""
         intent = BreakerIntent(
             component_id=component_id,
             intent="recover",
@@ -2919,13 +2919,13 @@ class StreamingBus:
             requested_by="streaming_bus",
             metadata=metadata or {}
         )
-        await self.publish_breaker_intent(intent)
+        await self.publish_breaker_intent(intent, apply_locally=True)
     
     async def record_component_failure(self, component_id: str, 
                                      cascade_failure: bool = True,
                                      reason: str = "failure",
                                      severity: str = "high") -> None:
-        """Publish a breaker intent requesting a trip for the component."""
+        """Publish a breaker intent requesting a trip for the component and apply locally."""
         intent = BreakerIntent(
             component_id=component_id,
             intent="trip",
@@ -2934,7 +2934,7 @@ class StreamingBus:
             requested_by="streaming_bus",
             metadata={"cascade_failure": cascade_failure}
         )
-        await self.publish_breaker_intent(intent)
+        await self.publish_breaker_intent(intent, apply_locally=True)
         logger.warning(f"Requested breaker trip for component: {component_id} (reason={reason})")
     
     async def publish_breaker_intent(self, intent: BreakerIntent,

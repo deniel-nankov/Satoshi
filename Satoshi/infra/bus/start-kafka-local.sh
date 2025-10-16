@@ -3,10 +3,17 @@
 
 set -e
 
-KAFKA_DIR=$(brew --prefix kafka)
+KAFKA_DIR=$(brew --prefix kafka 2>/dev/null || echo "")
+if [ -z "$KAFKA_DIR" ]; then
+    echo "⚠️  Kafka not found via Homebrew, using PATH"
+    KAFKA_BIN=""
+else
+    KAFKA_BIN="$KAFKA_DIR/bin/"
+fi
+
 DATA_DIR="/tmp/satoshi-kafka"
 LOG_DIR="$DATA_DIR/logs"
-CLUSTER_ID=$(kafka-storage random-uuid)
+CLUSTER_ID=$("${KAFKA_BIN}kafka-storage" random-uuid)
 
 echo "🚀 Starting Kafka for Satoshi pipeline..."
 echo "📁 Data directory: $DATA_DIR"
@@ -62,7 +69,7 @@ compression.type=lz4
 EOF
 
 echo "📝 Formatting storage..."
-kafka-storage format -t $CLUSTER_ID -c /tmp/kafka-kraft-config.properties
+"${KAFKA_BIN}kafka-storage" format -t $CLUSTER_ID -c /tmp/kafka-kraft-config.properties
 
 echo "🎯 Starting Kafka broker..."
-kafka-server-start /tmp/kafka-kraft-config.properties
+"${KAFKA_BIN}kafka-server-start" /tmp/kafka-kraft-config.properties

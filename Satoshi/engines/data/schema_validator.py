@@ -795,6 +795,11 @@ class SchemaValidatorAgent:
                         # Try parsing ISO format first, then float
                         try:
                             dt = datetime.fromisoformat(raw_timestamp.replace('Z', '+00:00'))
+                            # Normalize to UTC
+                            if dt.tzinfo is None:
+                                dt = dt.replace(tzinfo=timezone.utc)
+                            else:
+                                dt = dt.astimezone(timezone.utc)
                             normalized_ts = int(dt.timestamp() * 1_000_000)
                         except ValueError:
                             normalized_ts = int(float(raw_timestamp) * 1_000_000)

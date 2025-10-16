@@ -171,25 +171,26 @@ Exchange APIs ─────────────┴────────
 │  │   - Viral coefficient propagation models│   │                         │
 │  │ ↓ gold.crypto_native_stats             │   │                         │
 │  │                                         │   │                         │
-│  │ [G-2] Hidden Alpha Discovery Engine 🔍 │   │                         │
+│  │ [G-2] Pattern Discovery & Hidden Alpha Engine 🔍 │   │                         │
 │  │ • LATENT FACTOR EXTRACTION:            │   │                         │
 │  │   - Kernel PCA for non-linear patterns │   │                         │
 │  │   - Independent Component Analysis (ICA)│   │                         │
 │  │   - Non-negative matrix factorization  │   │                         │
 │  │   - Sparse dictionary learning         │   │                         │
 │  │                                         │   │                         │
-│  │ • REGIME-CONDITIONAL PATTERN MINING:   │   │                         │
-│  │   - Hidden Markov model clustering     │   │                         │
-│  │   - Changepoint detection algorithms   │   │                         │
-│  │   - Regime-specific feature selection  │   │                         │
-│  │   - Conditional mutual information     │   │                         │
-│  │                                         │   │                         │
 │  │ • INTERACTION EFFECT DISCOVERY:        │   │                         │
 │  │   - Higher-order feature interactions  │   │                         │
 │  │   - Causal inference (do-calculus)     │   │                         │
 │  │   - Shapley interaction values         │   │                         │
 │  │   - Cross-asset spillover effects      │   │                         │
+│  │                                         │   │                         │
+│  │ • REGIME & TEMPORAL PATTERN MINING:    │   │                         │
+│  │   - Hidden Markov model clustering     │   │                         │
+│  │   - Changepoint detection algorithms   │   │                         │
+│  │   - Regime-specific feature selection  │   │                         │
+│  │   - Conditional mutual information     │   │                         │
 │  │ ↓ gold.hidden_alpha_signals            │   │                         │
+│  │ ↓ gold.pattern_discovery               │   │                         │                         │
 │  │                                         │   │                         │
 │  │ [G-3] Cross-Market Intelligence Hub 🌐 │   │                         │
 │  │ • ARBITRAGE OPPORTUNITY MATHEMATICS:   │   │                         │
@@ -230,26 +231,6 @@ Exchange APIs ─────────────┴────────
 │  │   - Information-to-noise ratio tracking│   │                         │
 │  │   - Capacity constraint modeling       │   │                         │
 │  │ ↓ gold.time_scale_analytics            │   │                         │
-│  │                                         │   │                         │
-│  │ [G-5] Advanced Pattern Discovery 🧬   │   │                         │
-│  │ • LATENT FACTOR EXTRACTION:            │   │                         │
-│  │   - Kernel PCA for non-linear patterns │   │                         │
-│  │   - Independent Component Analysis (ICA)│   │                         │
-│  │   - Non-negative matrix factorization  │   │                         │
-│  │   - Sparse dictionary learning         │   │                         │
-│  │                                         │   │                         │
-│  │ • INTERACTION EFFECT DISCOVERY:        │   │                         │
-│  │   - Higher-order feature interactions  │   │                         │
-│  │   - Causal inference (do-calculus)     │   │                         │
-│  │   - Shapley interaction values         │   │                         │
-│  │   - Cross-asset spillover effects      │   │                         │
-│  │                                         │   │                         │
-│  │ • MATHEMATICAL PATTERN MINING:         │   │                         │
-│  │   - Hidden Markov model clustering     │   │                         │
-│  │   - Changepoint detection algorithms   │   │                         │
-│  │   - Conditional mutual information     │   │                         │
-│  │   - Regime-specific feature selection  │   │                         │
-│  │ ↓ gold.pattern_discovery               │   │                         │
 │  └─────────────────────────────────────────┘   │                         │
 │                         │                       │                         │
 │                         ▼                       │                         │
@@ -2755,6 +2736,7 @@ api_gateway + state_manager + smart_partitioner
 - **Data Quality Orchestrator** 🎭: Coordinates quality agents, arbitrates circuit-breaker intents, publishes `clean.*`, and drives quality telemetry
 
 #### 📚 Data Quality Agent Responsibilities (Implemented)
+
 | Agent | File | Primary Role | Key Responsibilities | Circuit-Breaker Interaction |
 | --- | --- | --- | --- | --- |
 | **Schema Validator** | `engines/data/schema_validator.py` | Contract enforcement | Validates rows against registry schemas, coerces types, annotates integrity flags, emits schema incidents | Registers component breaker; on repeated validation failures publishes intents via `StreamingBus.publish_breaker_intent` |

@@ -165,7 +165,7 @@ class DataPipelineTester:
                 },
                 "headers": {
                     "data_type": "social_event",
-                    "source": "twitter",
+                    "original_source": "twitter",
                     "source": "test_harness"
                 }
             }

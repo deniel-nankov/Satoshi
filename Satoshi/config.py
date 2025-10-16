@@ -165,7 +165,7 @@ ONCHAIN_CONFIG = {
         # ===== ETHEREUM MAINNET (QuickNode) =====
         "ethereum": {
             "enabled": True,
-            "rpc_url": "https://YOUR-ENDPOINT.quiknode.pro/YOUR-API-KEY/",  # Replace with your QuickNode Ethereum endpoint
+            "rpc_url": "https://docs-demo.quiknode.pro/QN_44410a76eaa34dd598bda30478383d6a/",
             "fallback_rpcs": [
                 "https://eth.llamarpc.com",
                 "https://rpc.ankr.com/eth"
@@ -183,7 +183,7 @@ ONCHAIN_CONFIG = {
         # ===== ARBITRUM (L2 - QuickNode) =====
         "arbitrum": {
             "enabled": True,
-            "rpc_url": "https://YOUR-ENDPOINT.arbitrum-mainnet.quiknode.pro/YOUR-API-KEY/",  # Replace with your QuickNode Arbitrum endpoint
+            "rpc_url": "https://docs-demo.arbitrum-mainnet.quiknode.pro/QN_44410a76eaa34dd598bda30478383d6a/",
             "fallback_rpcs": [
                 "https://arb1.arbitrum.io/rpc",
                 "https://rpc.ankr.com/arbitrum"
@@ -205,7 +205,7 @@ ONCHAIN_CONFIG = {
         # ===== BASE (Coinbase L2 - QuickNode) =====
         "base": {
             "enabled": True,
-            "rpc_url": "https://YOUR-ENDPOINT.base-mainnet.quiknode.pro/YOUR-API-KEY/",  # Replace with your QuickNode Base endpoint
+            "rpc_url": "https://docs-demo.base-mainnet.quiknode.pro/QN_44410a76eaa34dd598bda30478383d6a/",
             "fallback_rpcs": [
                 "https://mainnet.base.org",
                 "https://base.llamarpc.com"
@@ -225,7 +225,7 @@ ONCHAIN_CONFIG = {
         # ===== POLYGON (QuickNode) =====
         "polygon": {
             "enabled": True,
-            "rpc_url": "https://YOUR-ENDPOINT.matic.quiknode.pro/YOUR-API-KEY/",  # Replace with your QuickNode Polygon endpoint
+            "rpc_url": "https://docs-demo.matic.quiknode.pro/QN_44410a76eaa34dd598bda30478383d6a/",
             "fallback_rpcs": [
                 "https://polygon-rpc.com",
                 "https://rpc.ankr.com/polygon"
@@ -246,7 +246,7 @@ ONCHAIN_CONFIG = {
         # ===== OPTIMISM (QuickNode) =====
         "optimism": {
             "enabled": True,
-            "rpc_url": "https://YOUR-ENDPOINT.optimism.quiknode.pro/YOUR-API-KEY/",  # Replace with your QuickNode Optimism endpoint
+            "rpc_url": "https://docs-demo.optimism.quiknode.pro/QN_44410a76eaa34dd598bda30478383d6a/",
             "fallback_rpcs": [
                 "https://mainnet.optimism.io",
                 "https://rpc.ankr.com/optimism"

@@ -58,7 +58,7 @@ SLO: chain→bus lag p95 < 30s (coarse!).
 import asyncio
 import aiohttp
 import logging
-from typing import List, Dict, Any, Optional, ClassVar, Set
+from typing import List, Dict, Any, Optional, ClassVar, Set, Callable
 from dataclasses import dataclass, field
 from decimal import Decimal
 from datetime import datetime
@@ -384,10 +384,11 @@ class DuplicateDetector:
 
 class DuneClient:
     """Minimal Dune API client for query execution and result polling."""
-    def __init__(self, api_key: str):
+    def __init__(self, api_key: str, on_rate_limit: Optional[Callable[[], None]] = None):
         self.api_key = api_key
         self.base_url = "https://api.dune.com/api/v1"
         self.session: aiohttp.ClientSession | None = None
+        self.on_rate_limit = on_rate_limit
 
     async def __aenter__(self):
         if self.session is None or self.session.closed:
@@ -407,6 +408,13 @@ class DuneClient:
         if self.session:
             await self.session.close()
 
+    def _record_rate_limit(self):
+        if self.on_rate_limit:
+            try:
+                self.on_rate_limit()
+            except Exception as exc:
+                logger.warning(f"DuneClient rate-limit callback failed: {exc}")
+
     async def get_cached_results(self, query_id: int, params: dict = {}) -> Optional[dict]:
         # Only use cached results if params is empty
         if params:
@@ -418,6 +426,7 @@ class DuneClient:
             timeout = aiohttp.ClientTimeout(total=10)
             async with self.session.get(url, headers=headers, timeout=timeout) as resp:
                 if resp.status == 429:
+                    self._record_rate_limit()
                     retry_after = int(resp.headers.get("Retry-After", "2"))
                     logger.warning(f"Dune cached results 429, sleeping {retry_after}s")
                     await asyncio.sleep(retry_after)
@@ -447,6 +456,7 @@ class DuneClient:
             timeout = aiohttp.ClientTimeout(total=10)
             async with self.session.post(url, headers=headers, json={"parameters": params}, timeout=timeout) as resp:
                 if resp.status == 429:
+                    self._record_rate_limit()
                     retry_after = int(resp.headers.get("Retry-After", "2"))
                     logger.warning(f"Dune execute 429, sleeping {retry_after}s")
                     await asyncio.sleep(retry_after)
@@ -480,6 +490,7 @@ class DuneClient:
                 timeout = aiohttp.ClientTimeout(total=10)
                 async with self.session.get(result_url, headers=headers, timeout=timeout) as resp:
                     if resp.status == 429:
+                        self._record_rate_limit()
                         retry_after = int(resp.headers.get("Retry-After", "2"))
                         await asyncio.sleep(retry_after)
                     elif resp.status >= 400:
@@ -553,7 +564,14 @@ class OnchainCollectorAgent:
             'dune_api_errors': 0,
             'rpc_calls': 0,
             'rpc_errors': 0,
-            'validation_failures': 0
+            'validation_failures': 0,
+            'rate_budget_timeouts': 0,
+            # High-throughput batching metrics
+            'flow_batches_published': 0,
+            'flow_batch_publish_failures': 0,
+            'flows_published_async': 0,
+            'flow_publish_queue_depth': 0,
+            'flow_batch_tuning_adjustments': 0
         }
         
         self.running = False
@@ -568,6 +586,52 @@ class OnchainCollectorAgent:
         self._block_hashes: Dict[str, Dict[int, str]] = defaultdict(dict)  # chain -> {block_num: block_hash}
         self._finality_windows: Dict[str, int] = {}  # chain -> confirmed finality depth
         self._cursor_state: Dict[str, Dict[str, Any]] = defaultdict(dict)  # chain -> {cursor_type: value}
+
+        # High-throughput async batching configuration (default to common L2s)
+        self._l2_batch_size = max(1, int(config.get('l2_batch_size', 500)))
+        self._l2_batch_flush_interval = max(0.01, float(config.get('l2_batch_flush_interval_sec', 0.25)))
+        self._l2_publish_queue_size = max(0, int(config.get('l2_publish_queue_size', 20000)))
+        self._l2_publish_concurrency_default = max(1, int(config.get('l2_publish_concurrency', 5)))
+
+        self._l2_auto_tune_enabled = bool(config.get('l2_auto_tune_enabled', True))
+
+        batch_min_default = max(1, int(config.get('l2_batch_size_min', max(50, self._l2_batch_size // 2))))
+        batch_max_default = max(1, int(config.get('l2_batch_size_max', self._l2_batch_size * 3)))
+        batch_min = min(batch_min_default, batch_max_default)
+        batch_max = max(batch_min_default, batch_max_default)
+        self._l2_batch_size_bounds = (batch_min, batch_max)
+
+        min_flush_default = float(config.get('l2_min_flush_interval_sec', 0.05))
+        max_flush_default = float(config.get('l2_max_flush_interval_sec', 0.5))
+        lower_flush = max(0.001, min(min_flush_default, max_flush_default))
+        upper_flush = max(lower_flush, max(min_flush_default, max_flush_default))
+        self._l2_flush_interval_bounds = (lower_flush, upper_flush)
+
+        min_concurrency_default = int(config.get('l2_min_publish_concurrency', max(1, self._l2_publish_concurrency_default // 2)))
+        max_concurrency_default = int(config.get('l2_max_publish_concurrency', max(self._l2_publish_concurrency_default, self._l2_publish_concurrency_default * 3)))
+        min_concurrency = max(1, min(min_concurrency_default, max_concurrency_default))
+        max_concurrency = max(min_concurrency, max(min_concurrency_default, max_concurrency_default))
+        self._l2_concurrency_bounds = (min_concurrency, max_concurrency)
+
+        self._l2_queue_pressure_high = float(config.get('l2_queue_pressure_high', 0.75))
+        self._l2_queue_pressure_low = float(config.get('l2_queue_pressure_low', 0.15))
+        if self._l2_queue_pressure_low >= self._l2_queue_pressure_high:
+            self._l2_queue_pressure_low = max(0.0, self._l2_queue_pressure_high * 0.5)
+
+        self._flow_publish_queues: Dict[str, asyncio.Queue] = {}
+        self._flow_publish_semaphores: Dict[str, asyncio.Semaphore] = {}
+        self._flow_publisher_tasks: Dict[str, asyncio.Task] = {}
+        self._l2_chain_params: Dict[str, Dict[str, Any]] = {}
+
+        self._configure_high_throughput_batched_pipeline(config)
+
+        # Rate budget domains for cross-agent control
+        rate_budget_domains_cfg = config.get("rate_budget_domains", {})
+        self.rate_budget_domains = {
+            "dune": rate_budget_domains_cfg.get("dune", "onchain.dune"),
+            "rpc": rate_budget_domains_cfg.get("rpc", "onchain.rpc"),
+        }
+        self._rate_budget_timeout = float(config.get("rate_budget_timeout_sec", 5.0))
         
         # Initialize validators and classifiers
         self.validator = BlockchainValidator()
@@ -643,13 +707,17 @@ class OnchainCollectorAgent:
                 
                 if not is_healthy:
                     logger.warning("Onchain Collector health check failed")
-                    await self.streaming_bus.system_circuit_breaker.record_component_failure(
+                    await self.streaming_bus.record_component_failure(
                         component_id=self.circuit_breaker_id,
-                        cascade_to_dependents=False
+                        cascade_failure=False,
+                        reason="onchain_collector_health_check_failed",
+                        severity="high"
                     )
                 else:
-                    await self.streaming_bus.system_circuit_breaker.record_component_success(
-                        component_id=self.circuit_breaker_id
+                    await self.streaming_bus.record_component_success(
+                        component_id=self.circuit_breaker_id,
+                        reason="onchain_collector_health_restored",
+                        severity="low"
                     )
                 
                 await asyncio.sleep(self._health_check_interval)
@@ -748,6 +816,104 @@ class OnchainCollectorAgent:
             chain_configs[chain] = chain_config
             
         return chain_configs
+
+    def _configure_high_throughput_batched_pipeline(self, config: Dict[str, Any]) -> None:
+        """Initialize async batching structures for high-throughput L2 chains."""
+        configured_chain_names: List[str] = []
+        for chain_entry in config.get('chains', []):
+            if isinstance(chain_entry, str):
+                configured_chain_names.append(chain_entry)
+            elif isinstance(chain_entry, dict):
+                chain_name = chain_entry.get('name')
+                if isinstance(chain_name, str):
+                    configured_chain_names.append(chain_name)
+
+        self._configured_chain_lookup = {
+            chain.lower(): chain for chain in configured_chain_names
+        }
+
+        default_high_throughput = {
+            'arbitrum', 'optimism', 'base', 'polygon', 'zksync',
+            'scroll', 'linea', 'starknet'
+        }
+        configured_high_throughput = config.get('high_throughput_chains')
+        if configured_high_throughput:
+            candidate_high_throughput: Set[str] = set()
+            for chain_entry in configured_high_throughput:
+                if isinstance(chain_entry, str):
+                    candidate_high_throughput.add(chain_entry.lower())
+                elif isinstance(chain_entry, dict):
+                    chain_name = chain_entry.get('name')
+                    if isinstance(chain_name, str):
+                        candidate_high_throughput.add(chain_name.lower())
+        else:
+            candidate_high_throughput = set(default_high_throughput)
+
+        self._high_throughput_chains_lower = {
+            chain_lower for chain_lower in self._configured_chain_lookup
+            if chain_lower in candidate_high_throughput
+        }
+
+        chain_overrides = config.get('l2_chain_overrides', {})
+        enabled_chains: List[str] = []
+
+        for chain_lower, original_name in self._configured_chain_lookup.items():
+            if chain_lower not in self._high_throughput_chains_lower:
+                continue
+
+            override = None
+            if isinstance(chain_overrides, dict):
+                override = chain_overrides.get(original_name) or chain_overrides.get(chain_lower)
+            override = override or {}
+
+            queue_size_config = override.get('queue_size', self._l2_publish_queue_size)
+            try:
+                queue_size = max(0, int(queue_size_config))
+            except (TypeError, ValueError):
+                queue_size = self._l2_publish_queue_size
+
+            batch_size_config = override.get('batch_size', self._l2_batch_size)
+            try:
+                batch_size = int(batch_size_config)
+            except (TypeError, ValueError):
+                batch_size = self._l2_batch_size
+
+            flush_config = override.get('flush_interval_sec', self._l2_batch_flush_interval)
+            try:
+                flush_interval = float(flush_config)
+            except (TypeError, ValueError):
+                flush_interval = self._l2_batch_flush_interval
+
+            concurrency_config = override.get('concurrency', self._l2_publish_concurrency_default)
+            try:
+                concurrency = int(concurrency_config)
+            except (TypeError, ValueError):
+                concurrency = self._l2_publish_concurrency_default
+
+            # Clamp tuned parameters to configured bounds
+            batch_size = max(self._l2_batch_size_bounds[0], min(self._l2_batch_size_bounds[1], batch_size))
+            flush_interval = max(self._l2_flush_interval_bounds[0], min(self._l2_flush_interval_bounds[1], flush_interval))
+            concurrency = max(self._l2_concurrency_bounds[0], min(self._l2_concurrency_bounds[1], concurrency))
+
+            queue_capacity_for_tuning = queue_size if queue_size > 0 else (self._l2_publish_queue_size or 10000)
+            queue_capacity_for_tuning = max(1, queue_capacity_for_tuning)
+
+            self._flow_publish_queues[original_name] = asyncio.Queue(maxsize=queue_size)
+            self._flow_publish_semaphores[original_name] = asyncio.Semaphore(concurrency)
+            self._l2_chain_params[original_name] = {
+                "batch_size": batch_size,
+                "flush_interval": flush_interval,
+                "queue_size": queue_capacity_for_tuning,
+                "concurrency": concurrency,
+                "base_concurrency": concurrency,
+            }
+            enabled_chains.append(original_name)
+
+        if enabled_chains:
+            logger.info(
+                "High-throughput batching enabled for chains: %s",
+                ", ".join(sorted(enabled_chains))
+            )
     
     def _get_chain_config(self, chain: str, key: str, default: Any = None) -> Any:
         """Get chain-specific configuration value."""
@@ -759,6 +925,9 @@ class OnchainCollectorAgent:
         
         # Register circuit breaker
         await self._register_circuit_breaker()
+
+        # Ensure shared rate budgets are synced
+        await self.streaming_bus.ensure_rate_budget_listener()
         
         # Start health monitoring
         if self._health_check_task is None:
@@ -766,6 +935,11 @@ class OnchainCollectorAgent:
             self._background_tasks.add(self._health_check_task)
         
         # Start all collection tasks
+        for chain in self._flow_publish_queues.keys():
+            publisher_task = asyncio.create_task(self._flow_publish_loop(chain))
+            self._flow_publisher_tasks[chain] = publisher_task
+            self.tasks.append(publisher_task)
+
         for chain in self.config.get('chains', []):
             self.tasks.append(asyncio.create_task(self._collect_flows(chain)))
             self.tasks.append(asyncio.create_task(self._collect_lst_state(chain)))
@@ -814,9 +988,11 @@ class OnchainCollectorAgent:
             logger.error(f"OnChain Collector: Error in control message consumption: {e}")
             # Use the system circuit breaker to record failure
             component_id = getattr(self, 'circuit_breaker_id', 'onchain_collector')
-            await self.streaming_bus.system_circuit_breaker.record_component_failure(
+            await self.streaming_bus.record_component_failure(
                 component_id=component_id,
-                cascade_to_dependents=False
+                cascade_failure=False,
+                reason="onchain_collector_control_listener_failure",
+                severity="medium"
             )
     
     def _handle_control_message_wrapper(self, topic: str, partition_key: str, 
@@ -896,6 +1072,105 @@ class OnchainCollectorAgent:
             if "reorg_safety_blocks" in updates:
                 self.config["reorg_safety_blocks"] = updates["reorg_safety_blocks"]
                 logger.info(f"OnChain Collector: Updated reorg_safety_blocks to {updates['reorg_safety_blocks']}")
+
+            if "l2_auto_tune_enabled" in updates:
+                self._l2_auto_tune_enabled = bool(updates["l2_auto_tune_enabled"])
+                logger.info(f"OnChain Collector: L2 auto tuning set to {self._l2_auto_tune_enabled}")
+
+            if {"l2_batch_size_min", "l2_batch_size_max"} & updates.keys():
+                new_min = int(updates.get('l2_batch_size_min', self._l2_batch_size_bounds[0]))
+                new_max = int(updates.get('l2_batch_size_max', self._l2_batch_size_bounds[1]))
+                min_bound = max(1, min(new_min, new_max))
+                max_bound = max(min_bound, max(new_min, new_max))
+                self._l2_batch_size_bounds = (min_bound, max_bound)
+                for params in self._l2_chain_params.values():
+                    params['batch_size'] = max(
+                        self._l2_batch_size_bounds[0],
+                        min(self._l2_batch_size_bounds[1], params.get('batch_size', self._l2_batch_size))
+                    )
+                logger.info(f"OnChain Collector: Updated L2 batch size bounds to {self._l2_batch_size_bounds}")
+
+            if "l2_batch_size" in updates:
+                new_batch_size = max(1, int(updates["l2_batch_size"]))
+                clamped_batch_size = max(self._l2_batch_size_bounds[0],
+                                         min(self._l2_batch_size_bounds[1], new_batch_size))
+                self._l2_batch_size = clamped_batch_size
+                for params in self._l2_chain_params.values():
+                    params['batch_size'] = clamped_batch_size
+                logger.info(f"OnChain Collector: Updated default L2 batch size to {clamped_batch_size}")
+
+            if {"l2_min_flush_interval_sec", "l2_max_flush_interval_sec"} & updates.keys():
+                new_min_flush = float(updates.get('l2_min_flush_interval_sec', self._l2_flush_interval_bounds[0]))
+                new_max_flush = float(updates.get('l2_max_flush_interval_sec', self._l2_flush_interval_bounds[1]))
+                lower_flush = max(0.001, min(new_min_flush, new_max_flush))
+                upper_flush = max(lower_flush, max(new_min_flush, new_max_flush))
+                self._l2_flush_interval_bounds = (lower_flush, upper_flush)
+                for params in self._l2_chain_params.values():
+                    params['flush_interval'] = max(
+                        self._l2_flush_interval_bounds[0],
+                        min(self._l2_flush_interval_bounds[1], params.get('flush_interval', self._l2_batch_flush_interval))
+                    )
+                logger.info(f"OnChain Collector: Updated L2 flush interval bounds to {self._l2_flush_interval_bounds}")
+
+            if "l2_batch_flush_interval_sec" in updates:
+                new_flush_interval = float(updates["l2_batch_flush_interval_sec"])
+                clamped_flush = max(
+                    self._l2_flush_interval_bounds[0],
+                    min(self._l2_flush_interval_bounds[1], new_flush_interval)
+                )
+                self._l2_batch_flush_interval = clamped_flush
+                for params in self._l2_chain_params.values():
+                    params['flush_interval'] = clamped_flush
+                logger.info(f"OnChain Collector: Updated default L2 flush interval to {clamped_flush:.3f}s")
+
+            if {"l2_min_publish_concurrency", "l2_max_publish_concurrency"} & updates.keys():
+                new_min_conc = int(updates.get('l2_min_publish_concurrency', self._l2_concurrency_bounds[0]))
+                new_max_conc = int(updates.get('l2_max_publish_concurrency', self._l2_concurrency_bounds[1]))
+                min_conc = max(1, min(new_min_conc, new_max_conc))
+                max_conc = max(min_conc, max(new_min_conc, new_max_conc))
+                self._l2_concurrency_bounds = (min_conc, max_conc)
+                for chain, params in self._l2_chain_params.items():
+                    current_conc = params.get('concurrency', self._l2_publish_concurrency_default)
+                    clamped_conc = max(min_conc, min(max_conc, current_conc))
+                    if clamped_conc != current_conc:
+                        params['concurrency'] = clamped_conc
+                        self._flow_publish_semaphores[chain] = asyncio.Semaphore(clamped_conc)
+                    base_conc = params.get('base_concurrency', clamped_conc)
+                    params['base_concurrency'] = max(min_conc, min(max_conc, base_conc))
+                logger.info(f"OnChain Collector: Updated L2 concurrency bounds to {self._l2_concurrency_bounds}")
+
+            if "l2_publish_concurrency" in updates:
+                new_concurrency = int(updates["l2_publish_concurrency"])
+                clamped_concurrency = max(
+                    self._l2_concurrency_bounds[0],
+                    min(self._l2_concurrency_bounds[1], new_concurrency)
+                )
+                self._l2_publish_concurrency_default = clamped_concurrency
+                for chain, params in self._l2_chain_params.items():
+                    params['concurrency'] = clamped_concurrency
+                    params['base_concurrency'] = clamped_concurrency
+                    self._flow_publish_semaphores[chain] = asyncio.Semaphore(clamped_concurrency)
+                logger.info(f"OnChain Collector: Updated default L2 publish concurrency to {clamped_concurrency}")
+
+            if {"l2_queue_pressure_high", "l2_queue_pressure_low"} & updates.keys():
+                new_high = float(updates.get('l2_queue_pressure_high', self._l2_queue_pressure_high))
+                new_low = float(updates.get('l2_queue_pressure_low', self._l2_queue_pressure_low))
+                new_high = min(0.99, max(0.05, new_high))
+                new_low = max(0.0, min(new_low, new_high * 0.95))
+                if new_low >= new_high:
+                    new_low = max(0.0, new_high * 0.5)
+                self._l2_queue_pressure_high = new_high
+                self._l2_queue_pressure_low = new_low
+                logger.info(f"OnChain Collector: Updated L2 queue pressure targets to high={new_high:.2f}, low={new_low:.2f}")
+
+            if "l2_publish_queue_size" in updates:
+                logger.warning("OnChain Collector: Runtime update to l2_publish_queue_size not supported; restart required.")
+
+            if "high_throughput_chains" in updates:
+                logger.warning("OnChain Collector: Updating high_throughput_chains requires restart to recreate batching pipeline.")
+
+            if "l2_chain_overrides" in updates:
+                logger.warning("OnChain Collector: Updating l2_chain_overrides requires restart to recreate batching pipeline.")
                 
         except Exception as e:
             logger.error(f"OnChain Collector: Error applying config updates: {e}")
@@ -950,6 +1225,9 @@ class OnchainCollectorAgent:
             logger.warning(f"No RPC URL configured for chain {chain}")
             return None
             
+        rpc_rate_domain = self.rate_budget_domains.get("rpc", "onchain.rpc")
+        rate_limit_timeout = self._rate_budget_timeout
+
         async with aiohttp.ClientSession() as session:
             payload = {
                 "jsonrpc": "2.0",
@@ -957,13 +1235,21 @@ class OnchainCollectorAgent:
                 "params": [],
                 "id": 1
             }
-            async with session.post(rpc_url, json=payload, timeout=aiohttp.ClientTimeout(total=5)) as resp:
-                if resp.status == 200:
-                    data = await resp.json()
-                    if 'result' in data:
-                        return int(data['result'], 16)  # Convert hex to int
-                else:
-                    raise aiohttp.ClientError(f"RPC request failed with status {resp.status}")
+            try:
+                async with self.streaming_bus.rate_limit(rpc_rate_domain, timeout=rate_limit_timeout):
+                    async with session.post(rpc_url, json=payload, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+                        if resp.status == 429:
+                            self.streaming_bus.record_rate_limit_429(rpc_rate_domain)
+                        if resp.status == 200:
+                            data = await resp.json()
+                            if 'result' in data:
+                                return int(data['result'], 16)  # Convert hex to int
+                        else:
+                            raise aiohttp.ClientError(f"RPC request failed with status {resp.status}")
+            except asyncio.TimeoutError:
+                self.metrics['rate_budget_timeouts'] += 1
+                logger.warning(f"Rate budget timeout while fetching latest block for {chain}")
+                return None
         return None
 
     async def _finalize_reorg_safe_flows(self, chain: str):
@@ -997,7 +1283,7 @@ class OnchainCollectorAgent:
                     
                     # Publish finalized flows
                     for flow in finalized_flows:
-                        await self._publish_finalized_flow(flow, chain)
+                        await self._dispatch_finalized_flow(flow, chain)
                         
                     if finalized_flows:
                         self.metrics['flows_finalized'] += len(finalized_flows)
@@ -1020,83 +1306,90 @@ class OnchainCollectorAgent:
     async def _publish_finalized_flow(self, flow: OnchainFlow, chain: str):
         """Publish a finalized flow to the streaming bus with comprehensive headers."""
         try:
-            flow_data = {
-                "chain": chain,
-                "data_type": "flows",
-                "timestamp": flow.timestamp_utc_us,
-                "capture_timestamp": flow.capture_timestamp_utc_us,
-                "block_number": flow.block_number,
-                "tx_hash": flow.tx_hash,
-                "event_type": flow.event_type,
-                "from_address": flow.from_address,
-                "to_address": flow.to_address,
-                "amount": str(flow.amount) if flow.amount else None,
-                "token": flow.token,
-                "value_usd": str(flow.value_usd) if flow.value_usd else None,
-                "extra": flow.extra,
-                # Reorg safety fields
-                "finalized": flow.finalized,
-                "reorg_depth": flow.reorg_depth,
-                "block_hash": flow.block_hash
-            }
-            
-            # Use chain+block as partition key for blockchain ordering
-            partition_key = f"{chain}_{flow.block_number or 0}"
-            log_index = flow.extra.get('log_index', 0) if flow.extra else 0
-            dedupe_key = f"{chain}_{flow.tx_hash}_{log_index}"
-            
-            # Enhanced headers with validation and classification info
-            headers = {
-                "data_type": "flows", 
-                "chain": chain,
-                "event_type": flow.event_type,
-                "finalized": str(flow.finalized).lower(),
-                "reorg_depth": str(flow.reorg_depth),
-                "block_number": str(flow.block_number),
-                "collector_version": "enhanced_v1"
-            }
-            
-            # Add validation flags to headers
-            if flow.extra:
-                if flow.extra.get('suspect_data'):
-                    headers["suspect_data"] = "true"
-                    headers["validation_issues"] = ','.join(flow.extra.get('validation_issues', []))
-                
-                if flow.extra.get('log_index') is not None:
-                    headers["log_index"] = str(flow.extra['log_index'])
-            
-            # Add chain-specific metadata
-            chain_config = self.chain_configs.get(chain, {})
-            if chain_config:
-                headers["chain_reorg_depth"] = str(chain_config.get('reorg_depth', 12))
-                headers["chain_finality_blocks"] = str(chain_config.get('finality_blocks', 32))
-            
-            await self.streaming_bus.publish_with_headers(
+            flow_data, headers, partition_key, dedupe_key = self._prepare_flow_transport(flow, chain)
+            success = await self.streaming_bus.publish_with_headers(
                 topic="raw_data.onchain_events",
                 partition_key=partition_key,
                 payload=flow_data,
                 headers=headers,
                 dedupe_key=dedupe_key
             )
-            
-            # Local queue fallback with proper error handling
-            try:
-                q = self.output_queues['flows']
-                if q.full():
-                    try: 
-                        q.get_nowait()
-                        logger.debug("Dropped old flow from full queue")
-                    except asyncio.QueueEmpty: 
-                        pass
-                q.put_nowait(flow)
-                logger.debug("Enqueued flow to local queue")
-            except asyncio.QueueFull:
-                logger.warning("Failed to enqueue flow - queue full")
-            except Exception as e:
-                logger.warning(f"Failed to enqueue flow to local queue: {e}")
-            
+            if not success:
+                logger.debug(f"Streaming bus publish returned false for {chain} flow {flow.tx_hash}")
+            self._enqueue_local_flow(flow)
         except Exception as e:
             logger.warning(f"Failed to publish finalized flow to streaming bus: {e}")
+
+    def _prepare_flow_transport(self, flow: OnchainFlow, chain: str) -> tuple[Dict[str, Any], Dict[str, str], str, Optional[str]]:
+        """Prepare transport payload, headers, and routing info for a finalized flow."""
+        flow_data = {
+            "chain": chain,
+            "data_type": "flows",
+            "timestamp": flow.timestamp_utc_us,
+            "capture_timestamp": flow.capture_timestamp_utc_us,
+            "block_number": flow.block_number,
+            "tx_hash": flow.tx_hash,
+            "event_type": flow.event_type,
+            "from_address": flow.from_address,
+            "to_address": flow.to_address,
+            "amount": str(flow.amount) if flow.amount is not None else None,
+            "token": flow.token,
+            "value_usd": str(flow.value_usd) if flow.value_usd is not None else None,
+            "extra": flow.extra,
+            "finalized": flow.finalized,
+            "reorg_depth": flow.reorg_depth,
+            "block_hash": flow.block_hash
+        }
+
+        partition_key = f"{chain}_{flow.block_number or 0}"
+        log_index = flow.extra.get('log_index', 0) if flow.extra else 0
+        dedupe_key = f"{chain}_{flow.tx_hash}_{log_index}"
+
+        headers: Dict[str, str] = {
+            "data_type": "flows",
+            "chain": chain,
+            "event_type": flow.event_type,
+            "finalized": str(flow.finalized).lower(),
+            "reorg_depth": str(flow.reorg_depth),
+            "block_number": str(flow.block_number),
+            "collector_version": "enhanced_v1"
+        }
+
+        if flow.extra:
+            if flow.extra.get('suspect_data'):
+                headers["suspect_data"] = "true"
+                issues = flow.extra.get('validation_issues', [])
+                if isinstance(issues, (list, tuple, set)):
+                    headers["validation_issues"] = ','.join(str(issue) for issue in issues)
+                elif issues:
+                    headers["validation_issues"] = str(issues)
+
+            if flow.extra.get('log_index') is not None:
+                headers["log_index"] = str(flow.extra['log_index'])
+
+        chain_config = self.chain_configs.get(chain, {})
+        if chain_config:
+            headers["chain_reorg_depth"] = str(chain_config.get('reorg_depth', 12))
+            headers["chain_finality_blocks"] = str(chain_config.get('finality_blocks', 32))
+
+        return flow_data, headers, partition_key, dedupe_key
+
+    def _enqueue_local_flow(self, flow: OnchainFlow) -> None:
+        """Best-effort enqueue to local asyncio queue for downstream consumers."""
+        try:
+            q = self.output_queues['flows']
+            if q.full():
+                try:
+                    q.get_nowait()
+                    logger.debug("Dropped old flow from full queue")
+                except asyncio.QueueEmpty:
+                    pass
+            q.put_nowait(flow)
+            logger.debug("Enqueued flow to local queue")
+        except asyncio.QueueFull:
+            logger.warning("Failed to enqueue flow - queue full")
+        except Exception as exc:
+            logger.warning(f"Failed to enqueue flow to local queue: {exc}")
 
     async def _add_flow_to_pending_buffer(self, flow: OnchainFlow, chain: str):
         """Add a flow to the pending buffer for reorg safety with enhanced validation."""
@@ -1164,6 +1457,248 @@ class OnchainCollectorAgent:
         except Exception as e:
             logger.warning(f"Failed to add flow to pending buffer: {e}")
 
+    async def _dispatch_finalized_flow(self, flow: OnchainFlow, chain: str) -> None:
+        """Route finalized flows through async batching pipeline when enabled."""
+        if not self._use_high_throughput_batching(chain):
+            await self._publish_finalized_flow(flow, chain)
+            return
+
+        queue = self._flow_publish_queues.get(chain)
+        if queue is None:
+            await self._publish_finalized_flow(flow, chain)
+            return
+
+        try:
+            queue.put_nowait(flow)
+            self.metrics['flow_publish_queue_depth'] = queue.qsize()
+        except asyncio.QueueFull:
+            self.metrics['flow_batch_publish_failures'] += 1
+            logger.warning(f"High-throughput publish queue full for {chain}; falling back to direct publish")
+            await self._publish_finalized_flow(flow, chain)
+
+    def _use_high_throughput_batching(self, chain: str) -> bool:
+        """Determine if a chain should use the high-throughput batching pipeline."""
+        if not isinstance(chain, str):
+            return False
+        return chain.lower() in self._high_throughput_chains_lower
+
+    def _get_chain_batch_size(self, chain: str) -> int:
+        """Get current batch size target for the given chain."""
+        params = self._l2_chain_params.get(chain)
+        if not params:
+            return self._l2_batch_size
+        batch_size = params.get('batch_size', self._l2_batch_size)
+        return max(0, batch_size)
+
+    def _get_chain_flush_interval(self, chain: str) -> float:
+        """Get current flush interval target for the given chain."""
+        params = self._l2_chain_params.get(chain)
+        if not params:
+            return self._l2_batch_flush_interval
+        flush_interval = params.get('flush_interval', self._l2_batch_flush_interval)
+        return max(self._l2_flush_interval_bounds[0], min(self._l2_flush_interval_bounds[1], flush_interval))
+
+    def _auto_tune_chain_params(self, chain: str, queue: asyncio.Queue, batch_size: int,
+                                successes: int, failures: int) -> None:
+        """Automatically tune L2 batching parameters based on queue pressure."""
+        if not self._l2_auto_tune_enabled:
+            return
+
+        params = self._l2_chain_params.get(chain)
+        if not params:
+            return
+
+        queue_capacity = params.get('queue_size') or queue.maxsize or 0
+        if queue_capacity <= 0:
+            return  # Skip auto tuning when queue is unbounded
+
+        occupancy = queue.qsize() / queue_capacity
+        success_ratio = successes / max(batch_size, 1) if batch_size else 1.0
+        concurrency = params.get('concurrency', self._l2_publish_concurrency_default)
+        base_concurrency = params.get('base_concurrency', self._l2_publish_concurrency_default)
+        new_concurrency = concurrency
+        changed = False
+
+        if occupancy > self._l2_queue_pressure_high and concurrency < self._l2_concurrency_bounds[1]:
+            new_concurrency = min(self._l2_concurrency_bounds[1], concurrency + 1)
+        elif occupancy < self._l2_queue_pressure_low and concurrency > base_concurrency:
+            new_concurrency = max(base_concurrency, concurrency - 1, self._l2_concurrency_bounds[0])
+
+        if new_concurrency != concurrency:
+            params['concurrency'] = new_concurrency
+            self._flow_publish_semaphores[chain] = asyncio.Semaphore(new_concurrency)
+            changed = True
+
+        flush_interval = params.get('flush_interval', self._l2_batch_flush_interval)
+        new_flush_interval = flush_interval
+        if occupancy > self._l2_queue_pressure_high:
+            new_flush_interval = max(self._l2_flush_interval_bounds[0], flush_interval * 0.85)
+        elif occupancy < self._l2_queue_pressure_low:
+            new_flush_interval = min(self._l2_flush_interval_bounds[1], flush_interval * 1.15)
+
+        if abs(new_flush_interval - flush_interval) > (max(flush_interval, 1e-6) * 0.05):
+            params['flush_interval'] = new_flush_interval
+            changed = True
+
+        current_batch_size = params.get('batch_size', self._l2_batch_size)
+        new_batch_size = current_batch_size
+        if occupancy > self._l2_queue_pressure_high and success_ratio > 0.8:
+            new_batch_size = min(
+                self._l2_batch_size_bounds[1],
+                max(current_batch_size + 1, int(current_batch_size * 1.1))
+            )
+        elif occupancy < self._l2_queue_pressure_low and current_batch_size > self._l2_batch_size_bounds[0]:
+            new_batch_size = max(
+                self._l2_batch_size_bounds[0],
+                int(current_batch_size * 0.9)
+            )
+
+        if new_batch_size != current_batch_size:
+            params['batch_size'] = new_batch_size
+            changed = True
+
+        if changed:
+            self.metrics['flow_batch_tuning_adjustments'] += 1
+            logger.debug(
+                f"Auto-tuned batching for {chain}: occupancy={occupancy:.2f}, "
+                f"batch_size={params['batch_size']}, "
+                f"flush_interval={params['flush_interval']:.3f}s, "
+                f"concurrency={params['concurrency']}"
+            )
+
+    async def _flow_publish_loop(self, chain: str) -> None:
+        """Async worker that flushes finalized flows in high-throughput batches."""
+        queue = self._flow_publish_queues.get(chain)
+        if queue is None:
+            return
+
+        batch: List[OnchainFlow] = []
+        batch_started_at: Optional[float] = None
+
+        while True:
+            try:
+                flush_interval = self._get_chain_flush_interval(chain)
+                batch_limit = self._get_chain_batch_size(chain)
+
+                if not batch:
+                    if not self.running and queue.empty():
+                        break
+                    flow = await queue.get()
+                    batch.append(flow)
+                    batch_started_at = time.monotonic()
+                else:
+                    elapsed = time.monotonic() - (batch_started_at or time.monotonic())
+                    remaining = flush_interval - elapsed
+                    if remaining <= 0:
+                        await self._flush_flow_batch(chain, batch, queue)
+                        batch = []
+                        batch_started_at = None
+                        continue
+                    try:
+                        flow = await asyncio.wait_for(queue.get(), timeout=max(remaining, 0.0))
+                        batch.append(flow)
+                    except asyncio.TimeoutError:
+                        await self._flush_flow_batch(chain, batch, queue)
+                        batch = []
+                        batch_started_at = None
+                        continue
+
+                if batch_limit and len(batch) >= batch_limit:
+                    await self._flush_flow_batch(chain, batch, queue)
+                    batch = []
+                    batch_started_at = None
+
+                if not self.running and not batch and queue.empty():
+                    break
+
+            except asyncio.CancelledError:
+                if batch:
+                    await self._flush_flow_batch(chain, batch, queue)
+                    batch = []
+                drained: List[OnchainFlow] = []
+                while True:
+                    try:
+                        drained.append(queue.get_nowait())
+                    except asyncio.QueueEmpty:
+                        break
+                if drained:
+                    await self._flush_flow_batch(chain, drained, queue)
+                raise
+            except Exception as exc:
+                logger.error(f"High-throughput publisher loop error for {chain}: {exc}")
+                await asyncio.sleep(0.2)
+
+        if batch:
+            await self._flush_flow_batch(chain, batch, queue)
+
+    async def _flush_flow_batch(self, chain: str, flows: List[OnchainFlow], queue: asyncio.Queue) -> None:
+        """Flush a batch of flows to the streaming bus asynchronously with concurrency limits."""
+        if not flows:
+            return
+
+        semaphore = self._flow_publish_semaphores.get(chain)
+
+        async def _send_single(flow_obj: OnchainFlow, payload: Dict[str, Any],
+                               headers: Dict[str, str], partition_key: str,
+                               dedupe_key: Optional[str]) -> bool:
+            try:
+                if semaphore:
+                    async with semaphore:
+                        return await self.streaming_bus.publish_with_headers(
+                            topic="raw_data.onchain_events",
+                            partition_key=partition_key,
+                            payload=payload,
+                            headers=headers,
+                            dedupe_key=dedupe_key
+                        )
+                return await self.streaming_bus.publish_with_headers(
+                    topic="raw_data.onchain_events",
+                    partition_key=partition_key,
+                    payload=payload,
+                    headers=headers,
+                    dedupe_key=dedupe_key
+                )
+            except Exception as send_exc:
+                logger.error(f"Async publish error for {chain} flow {flow_obj.tx_hash}: {send_exc}")
+                return False
+
+        tasks = []
+        for flow_obj in flows:
+            flow_data, headers, partition_key, dedupe_key = self._prepare_flow_transport(flow_obj, chain)
+            tasks.append(_send_single(flow_obj, flow_data, headers, partition_key, dedupe_key))
+
+        results = await asyncio.gather(*tasks, return_exceptions=True)
+
+        successes = 0
+        failures = 0
+        for flow_obj, result in zip(flows, results):
+            if isinstance(result, Exception):
+                failures += 1
+                logger.error(f"Streaming bus exception for {chain} flow {flow_obj.tx_hash}: {result}")
+            elif result:
+                successes += 1
+            else:
+                failures += 1
+
+            if not isinstance(result, Exception):
+                self._enqueue_local_flow(flow_obj)
+
+            queue.task_done()
+
+        self._auto_tune_chain_params(chain, queue, len(flows), successes, failures)
+
+        self.metrics['flow_batches_published'] += 1
+        self.metrics['flows_published_async'] += successes
+        if failures:
+            self.metrics['flow_batch_publish_failures'] += failures
+        self.metrics['flow_publish_queue_depth'] = queue.qsize()
+
+        logger.debug(
+            f"Flushed {len(flows)} flows for {chain} "
+            f"(success={successes}, failures={failures}, queue_remaining={queue.qsize()})"
+        )
+
+
     async def _handle_reorg(self, chain: str, reorg_block: int):
         """Handle blockchain reorganization by removing affected flows."""
         try:
@@ -1202,7 +1737,13 @@ class OnchainCollectorAgent:
             logger.warning("Dune API key or query ID not set; skipping Dune flows collection.")
             await asyncio.sleep(interval_sec)
             return
-        async with DuneClient(dune_api_key) as dune:
+        dune_rate_domain = self.rate_budget_domains.get("dune", "onchain.dune")
+        rate_limit_timeout = self._rate_budget_timeout
+
+        def _record_dune_429() -> None:
+            self.streaming_bus.record_rate_limit_429(dune_rate_domain)
+
+        async with DuneClient(dune_api_key, on_rate_limit=_record_dune_429) as dune:
             next_tick = time.monotonic()
             while self.running:
                 try:
@@ -1225,7 +1766,12 @@ class OnchainCollectorAgent:
                     # Use retry wrapper for Dune API calls
                     self.metrics['dune_api_calls'] += 1
                     try:
-                        result = await self._retry_with_backoff(dune.run_query, dune_query_id, params=params)
+                        async with self.streaming_bus.rate_limit(dune_rate_domain, timeout=rate_limit_timeout):
+                            result = await self._retry_with_backoff(dune.run_query, dune_query_id, params=params)
+                    except asyncio.TimeoutError:
+                        self.metrics['rate_budget_timeouts'] += 1
+                        logger.warning(f"Rate budget timeout while waiting to query Dune for {chain}")
+                        continue
                     except Exception as e:
                         self.metrics['dune_api_errors'] += 1
                         logger.error(f"Dune API call failed for {chain} flows after retries: {e}")
@@ -1333,7 +1879,13 @@ class OnchainCollectorAgent:
             logger.warning("Dune API key or LST query ID not set; skipping Dune LST collection.")
             await asyncio.sleep(interval_sec)
             return
-        async with DuneClient(dune_api_key) as dune:
+        dune_rate_domain = self.rate_budget_domains.get("dune", "onchain.dune")
+        rate_limit_timeout = self._rate_budget_timeout
+
+        def _record_dune_429() -> None:
+            self.streaming_bus.record_rate_limit_429(dune_rate_domain)
+
+        async with DuneClient(dune_api_key, on_rate_limit=_record_dune_429) as dune:
             next_tick = time.monotonic()
             while self.running:
                 try:
@@ -1342,7 +1894,12 @@ class OnchainCollectorAgent:
                     # Use retry wrapper for Dune API calls
                     self.metrics['dune_api_calls'] += 1
                     try:
-                        result = await self._retry_with_backoff(dune.run_query, lst_query_id, params=params)
+                        async with self.streaming_bus.rate_limit(dune_rate_domain, timeout=rate_limit_timeout):
+                            result = await self._retry_with_backoff(dune.run_query, lst_query_id, params=params)
+                    except asyncio.TimeoutError:
+                        self.metrics['rate_budget_timeouts'] += 1
+                        logger.warning(f"Rate budget timeout while fetching LST state for {chain}")
+                        continue
                     except Exception as e:
                         self.metrics['dune_api_errors'] += 1
                         logger.error(f"Dune API call failed for {chain} LST after retries: {e}")
@@ -1387,12 +1944,24 @@ class OnchainCollectorAgent:
             logger.warning("Dune API key or bridge query ID not set; skipping Dune bridge collection.")
             await asyncio.sleep(interval_sec)
             return
-        async with DuneClient(dune_api_key) as dune:
+        dune_rate_domain = self.rate_budget_domains.get("dune", "onchain.dune")
+        rate_limit_timeout = self._rate_budget_timeout
+
+        def _record_dune_429() -> None:
+            self.streaming_bus.record_rate_limit_429(dune_rate_domain)
+
+        async with DuneClient(dune_api_key, on_rate_limit=_record_dune_429) as dune:
             next_tick = time.monotonic()
             while self.running:
                 try:
                     params = {"chain": chain}
-                    result = await dune.run_query(bridge_query_id, params=params)
+                    try:
+                        async with self.streaming_bus.rate_limit(dune_rate_domain, timeout=rate_limit_timeout):
+                            result = await dune.run_query(bridge_query_id, params=params)
+                    except asyncio.TimeoutError:
+                        self.metrics['rate_budget_timeouts'] += 1
+                        logger.warning(f"Rate budget timeout while fetching bridge data for {chain}")
+                        continue
                     now = int(time.time() * 1_000_000)
                     capture_now = int(time.time() * 1_000_000)
                     for row in result.get("rows", []):
@@ -1438,12 +2007,24 @@ class OnchainCollectorAgent:
             logger.warning("Dune API key or queues query ID not set; skipping Dune queues collection.")
             await asyncio.sleep(interval_sec)
             return
-        async with DuneClient(dune_api_key) as dune:
+        dune_rate_domain = self.rate_budget_domains.get("dune", "onchain.dune")
+        rate_limit_timeout = self._rate_budget_timeout
+
+        def _record_dune_429() -> None:
+            self.streaming_bus.record_rate_limit_429(dune_rate_domain)
+
+        async with DuneClient(dune_api_key, on_rate_limit=_record_dune_429) as dune:
             next_tick = time.monotonic()
             while self.running:
                 try:
                     params = {"chain": chain}
-                    result = await dune.run_query(queues_query_id, params=params)
+                    try:
+                        async with self.streaming_bus.rate_limit(dune_rate_domain, timeout=rate_limit_timeout):
+                            result = await dune.run_query(queues_query_id, params=params)
+                    except asyncio.TimeoutError:
+                        self.metrics['rate_budget_timeouts'] += 1
+                        logger.warning(f"Rate budget timeout while fetching queue data for {chain}")
+                        continue
                     now = int(time.time() * 1_000_000)
                     capture_now = int(time.time() * 1_000_000)
                     for row in result.get("rows", []):
@@ -1493,7 +2074,7 @@ class OnchainCollectorAgent:
 
 async def main():
     config = {
-        'chains': ['ethereum', 'arbitrum', 'polygon'],
+        'chains': ['ethereum', 'arbitrum', 'optimism', 'polygon'],
         'flows_interval_sec': 10,
         'lst_interval_sec': 60,
         
@@ -1510,6 +2091,12 @@ async def main():
                 'finality_blocks': 10,
                 'max_buffer_blocks': 2000,
                 'max_cursor_lag_blocks': 400
+            },
+            'optimism': {
+                'reorg_depth': 1,
+                'finality_blocks': 12,
+                'max_buffer_blocks': 400,
+                'max_cursor_lag_blocks': 300
             },
             'polygon': {
                 'reorg_depth': 256,
@@ -1540,6 +2127,43 @@ async def main():
         'lst_queue_size': 2000,
         'bridge_queue_size': 2000,
         'queues_queue_size': 2000,
+
+        # Shared rate budget domains
+        'rate_budget_domains': {
+            'dune': 'onchain.dune',
+            'rpc': 'onchain.rpc'
+        },
+        'rate_budget_timeout_sec': 5.0,
+
+        # High-throughput L2 batching (tuned defaults)
+        'high_throughput_chains': ['arbitrum', 'optimism', 'polygon'],
+        'l2_batch_size': 600,
+        'l2_batch_size_min': 200,
+        'l2_batch_size_max': 2000,
+        'l2_batch_flush_interval_sec': 0.15,
+        'l2_min_flush_interval_sec': 0.05,
+        'l2_max_flush_interval_sec': 0.35,
+        'l2_publish_queue_size': 40000,
+        'l2_publish_concurrency': 8,
+        'l2_min_publish_concurrency': 4,
+        'l2_max_publish_concurrency': 16,
+        'l2_auto_tune_enabled': True,
+        'l2_queue_pressure_high': 0.8,
+        'l2_queue_pressure_low': 0.2,
+        'l2_chain_overrides': {
+            'arbitrum': {
+                'batch_size': 900,
+                'flush_interval_sec': 0.12,
+                'queue_size': 60000,
+                'concurrency': 12
+            },
+            'optimism': {
+                'batch_size': 750,
+                'flush_interval_sec': 0.14,
+                'queue_size': 45000,
+                'concurrency': 10
+            }
+        },
         
         # Dune API configuration
         'dune_query_id': 1234567,  # Your Dune query ID for flows

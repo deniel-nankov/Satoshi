@@ -27,7 +27,7 @@ from enum import Enum
 from datetime import datetime, timezone
 from collections import defaultdict, deque
 
-from infra.bus.streaming_bus import StreamingBus
+from infra.bus.streaming_bus import StreamingBus, BreakerIntent
 
 logger = logging.getLogger(__name__)
 
@@ -389,12 +389,27 @@ class AutoRemediationEngine:
             for topic in affected_topics:
                 self.active_sources[topic] = backup_source
             
-            # Open circuit breaker for failed source
+            # Request circuit breaker open for failed source
+            component_id = f"failed_source_{target_source}"
             await self.streaming_bus.register_circuit_breaker(
-                component_id=f"failed_source_{target_source}",
+                component_id=component_id,
                 failure_threshold=1,
                 recovery_timeout_us=1800_000_000,  # 30 minutes
                 dependency_components=[]
+            )
+            await self.streaming_bus.publish_breaker_intent(
+                BreakerIntent(
+                    component_id=component_id,
+                    intent="trip",
+                    reason="auto_remediation_failover",
+                    severity="high",
+                    requested_by=self.session_id,
+                    metadata={
+                        "action_id": action.action_id,
+                        "failed_source": target_source,
+                        "backup_source": backup_source
+                    }
+                )
             )
             
             self.metrics["data_source_failovers"] += 1
@@ -449,12 +464,25 @@ class AutoRemediationEngine:
             component = action.target_component
             logger.info(f"🚫 Isolating component via circuit breaker: {component}")
             
-            # Open circuit breaker
+            isolation_component_id = f"isolated_{component}"
             await self.streaming_bus.register_circuit_breaker(
-                component_id=f"isolated_{component}",
+                component_id=isolation_component_id,
                 failure_threshold=1,  # Immediate isolation
                 recovery_timeout_us=action.action_params.get("recovery_timeout", 1800_000_000),
                 dependency_components=[]
+            )
+            await self.streaming_bus.publish_breaker_intent(
+                BreakerIntent(
+                    component_id=isolation_component_id,
+                    intent="trip",
+                    reason="auto_remediation_isolation",
+                    severity="critical",
+                    requested_by=self.session_id,
+                    metadata={
+                        "action_id": action.action_id,
+                        "target_component": component
+                    }
+                )
             )
             
             logger.info(f"✅ Component isolated: {component}")
@@ -526,11 +554,25 @@ class AutoRemediationEngine:
             
             # Open circuit breakers for dependent components
             for component in dependent_components:
+                cascade_component_id = f"cascade_protected_{component}"
                 await self.streaming_bus.register_circuit_breaker(
-                    component_id=f"cascade_protected_{component}",
+                    component_id=cascade_component_id,
                     failure_threshold=1,
                     recovery_timeout_us=600_000_000,  # 10 minutes
                     dependency_components=[]
+                )
+                await self.streaming_bus.publish_breaker_intent(
+                    BreakerIntent(
+                        component_id=cascade_component_id,
+                        intent="trip",
+                        reason="auto_remediation_cascade_prevention",
+                        severity="high",
+                        requested_by=self.session_id,
+                        metadata={
+                            "action_id": action.action_id,
+                            "dependent_component": component
+                        }
+                    )
                 )
             
             self.metrics["cascade_preventions"] += 1

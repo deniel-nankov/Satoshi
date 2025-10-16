@@ -1532,9 +1532,11 @@ class ReconcilerAgent:
         except Exception as e:
             print(f"🔄 Reconciler Agent: Error in clean data consumption: {e}")
             # Record failure with circuit breaker
-            await self.streaming_bus.system_circuit_breaker.record_component_failure(
+            await self.streaming_bus.record_component_failure(
                 component_id="reconciler_agent",
-                cascade_to_dependents=False
+                cascade_failure=False,
+                reason="reconciler_clean_data_subscription_failure",
+                severity="medium"
             )
     
     def _handle_clean_data_wrapper(self, topic: str, partition_key: str, 
@@ -1699,9 +1701,11 @@ class ReconcilerAgent:
         except Exception as e:
             print(f"🔄 Reconciler Agent: Error in control message consumption: {e}")
             # Use the system circuit breaker to record failure
-            await self.streaming_bus.system_circuit_breaker.record_component_failure(
+            await self.streaming_bus.record_component_failure(
                 component_id="reconciler_agent",
-                cascade_to_dependents=False
+                cascade_failure=False,
+                reason="reconciler_control_listener_failure",
+                severity="medium"
             )
     
     def _handle_control_message_wrapper(self, topic: str, partition_key: str, 
@@ -1731,14 +1735,18 @@ class ReconcilerAgent:
                     action = message.get("action")
                     if action == "open":
                         print(f"🔄 Reconciler Agent: Circuit breaker opened via control message")
-                        await self.streaming_bus.system_circuit_breaker.record_component_failure(
+                        await self.streaming_bus.record_component_failure(
                             component_id="reconciler_agent",
-                            cascade_to_dependents=False
+                            cascade_failure=False,
+                            reason="reconciler_control_open_request",
+                            severity="medium"
                         )
                     elif action == "close":
                         print(f"🔄 Reconciler Agent: Circuit breaker closed via control message")
-                        await self.streaming_bus.system_circuit_breaker.record_component_success(
-                            component_id="reconciler_agent"
+                        await self.streaming_bus.record_component_success(
+                            component_id="reconciler_agent",
+                            reason="reconciler_control_close_request",
+                            severity="low"
                         )
                         
             elif topic == "control.config_update":

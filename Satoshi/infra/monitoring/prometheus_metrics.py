@@ -79,7 +79,7 @@ class MetricsCollector:
         self._initialize_core_metrics()
     
     def _initialize_core_metrics(self) -> None:
-        """Initialize essential system and application metrics."""
+        """Initialize essential system, application, and crypto-native business metrics."""
         # System metrics
         self.register_gauge("system_cpu_percent", "CPU utilization percentage")
         self.register_gauge("system_memory_percent", "Memory utilization percentage") 
@@ -92,19 +92,129 @@ class MetricsCollector:
         self.register_counter("http_request_errors_total", "Total HTTP request errors")
         self.register_histogram("http_request_duration_seconds", "HTTP request duration")
         
-        # Trading metrics
-        self.register_counter("trades_executed_total", "Total trades executed")
-        self.register_counter("orders_placed_total", "Total orders placed")
-        self.register_gauge("portfolio_value_usd", "Current portfolio value in USD")
-        self.register_gauge("risk_exposure_percent", "Current risk exposure percentage")
+        # =================================================================================
+        # DATA QUALITY AGENT METRICS - Integrated with Quality Orchestrator
+        # =================================================================================
+        
+        # Schema Validator Metrics
+        self.register_counter("schema_validation_total", "Total schema validations performed", {"table_name": "", "status": "", "venue": ""})
+        self.register_histogram("schema_validation_duration_seconds", "Time spent validating schemas", labels={"table_name": "", "venue": ""})
+        self.register_counter("schema_violations_total", "Total schema violations detected", {"table_name": "", "violation_type": "", "venue": ""})
+        self.register_gauge("schema_compliance_ratio", "Ratio of compliant vs total messages", {"table_name": "", "venue": ""})
+        
+        # Leakage Police Metrics  
+        self.register_counter("leakage_incidents_total", "Total leakage incidents detected", {"leakage_type": "", "severity": "", "source": ""})
+        self.register_gauge("leakage_detection_score", "Current leakage detection confidence score", {"feature_set": ""})
+        self.register_histogram("leakage_analysis_duration_seconds", "Time spent analyzing for leakage", labels={"analysis_type": ""})
+        self.register_gauge("temporal_leakage_risk", "Current temporal leakage risk score (0-1)", {"time_window": ""})
+        
+        # Anomaly Detector Metrics
+        self.register_counter("anomalies_detected_total", "Total anomalies detected", {"anomaly_type": "", "severity": "", "table": ""})
+        self.register_gauge("anomaly_detection_score", "Current anomaly detection confidence", {"detector_type": "", "symbol": ""})
+        self.register_histogram("anomaly_analysis_duration_seconds", "Time spent on anomaly detection")
+        self.register_gauge("statistical_deviation_score", "Current statistical deviation from baseline", {"metric": "", "symbol": ""})
+        
+        # Freshness Agent Metrics
+        self.register_gauge("data_staleness_seconds", "Current data staleness in seconds", {"stream_name": "", "venue": ""})
+        self.register_counter("freshness_violations_total", "Total freshness SLA violations", {"stream_name": "", "severity": ""})
+        self.register_gauge("freshness_sla_ratio", "Ratio of fresh vs stale messages", {"stream_name": "", "sla_threshold": ""})
+        self.register_histogram("freshness_check_duration_seconds", "Time spent checking data freshness")
+        
+        # Reconciler Agent Metrics  
+        self.register_counter("reconciliation_discrepancies_total", "Total reconciliation discrepancies", {"source_pair": "", "discrepancy_type": ""})
+        self.register_gauge("cross_source_accuracy_ratio", "Cross-source data accuracy ratio", {"source_pair": ""})
+        self.register_histogram("reconciliation_duration_seconds", "Time spent on cross-source reconciliation", labels={"source_count": ""})
+        self.register_gauge("data_consistency_score", "Overall data consistency score across sources", {"domain": ""})
+        
+        # Data Quality Orchestrator Metrics
+        self.register_counter("quality_pipeline_executions_total", "Total quality pipeline executions", {"pipeline_mode": "", "result": ""})
+        self.register_histogram("quality_pipeline_duration_seconds", "End-to-end quality pipeline execution time", labels={"pipeline_mode": ""})
+        self.register_gauge("overall_data_quality_score", "Overall weighted data quality score", {"pipeline_mode": ""})
+        self.register_gauge("quality_circuit_breaker_state", "Quality circuit breaker state (0=closed, 1=open)", {"component": ""})
+        self.register_counter("quality_incidents_published_total", "Total quality incidents published", {"incident_type": "", "severity": ""})
+        
+        # =================================================================================
+        # CRYPTO-NATIVE BUSINESS METRICS - Institutional Trading Focus
+        # =================================================================================
+        
+        # Core Trading Metrics
+        self.register_counter("trades_executed_total", "Total trades executed", {"symbol": "", "side": "", "venue": ""})
+        self.register_counter("orders_placed_total", "Total orders placed", {"symbol": "", "order_type": "", "venue": ""})
+        self.register_gauge("portfolio_value_usd", "Current portfolio value in USD", {"strategy": ""})
+        self.register_gauge("risk_exposure_percent", "Current risk exposure percentage", {"asset_class": ""})
+        
+        # Crypto-Specific Market Metrics
+        self.register_gauge("funding_rate_current", "Current perpetual funding rate (8h annualized)", {"symbol": "", "venue": ""})
+        self.register_gauge("basis_spread_bps", "Current futures basis spread in basis points", {"symbol": "", "expiry": "", "venue": ""})
+        self.register_gauge("implied_volatility_current", "Current implied volatility (30-day ATM)", {"symbol": "", "venue": ""})
+        self.register_gauge("realized_volatility_30d", "30-day realized volatility", {"symbol": ""})
+        self.register_gauge("vol_surface_skew", "Volatility surface skew (25D RR)", {"symbol": "", "expiry": ""})
+        
+        # Crypto On-Chain Metrics
+        self.register_gauge("onchain_volume_24h_usd", "24-hour on-chain transaction volume", {"chain": "", "token": ""})
+        self.register_gauge("stablecoin_supply_total", "Total stablecoin supply", {"stablecoin": ""})
+        self.register_gauge("bridge_inflows_24h_usd", "24-hour bridge inflows to exchanges", {"bridge": "", "destination": ""})
+        self.register_gauge("whale_wallet_activity", "Large wallet activity score", {"token": "", "threshold_usd": ""})
+        self.register_gauge("network_hash_rate", "Network hash rate", {"chain": ""})
+        
+        # Market Microstructure Metrics  
+        self.register_gauge("orderbook_depth_bps", "Order book depth at N bps from mid", {"symbol": "", "venue": "", "depth_bps": ""})
+        self.register_gauge("bid_ask_spread_bps", "Current bid-ask spread in basis points", {"symbol": "", "venue": ""})
+        self.register_gauge("market_impact_bps", "Estimated market impact for standard size", {"symbol": "", "venue": "", "notional_usd": ""})
+        self.register_gauge("venue_dominance_ratio", "Venue's share of total volume", {"symbol": "", "venue": ""})
+        self.register_histogram("order_fill_latency_seconds", "Time from order placement to fill", labels={"venue": "", "order_type": ""})
+        
+        # Risk Management Metrics
+        self.register_gauge("var_95_daily_usd", "Daily 95% Value at Risk", {"strategy": "", "lookback_days": ""})
+        self.register_gauge("expected_shortfall_usd", "Expected shortfall beyond VaR", {"strategy": "", "confidence": ""})
+        self.register_gauge("correlation_btc_spy", "Rolling correlation between BTC and SPY", {"window_days": ""})
+        self.register_gauge("portfolio_beta", "Portfolio beta to market benchmark", {"benchmark": ""})
+        self.register_gauge("max_drawdown_percent", "Maximum drawdown from peak", {"strategy": "", "period": ""})
+        
+        # Alpha Generation Metrics
+        self.register_gauge("sharpe_ratio", "Rolling Sharpe ratio", {"strategy": "", "window_days": ""})
+        self.register_gauge("information_ratio", "Information ratio vs benchmark", {"strategy": "", "benchmark": ""})
+        self.register_gauge("alpha_decay_rate", "Rate of alpha decay over time", {"strategy": "", "feature_set": ""})
+        self.register_counter("strategy_signals_total", "Total strategy signals generated", {"strategy": "", "signal_type": ""})
+        self.register_gauge("signal_accuracy_ratio", "Ratio of profitable signals", {"strategy": "", "lookback_days": ""})
+        
+        # Execution Quality Metrics
+        self.register_histogram("execution_slippage_bps", "Execution slippage in basis points", labels={"symbol": "", "venue": "", "strategy": ""})
+        self.register_gauge("fill_ratio", "Ratio of filled vs placed orders", {"symbol": "", "venue": "", "order_type": ""})
+        self.register_histogram("time_to_fill_seconds", "Time from order placement to complete fill", labels={"venue": "", "size_bucket": ""})
+        self.register_gauge("execution_shortfall_bps", "Implementation shortfall in basis points", {"strategy": "", "symbol": ""})
+        
+        # Regulatory and Compliance Metrics
+        self.register_counter("compliance_violations_total", "Total compliance violations detected", {"violation_type": "", "severity": ""})
+        self.register_gauge("position_limit_utilization", "Current position limit utilization ratio", {"symbol": "", "limit_type": ""})
+        self.register_counter("wash_trading_alerts_total", "Total wash trading alerts", {"symbol": "", "venue": ""})
+        self.register_gauge("surveillance_score", "Current surveillance risk score", {"entity": "", "risk_type": ""})
         
         # Infrastructure metrics  
-        self.register_gauge("kafka_consumer_lag", "Kafka consumer lag")
-        self.register_counter("kafka_messages_consumed", "Kafka messages consumed")
-        self.register_counter("kafka_messages_produced", "Kafka messages produced")
-        self.register_gauge("circuit_breaker_state", "Circuit breaker state (0=closed, 1=open)")
+        self.register_gauge("kafka_consumer_lag", "Kafka consumer lag", {"consumer_group": "", "topic": ""})
+        self.register_counter("kafka_messages_consumed", "Kafka messages consumed", {"consumer_group": "", "topic": ""})
+        self.register_counter("kafka_messages_produced", "Kafka messages produced", {"topic": ""})
+        self.register_gauge("circuit_breaker_state", "Circuit breaker state (0=closed, 1=open)", {"component": "", "breaker_type": ""})
+        self.register_counter("breaker_intent_decisions_total", "Breaker intents processed by orchestrator", {"component_id": "", "intent": "", "decision": "", "severity": "", "requested_by": ""})
+        self.register_gauge("breaker_component_state", "Breaker state as observed by orchestrator (0=closed, 0.5=half_open, 1=open)", {"component_id": ""})
+        self.register_gauge("breaker_state_last_update_timestamp", "Last update timestamp for breaker state", {"component_id": ""})
         
-    def register_counter(self, name: str, help_text: str, labels: Dict[str, str] = None) -> None:
+        # Quality pipeline orchestration metrics
+        self.register_counter("quality_pipeline_messages_total", "Quality pipeline messages processed", {"source_topic": "", "decision": ""})
+        self.register_histogram("quality_pipeline_duration_seconds", "End-to-end quality pipeline duration", labels={"source_topic": ""})
+        # Rate budget and throttling metrics
+        self.register_gauge("rate_budget_available_tokens", "Available tokens in shared rate budget", {"domain": ""})
+        self.register_gauge("rate_budget_configured_qps", "Configured QPS for rate budget domain", {"domain": ""})
+        self.register_gauge("rate_budget_configured_burst", "Configured burst capacity for rate budget domain", {"domain": ""})
+        self.register_gauge("rate_budget_qps_utilization", "Recent permits consumed in last second", {"domain": ""})
+        self.register_gauge("rate_budget_avg_wait_seconds", "Average wait time for rate budget borrows", {"domain": ""})
+        self.register_gauge("rate_budget_throttled_events", "Total throttled events for domain", {"domain": ""})
+        self.register_gauge("rate_budget_borrow_count", "Total borrow count for rate budget domain", {"domain": ""})
+        self.register_gauge("rate_budget_rate_limit_responses", "Upstream rate-limit responses (429)", {"domain": ""})
+        self.register_gauge("rate_limit_responses_count", "Agent reported rate-limit responses", {"component": "", "domain": ""})
+        self.register_gauge("rate_budget_timeouts_count", "Agent rate-budget timeout events", {"component": "", "domain": ""})
+        
+    def register_counter(self, name: str, help_text: str, labels: Optional[Dict[str, str]] = None) -> None:
         """Register a counter metric."""
         with self._lock:
             self.metrics[name] = TimeSeries(
@@ -114,7 +224,7 @@ class MetricsCollector:
                 labels=labels or {}
             )
     
-    def register_gauge(self, name: str, help_text: str, labels: Dict[str, str] = None) -> None:
+    def register_gauge(self, name: str, help_text: str, labels: Optional[Dict[str, str]] = None) -> None:
         """Register a gauge metric."""
         with self._lock:
             self.metrics[name] = TimeSeries(
@@ -125,7 +235,7 @@ class MetricsCollector:
             )
     
     def register_histogram(self, name: str, help_text: str, 
-                         buckets: List[float] = None, labels: Dict[str, str] = None) -> None:
+                         buckets: Optional[List[float]] = None, labels: Optional[Dict[str, str]] = None) -> None:
         """Register a histogram metric."""
         if buckets is None:
             # HFT-optimized latency buckets (microseconds to seconds)
@@ -139,10 +249,10 @@ class MetricsCollector:
                 metric_type="histogram",
                 labels=labels or {}
             )
-            # Store bucket configuration
-            self.metrics[name].buckets = buckets
+            # Store bucket configuration in TimeSeries metadata
+            self.metrics[name].__dict__['buckets'] = buckets
     
-    def increment_counter(self, name: str, value: float = 1.0, labels: Dict[str, str] = None) -> None:
+    def increment_counter(self, name: str, value: float = 1.0, labels: Optional[Dict[str, str]] = None) -> None:
         """Increment a counter metric (thread-safe, lock-free for performance)."""
         key = f"{name}_{hash(frozenset(labels.items()) if labels else frozenset())}"
         self.counters[key] += value
@@ -158,7 +268,7 @@ class MetricsCollector:
         if name in self.metrics:
             self.metrics[name].samples.append(sample)
     
-    def set_gauge(self, name: str, value: float, labels: Dict[str, str] = None) -> None:
+    def set_gauge(self, name: str, value: float, labels: Optional[Dict[str, str]] = None) -> None:
         """Set a gauge metric value."""
         key = f"{name}_{hash(frozenset(labels.items()) if labels else frozenset())}"
         self.gauges[key] = value
@@ -173,7 +283,7 @@ class MetricsCollector:
         if name in self.metrics:
             self.metrics[name].samples.append(sample)
     
-    def observe_histogram(self, name: str, value: float, labels: Dict[str, str] = None) -> None:
+    def observe_histogram(self, name: str, value: float, labels: Optional[Dict[str, str]] = None) -> None:
         """Add an observation to a histogram metric."""
         key = f"{name}_{hash(frozenset(labels.items()) if labels else frozenset())}"
         self.histograms[key].append(value)
@@ -340,6 +450,324 @@ class MetricsCollector:
             "collection_interval": self.collection_interval,
             "running": self._running
         }
+    
+    # =================================================================================
+    # QUALITY AGENT INTEGRATION METHODS
+    # =================================================================================
+    
+    def record_quality_metrics(self, orchestrator_results: Dict[str, Any]) -> None:
+        """Record metrics from Data Quality Orchestrator pipeline results."""
+        try:
+            # Overall pipeline metrics
+            if 'pipeline_mode' in orchestrator_results:
+                mode = orchestrator_results['pipeline_mode']
+                self.increment_counter("quality_pipeline_executions_total", 
+                                     labels={"pipeline_mode": mode, "result": "success"})
+                
+                if 'execution_time' in orchestrator_results:
+                    self.observe_histogram("quality_pipeline_duration_seconds", 
+                                         orchestrator_results['execution_time'],
+                                         labels={"pipeline_mode": mode})
+                
+                if 'overall_score' in orchestrator_results:
+                    self.set_gauge("overall_data_quality_score", 
+                                 orchestrator_results['overall_score'],
+                                 labels={"pipeline_mode": mode})
+            
+            # Individual agent metrics
+            if 'agent_results' in orchestrator_results:
+                for agent_name, results in orchestrator_results['agent_results'].items():
+                    self._record_agent_metrics(agent_name, results)
+                    
+        except Exception as e:
+            logger.error(f"Error recording quality metrics: {e}")
+    
+    def _record_agent_metrics(self, agent_name: str, results: Dict[str, Any]) -> None:
+        """Record metrics for individual quality agents."""
+        if agent_name == "schema_validator":
+            self._record_schema_validator_metrics(results)
+        elif agent_name == "leakage_police":
+            self._record_leakage_police_metrics(results)
+        elif agent_name == "anomaly_detector":
+            self._record_anomaly_detector_metrics(results)
+        elif agent_name == "freshness_agent":
+            self._record_freshness_agent_metrics(results)
+        elif agent_name == "reconciler_agent":
+            self._record_reconciler_agent_metrics(results)
+    
+    def _record_schema_validator_metrics(self, results: Dict[str, Any]) -> None:
+        """Record Schema Validator specific metrics."""
+        table_name = results.get('table_name', 'unknown')
+        venue = results.get('venue', 'unknown')
+        
+        # Validation count and status
+        status = "pass" if results.get('is_valid', False) else "fail"
+        self.increment_counter("schema_validation_total", 
+                             labels={"table_name": table_name, "status": status, "venue": venue})
+        
+        # Validation duration
+        if 'validation_time' in results:
+            self.observe_histogram("schema_validation_duration_seconds", 
+                                 results['validation_time'],
+                                 labels={"table_name": table_name, "venue": venue})
+        
+        # Violations
+        if 'violations' in results and results['violations']:
+            for violation in results['violations']:
+                self.increment_counter("schema_violations_total",
+                                     labels={"table_name": table_name, 
+                                           "violation_type": violation.get('type', 'unknown'),
+                                           "venue": venue})
+        
+        # Compliance ratio
+        if 'compliance_ratio' in results:
+            self.set_gauge("schema_compliance_ratio", 
+                         results['compliance_ratio'],
+                         labels={"table_name": table_name, "venue": venue})
+    
+    def _record_freshness_agent_metrics(self, results: Dict[str, Any]) -> None:
+        """Record Freshness Agent specific metrics."""
+        stream_name = results.get('stream_name', 'unknown')
+        venue = results.get('venue', 'unknown')
+        
+        # Data staleness
+        if 'staleness_seconds' in results:
+            self.set_gauge("data_staleness_seconds", 
+                         results['staleness_seconds'],
+                         labels={"stream_name": stream_name, "venue": venue})
+        
+        # SLA violations
+        if 'sla_violation' in results and results['sla_violation']:
+            severity = results.get('violation_severity', 'medium')
+            self.increment_counter("freshness_violations_total",
+                                 labels={"stream_name": stream_name, "severity": severity})
+    
+    def _record_leakage_police_metrics(self, results: Dict[str, Any]) -> None:
+        """Record Leakage Police specific metrics."""
+        # Leakage incidents
+        if 'leakage_detected' in results and results['leakage_detected']:
+            leakage_type = results.get('leakage_type', 'unknown')
+            severity = results.get('severity', 'medium')
+            source = results.get('source', 'unknown')
+            
+            self.increment_counter("leakage_incidents_total",
+                                 labels={"leakage_type": leakage_type, "severity": severity, "source": source})
+        
+        # Detection score
+        if 'detection_score' in results:
+            feature_set = results.get('feature_set', 'default')
+            self.set_gauge("leakage_detection_score", 
+                         results['detection_score'],
+                         labels={"feature_set": feature_set})
+    
+    def _record_anomaly_detector_metrics(self, results: Dict[str, Any]) -> None:
+        """Record Anomaly Detector specific metrics."""
+        # Anomaly detection
+        if 'anomalies' in results and results['anomalies']:
+            for anomaly in results['anomalies']:
+                self.increment_counter("anomalies_detected_total",
+                                     labels={"anomaly_type": anomaly.get('type', 'unknown'),
+                                           "severity": anomaly.get('severity', 'medium'),
+                                           "table": anomaly.get('table', 'unknown')})
+        
+        # Detection score
+        if 'detection_score' in results:
+            detector_type = results.get('detector_type', 'statistical')
+            symbol = results.get('symbol', 'unknown')
+            self.set_gauge("anomaly_detection_score", 
+                         results['detection_score'],
+                         labels={"detector_type": detector_type, "symbol": symbol})
+    
+    def _record_reconciler_agent_metrics(self, results: Dict[str, Any]) -> None:
+        """Record Reconciler Agent specific metrics."""
+        # Discrepancies
+        if 'discrepancies' in results and results['discrepancies']:
+            for discrepancy in results['discrepancies']:
+                source_pair = discrepancy.get('source_pair', 'unknown')
+                discrepancy_type = discrepancy.get('type', 'unknown')
+                self.increment_counter("reconciliation_discrepancies_total",
+                                     labels={"source_pair": source_pair, 
+                                           "discrepancy_type": discrepancy_type})
+        
+        # Cross-source accuracy
+        if 'accuracy_ratio' in results:
+            source_pair = results.get('source_pair', 'unknown')
+            self.set_gauge("cross_source_accuracy_ratio", 
+                         results['accuracy_ratio'],
+                         labels={"source_pair": source_pair})
+    
+    # =================================================================================
+    # CRYPTO-NATIVE BUSINESS METRICS
+    # =================================================================================
+    
+    def record_trading_metrics(self, trade_data: Dict[str, Any]) -> None:
+        """Record crypto-specific trading metrics."""
+        try:
+            symbol = trade_data.get('symbol', 'unknown')
+            venue = trade_data.get('venue', 'unknown')
+            side = trade_data.get('side', 'unknown')
+            
+            # Basic trade metrics
+            self.increment_counter("trades_executed_total", 
+                                 labels={"symbol": symbol, "side": side, "venue": venue})
+            
+            # Execution quality metrics
+            if 'slippage_bps' in trade_data:
+                strategy = trade_data.get('strategy', 'unknown')
+                self.observe_histogram("execution_slippage_bps", 
+                                     trade_data['slippage_bps'],
+                                     labels={"symbol": symbol, "venue": venue, "strategy": strategy})
+            
+            if 'fill_latency' in trade_data:
+                order_type = trade_data.get('order_type', 'unknown')
+                self.observe_histogram("order_fill_latency_seconds", 
+                                     trade_data['fill_latency'],
+                                     labels={"venue": venue, "order_type": order_type})
+                
+        except Exception as e:
+            logger.error(f"Error recording trading metrics: {e}")
+    
+    def record_market_data_metrics(self, market_data: Dict[str, Any]) -> None:
+        """Record crypto market data metrics."""
+        try:
+            symbol = market_data.get('symbol', 'unknown')
+            venue = market_data.get('venue', 'unknown')
+            
+            # Market microstructure
+            if 'bid_ask_spread_bps' in market_data:
+                self.set_gauge("bid_ask_spread_bps", 
+                             market_data['bid_ask_spread_bps'],
+                             labels={"symbol": symbol, "venue": venue})
+            
+            if 'funding_rate' in market_data:
+                self.set_gauge("funding_rate_current", 
+                             market_data['funding_rate'],
+                             labels={"symbol": symbol, "venue": venue})
+            
+            if 'basis_spread_bps' in market_data:
+                expiry = market_data.get('expiry', 'perp')
+                self.set_gauge("basis_spread_bps", 
+                             market_data['basis_spread_bps'],
+                             labels={"symbol": symbol, "expiry": expiry, "venue": venue})
+                
+        except Exception as e:
+            logger.error(f"Error recording market data metrics: {e}")
+    
+    def record_onchain_metrics(self, onchain_data: Dict[str, Any]) -> None:
+        """Record crypto on-chain metrics."""
+        try:
+            chain = onchain_data.get('chain', 'unknown')
+            token = onchain_data.get('token', 'unknown')
+            
+            # On-chain volume
+            if 'volume_24h_usd' in onchain_data:
+                self.set_gauge("onchain_volume_24h_usd", 
+                             onchain_data['volume_24h_usd'],
+                             labels={"chain": chain, "token": token})
+            
+            # Bridge flows
+            if 'bridge_inflows_24h' in onchain_data:
+                bridge = onchain_data.get('bridge', 'unknown')
+                destination = onchain_data.get('destination', 'unknown')
+                self.set_gauge("bridge_inflows_24h_usd", 
+                             onchain_data['bridge_inflows_24h'],
+                             labels={"bridge": bridge, "destination": destination})
+                
+        except Exception as e:
+            logger.error(f"Error recording on-chain metrics: {e}")
+
+    # =================================================================================
+    # RATE BUDGET METRICS
+    # =================================================================================
+
+    def record_rate_budget_metrics(self, rate_snapshot: Dict[str, Any]) -> None:
+        """Record shared rate budget metrics from the streaming bus."""
+        try:
+            if not rate_snapshot:
+                return
+
+            for domain, stats in rate_snapshot.items():
+                labels = {"domain": domain}
+                self.set_gauge("rate_budget_available_tokens", stats.get("available_tokens", 0.0), labels)
+                self.set_gauge("rate_budget_configured_qps", stats.get("configured_qps", 0.0), labels)
+                self.set_gauge("rate_budget_configured_burst", stats.get("configured_burst", 0.0), labels)
+                self.set_gauge("rate_budget_qps_utilization", stats.get("qps_utilization", 0.0), labels)
+                self.set_gauge("rate_budget_avg_wait_seconds", stats.get("avg_wait_sec", 0.0), labels)
+                self.set_gauge("rate_budget_throttled_events", stats.get("throttled_events", 0.0), labels)
+                self.set_gauge("rate_budget_borrow_count", stats.get("borrow_count", 0.0), labels)
+                self.set_gauge("rate_budget_rate_limit_responses", stats.get("429_count", 0.0), labels)
+        except Exception as e:
+            logger.error(f"Error recording rate budget metrics: {e}")
+
+    def record_rate_limit_counters(self, component: str, metrics: Dict[str, Any], domain_keys: Optional[List[str]] = None) -> None:
+        """
+        Record per-component rate-limit counters reported by agents.
+        Expects metrics dict containing 'rate_limit_responses' and 'rate_budget_timeouts'.
+        """
+        try:
+            responses = metrics.get("rate_limit_responses")
+            timeouts = metrics.get("rate_budget_timeouts")
+            if isinstance(responses, dict):
+                for domain, value in responses.items():
+                    labels = {"component": component, "domain": domain}
+                    self.set_gauge("rate_limit_responses_count", float(value), labels)
+            elif responses is not None:
+                labels = {"component": component, "domain": domain_keys[0] if domain_keys else "default"}
+                self.set_gauge("rate_limit_responses_count", float(responses), labels)
+
+            if isinstance(timeouts, dict):
+                for domain, value in timeouts.items():
+                    labels = {"component": component, "domain": domain}
+                    self.set_gauge("rate_budget_timeouts_count", float(value), labels)
+            elif timeouts is not None:
+                labels = {"component": component, "domain": domain_keys[0] if domain_keys else "default"}
+                self.set_gauge("rate_budget_timeouts_count", float(timeouts), labels)
+        except Exception as e:
+            logger.error(f"Error recording agent rate-limit counters: {e}")
+    
+    def record_breaker_intent_decision(self, component_id: str, intent: str,
+                                       decision: str, severity: str,
+                                       requested_by: str) -> None:
+        """Track breaker intent decisions made by the orchestrator."""
+        try:
+            labels = {
+                "component_id": component_id,
+                "intent": intent,
+                "decision": decision,
+                "severity": severity,
+                "requested_by": requested_by
+            }
+            self.increment_counter("breaker_intent_decisions_total", labels=labels)
+        except Exception as exc:
+            logger.error(f"Error recording breaker intent decision: {exc}")
+    
+    def record_breaker_state(self, state_snapshot: Dict[str, Any]) -> None:
+        """Update breaker state gauges from orchestrator snapshots."""
+        try:
+            component_id = state_snapshot.get("component_id")
+            if not component_id:
+                return
+            state = (state_snapshot.get("state") or "").lower()
+            state_value = {"closed": 0.0, "half_open": 0.5, "open": 1.0}.get(state, -1.0)
+            labels = {"component_id": component_id}
+            self.set_gauge("breaker_component_state", state_value, labels)
+            self.set_gauge("breaker_state_last_update_timestamp", float(time.time()), labels)
+        except Exception as exc:
+            logger.error(f"Error recording breaker state snapshot: {exc}")
+    
+    def record_quality_pipeline_metrics(self, source_topic: str, decision: str,
+                                        duration_seconds: float) -> None:
+        """Record metrics for quality pipeline processing."""
+        try:
+            labels = {"source_topic": source_topic, "decision": decision}
+            self.increment_counter("quality_pipeline_messages_total", labels=labels)
+            self.observe_histogram(
+                "quality_pipeline_duration_seconds",
+                duration_seconds,
+                {"source_topic": source_topic}
+            )
+        except Exception as exc:
+            logger.error(f"Error recording quality pipeline metrics: {exc}")
 
 # =============================
 # CONVENIENCE DECORATORS

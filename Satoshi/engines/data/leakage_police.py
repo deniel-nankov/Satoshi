@@ -81,7 +81,7 @@ from enum import Enum
 from datetime import datetime, timedelta
 import warnings
 
-from infra.bus.streaming_bus import StreamingBus
+from infra.bus.streaming_bus import StreamingBus, BreakerIntent
 
 
 class LeakageType(Enum):
@@ -370,9 +370,15 @@ class LeakagePolice:
                     
                     # Record failure with circuit breaker
                     if self._circuit_breaker_registered:
-                        await self.streaming_bus.system_circuit_breaker.record_component_failure(
-                            component_id=self.circuit_breaker_id,
-                            cascade_to_dependents=False
+                        await self._emit_breaker_intent(
+                            intent="trip",
+                            reason=f"{operation_name} retry exhaustion",
+                            severity="high",
+                            metadata={
+                                "operation": operation_name,
+                                "attempts": attempt + 1,
+                                "exception": str(e)
+                            }
                         )
                     
                     raise e
@@ -545,6 +551,32 @@ class LeakagePolice:
         confidence = 1.0 / (1.0 + np.exp(-effect_strength))
         return min(1.0, confidence)
     
+    async def _emit_breaker_intent(self, intent: str, reason: str, severity: str,
+                                   metadata: Optional[Dict[str, Any]] = None) -> None:
+        """Helper to publish centralized breaker intents for leakage police."""
+        if not self._circuit_breaker_registered or not self.streaming_bus:
+            return
+        
+        payload_metadata: Dict[str, Any] = {
+            "agent": "leakage_police"
+        }
+        if metadata:
+            payload_metadata.update(metadata)
+        
+        breaker_intent = BreakerIntent(
+            component_id=self.circuit_breaker_id,
+            intent=intent,
+            reason=reason,
+            severity=severity,
+            requested_by=self.circuit_breaker_id,
+            metadata=payload_metadata
+        )
+        
+        try:
+            await self.streaming_bus.publish_breaker_intent(breaker_intent)
+        except Exception as exc:
+            self.logger.error(f"Failed to publish breaker intent ({intent}) for {self.circuit_breaker_id}: {exc}")
+    
     def _format_human_readable_time(self, timestamp_us: int) -> str:
         """Convert microsecond timestamp to human-readable UTC ISO-8601 format."""
         try:
@@ -604,7 +636,7 @@ class LeakagePolice:
                     return False
             
             # Check circuit breaker status before publishing
-            can_execute = await self.streaming_bus.system_circuit_breaker.can_component_execute(self.circuit_breaker_id)
+            can_execute = await self.streaming_bus.can_component_execute(self.circuit_breaker_id)
             if not can_execute:
                 self.logger.warning(f"Circuit breaker prevents publication for component: {self.circuit_breaker_id}")
                 self.metrics["circuit_breaker_trips"] += 1
@@ -662,9 +694,14 @@ class LeakagePolice:
             
             # Record failure with circuit breaker
             if self._circuit_breaker_registered:
-                await self.streaming_bus.system_circuit_breaker.record_component_failure(
-                    component_id=self.circuit_breaker_id,
-                    cascade_to_dependents=False
+                await self._emit_breaker_intent(
+                    intent="trip",
+                    reason="incident_publish_failure",
+                    severity="high",
+                    metadata={
+                        "incident_id": incident.incident_id,
+                        "exception": str(e)
+                    }
                 )
             
             return False
@@ -724,7 +761,7 @@ class LeakagePolice:
                 
                 # Publish health metrics if circuit breaker is healthy
                 if self._circuit_breaker_registered:
-                    can_execute = await self.streaming_bus.system_circuit_breaker.can_component_execute(self.circuit_breaker_id)
+                    can_execute = await self.streaming_bus.can_component_execute(self.circuit_breaker_id)
                     if can_execute:
                         await self._publish_health_metrics(health_data)
                 
@@ -775,9 +812,11 @@ class LeakagePolice:
         except Exception as e:
             print(f"🚨 Leakage Police: Error in control message consumption: {e}")
             # Use the system circuit breaker to record failure
-            await self.streaming_bus.system_circuit_breaker.record_component_failure(
-                component_id="leakage_police",
-                cascade_to_dependents=False
+            await self._emit_breaker_intent(
+                intent="trip",
+                reason="control_listener_failure",
+                severity="medium",
+                metadata={"exception": str(e)}
             )
     
     def _handle_data_message_for_leakage(self, topic: str, partition_key: str, payload: Dict[str, Any], headers: Dict[str, str]) -> None:
@@ -2498,9 +2537,13 @@ class LeakagePolice:
             
             # Record failure with circuit breaker
             if self._circuit_breaker_registered:
-                await self.streaming_bus.system_circuit_breaker.record_component_failure(
-                    component_id=self.circuit_breaker_id,
-                    cascade_to_dependents=False
+                await self._emit_breaker_intent(
+                    intent="trip",
+                    reason="analysis_timeout",
+                    severity="medium",
+                    metadata={
+                        "timeout_seconds": self.config.analysis_timeout_seconds
+                    }
                 )
             
             # Create incident for timeout
@@ -2527,9 +2570,14 @@ class LeakagePolice:
             
             # Record failure with circuit breaker
             if self._circuit_breaker_registered:
-                await self.streaming_bus.system_circuit_breaker.record_component_failure(
-                    component_id=self.circuit_breaker_id,
-                    cascade_to_dependents=False
+                await self._emit_breaker_intent(
+                    intent="trip",
+                    reason="analysis_exception",
+                    severity="high",
+                    metadata={
+                        "error_type": type(e).__name__,
+                        "exception": str(e)
+                    }
                 )
             
             # Create incident for analysis failure  

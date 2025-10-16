@@ -1,0 +1,35 @@
+<?xml version="1.0"?>
+<clickhouse>
+    <!-- Performance settings for HFT workloads -->
+    <max_memory_usage>20000000000</max_memory_usage>  <!-- 20GB -->
+    <max_threads>8</max_threads>
+    <max_concurrent_queries>50</max_concurrent_queries>
+    
+    <!-- Network settings -->
+    <listen_host>0.0.0.0</listen_host>
+    
+    <!-- Query cache for repeated queries -->
+    <query_cache_size>1073741824</query_cache_size>  <!-- 1GB -->
+    <uncompressed_cache_size>8589934592</uncompressed_cache_size>  <!-- 8GB -->
+    <mark_cache_size>5368709120</mark_cache_size>  <!-- 5GB -->
+    
+    <!-- Logging -->
+    <logger>
+        <level>information</level>
+        <log>/var/log/clickhouse-server/clickhouse-server.log</log>
+        <errorlog>/var/log/clickhouse-server/clickhouse-server.err.log</errorlog>
+        <size>1000M</size>
+        <count>10</count>
+    </logger>
+    
+    <!-- Background processing -->
+    <background_pool_size>16</background_pool_size>
+    <background_merges_mutations_concurrency_ratio>2</background_merges_mutations_concurrency_ratio>
+    
+    <!-- Part processing -->
+    <merge_tree>
+        <max_suspicious_broken_parts>5</max_suspicious_broken_parts>
+        <parts_to_delay_insert>150</parts_to_delay_insert>
+        <parts_to_throw_insert>300</parts_to_throw_insert>
+    </merge_tree>
+</clickhouse>

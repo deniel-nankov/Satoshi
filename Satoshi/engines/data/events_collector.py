@@ -379,11 +379,28 @@ class DuplicateDetector:
 # HTTP CLIENT
 # =============================
 
+class _AsyncNullContext:
+    """Async no-op context manager used when rate limiting is disabled."""
+
+    async def __aenter__(self):
+        return None
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        return False
+
+
 class HttpClient:
     """Generic HTTP client for various APIs."""
-    def __init__(self, api_key: Optional[str] = None):
+    def __init__(self, api_key: Optional[str] = None,
+                 streaming_bus: Optional[StreamingBus] = None,
+                 rate_domain: Optional[str] = None,
+                 rate_timeout_sec: float = 5.0):
         self.api_key = api_key
         self.session: aiohttp.ClientSession | None = None
+        self._streaming_bus = streaming_bus
+        self._rate_domain = rate_domain
+        self._rate_timeout = float(rate_timeout_sec)
+        self._rate_limit_enabled = self._streaming_bus is not None and self._rate_domain is not None
 
     async def __aenter__(self):
         if self.session is None or self.session.closed:
@@ -409,16 +426,18 @@ class HttpClient:
         assert self.session is not None, "aiohttp session is not initialized"
         try:
             timeout = aiohttp.ClientTimeout(total=15)
-            async with self.session.post(url, json=json_data, headers=headers, timeout=timeout) as resp:
-                if resp.status == 429:
-                    retry_after = int(resp.headers.get("Retry-After", "5"))
-                    logger.warning(f"HTTP 429, sleeping {retry_after}s for {url}")
-                    await asyncio.sleep(retry_after)
-                    return None
-                if resp.status >= 400:
-                    body = await resp.text()
-                    logger.error({"event":"http_error","url":url,"status":resp.status,"body":body[:300]})
-                    return None
+            async with self._rate_limit_context():
+                async with self.session.post(url, json=json_data, headers=headers, timeout=timeout) as resp:
+                    if resp.status == 429:
+                        retry_after = int(resp.headers.get("Retry-After", "5"))
+                        logger.warning(f"HTTP 429, sleeping {retry_after}s for {url}")
+                        self._record_rate_limit_429()
+                        await asyncio.sleep(min(retry_after, self._rate_timeout))
+                        return None
+                    if resp.status >= 400:
+                        body = await resp.text()
+                        logger.error({"event":"http_error","url":url,"status":resp.status,"body":body[:300]})
+                        return None
                 try:
                     return await resp.json()
                 except Exception:
@@ -434,20 +453,22 @@ class HttpClient:
         assert self.session is not None, "aiohttp session is not initialized"
         try:
             timeout = aiohttp.ClientTimeout(total=15)
-            async with self.session.get(url, headers=headers, timeout=timeout) as resp:
-                resp_headers = dict(resp.headers)
-                if resp.status == 304:
-                    # Not Modified - return None data but headers
-                    return None, resp_headers
-                if resp.status == 429:
-                    retry_after = int(resp.headers.get("Retry-After", "5"))
-                    logger.warning(f"HTTP 429, sleeping {retry_after}s for {url}")
-                    await asyncio.sleep(retry_after)
-                    return None, {}
-                if resp.status >= 400:
-                    body = await resp.text()
-                    logger.error({"event":"http_error","url":url,"status":resp.status,"body":body[:300]})
-                    return None, {}
+            async with self._rate_limit_context():
+                async with self.session.get(url, headers=headers, timeout=timeout) as resp:
+                    resp_headers = dict(resp.headers)
+                    if resp.status == 304:
+                        # Not Modified - return None data but headers
+                        return None, resp_headers
+                    if resp.status == 429:
+                        retry_after = int(resp.headers.get("Retry-After", "5"))
+                        logger.warning(f"HTTP 429, sleeping {retry_after}s for {url}")
+                        self._record_rate_limit_429()
+                        await asyncio.sleep(min(retry_after, self._rate_timeout))
+                        return None, {}
+                    if resp.status >= 400:
+                        body = await resp.text()
+                        logger.error({"event":"http_error","url":url,"status":resp.status,"body":body[:300]})
+                        return None, {}
                 try:
                     json_data = await resp.json()
                     return json_data, resp_headers
@@ -463,20 +484,35 @@ class HttpClient:
         assert self.session is not None, "aiohttp session is not initialized"
         try:
             timeout = aiohttp.ClientTimeout(total=15)
-            async with self.session.get(url, headers=headers, timeout=timeout) as resp:
-                if resp.status == 429:
-                    retry_after = int(resp.headers.get("Retry-After", "5"))
-                    logger.warning(f"HTTP 429, sleeping {retry_after}s for {url}")
-                    await asyncio.sleep(retry_after)
-                    return None
-                if resp.status >= 400:
-                    body = await resp.text()
-                    logger.error({"event":"http_error","url":url,"status":resp.status,"body":body[:300]})
-                    return None
+            async with self._rate_limit_context():
+                async with self.session.get(url, headers=headers, timeout=timeout) as resp:
+                    if resp.status == 429:
+                        retry_after = int(resp.headers.get("Retry-After", "5"))
+                        logger.warning(f"HTTP 429, sleeping {retry_after}s for {url}")
+                        self._record_rate_limit_429()
+                        await asyncio.sleep(min(retry_after, self._rate_timeout))
+                        return None
+                    if resp.status >= 400:
+                        body = await resp.text()
+                        logger.error({"event":"http_error","url":url,"status":resp.status,"body":body[:300]})
+                        return None
                 return await resp.json()
         except Exception as e:
             logger.warning(f"HTTP error for {url}: {e}")
             return None
+
+    def _rate_limit_context(self):
+        if self._rate_limit_enabled:
+            return self._streaming_bus.rate_limit(self._rate_domain, timeout=self._rate_timeout)
+        return _AsyncNullContext()
+
+    def _record_rate_limit_429(self) -> None:
+        if not self._rate_limit_enabled:
+            return
+        try:
+            self._streaming_bus.record_rate_limit_429(self._rate_domain)
+        except Exception as exc:
+            logger.debug(f"Failed to record rate limit 429 for domain {self._rate_domain}: {exc}")
 
 # =============================
 # MAIN EVENTS COLLECTOR AGENT
@@ -863,9 +899,11 @@ class EventsCollectorAgent:
         except Exception as e:
             logger.error(f"Events Collector: Error in control message consumption: {e}")
             # Use the system circuit breaker to record failure
-            await self.streaming_bus.system_circuit_breaker.record_component_failure(
+            await self.streaming_bus.record_component_failure(
                 component_id="events_collector",
-                cascade_to_dependents=False
+                cascade_failure=False,
+                reason="events_collector_control_listener_failure",
+                severity="medium"
             )
     
     def _handle_control_message_wrapper(self, topic: str, partition_key: str, 
@@ -996,7 +1034,8 @@ class EventsCollectorAgent:
                 
                 # Snapshot governance
                 snapshot_spaces = self.config.get('snapshot_spaces', [])
-                async with HttpClient() as client:
+                async with HttpClient(streaming_bus=self.streaming_bus,
+                                      rate_domain="events.snapshot") as client:
                     # Parallelize snapshot queries
                     tasks = []
                     for space in snapshot_spaces:
@@ -1168,7 +1207,8 @@ class EventsCollectorAgent:
                 # Example: Token unlocks from a hypothetical API
                 unlock_api_url = self.config.get('token_unlocks_api_url')
                 if unlock_api_url:
-                    async with HttpClient() as client:
+                    async with HttpClient(streaming_bus=self.streaming_bus,
+                                          rate_domain="events.token_unlocks") as client:
                         data = await client.get_json(unlock_api_url)
                         if data and "unlocks" in data:
                             for unlock in data["unlocks"]:
@@ -1267,7 +1307,8 @@ class EventsCollectorAgent:
                 #     exchanges.append(('kraken', 'https://status.kraken.com/api/v2/incidents.json'))
                 
                 if exchanges:
-                    async with HttpClient() as client:
+                    async with HttpClient(streaming_bus=self.streaming_bus,
+                                          rate_domain="events.exchange_status") as client:
                         # Parallelize exchange status queries
                         tasks = []
                         for exchange, url in exchanges:
@@ -1452,7 +1493,8 @@ class EventsCollectorAgent:
                 
                 repos = self.config.get('github_repos', [])  # e.g. ['ethereum/go-ethereum', 'compound-finance/compound-protocol']
                 
-                async with HttpClient() as client:
+                async with HttpClient(streaming_bus=self.streaming_bus,
+                                      rate_domain="events.github") as client:
                     # Parallelize GitHub repo queries
                     tasks = []
                     for repo in repos:

@@ -22,6 +22,7 @@ from dataclasses import dataclass
 
 # Streaming Bus Integration
 from infra.bus.streaming_bus import StreamingBus
+from infra.monitoring.prometheus_metrics import get_metrics_collector
 
 # =============================
 # SCHEMAS & DATA STRUCTURES
@@ -125,6 +126,12 @@ class OptionsVenueAdapter(ABC):
         self.session: Optional[aiohttp.ClientSession] = None
         self.logger = logging.getLogger(f"{__name__}.{venue}")
         self.supports_cursor = False  # Default: no cursor support
+        self.streaming_bus: Optional[StreamingBus] = None
+        self.rate_budget_domain: Optional[str] = None
+        self.rate_budget_timeout: float = float(config.get("rate_budget_timeout_sec", 5.0))
+        self._rate_limit_metrics: Optional[Dict[str, Any]] = None
+        self._rate_limit_enabled = False
+        self._component_id: Optional[str] = venue
     async def start(self):
         """Enhanced session initialization for options data collection."""
         # Production-grade connector for options data
@@ -174,6 +181,52 @@ class OptionsVenueAdapter(ABC):
             finally:
                 self.session = None
 
+    def configure_rate_limit(self, streaming_bus: StreamingBus, domain: str,
+                             timeout_sec: float, metrics: Dict[str, Any],
+                             component_id: Optional[str] = None) -> None:
+        """Configure shared rate budget integration."""
+        self.streaming_bus = streaming_bus
+        self.rate_budget_domain = domain
+        self.rate_budget_timeout = float(timeout_sec)
+        self._rate_limit_metrics = metrics
+        self._rate_limit_enabled = True
+        self._component_id = component_id or domain
+
+    def _record_rate_limit_response(self) -> None:
+        if self.streaming_bus and self.rate_budget_domain:
+            try:
+                self.streaming_bus.record_rate_limit_429(self.rate_budget_domain)
+            except Exception as exc:
+                self.logger.warning(f"Failed to record rate limit response for {self.venue}: {exc}")
+        if isinstance(self._rate_limit_metrics, dict):
+            domain = self.rate_budget_domain or self.venue
+            responses = self._rate_limit_metrics.setdefault('rate_limit_responses', {})
+            responses[domain] = responses.get(domain, 0) + 1
+        self._publish_rate_metrics()
+
+    def _record_rate_budget_timeout(self) -> None:
+        if isinstance(self._rate_limit_metrics, dict):
+            domain = self.rate_budget_domain or self.venue
+            timeouts = self._rate_limit_metrics.setdefault('rate_budget_timeouts', {})
+            timeouts[domain] = timeouts.get(domain, 0) + 1
+        self._publish_rate_metrics()
+
+    def _publish_rate_metrics(self) -> None:
+        if not self._rate_limit_metrics:
+            return
+        try:
+            collector = get_metrics_collector()
+            collector.record_rate_limit_counters(
+                self._component_id or self.venue,
+                {
+                    "rate_limit_responses": self._rate_limit_metrics.get('rate_limit_responses', {}),
+                    "rate_budget_timeouts": self._rate_limit_metrics.get('rate_budget_timeouts', {})
+                }
+            )
+        except Exception as exc:
+            self.logger.debug(f"Failed to publish rate metrics for {self.venue}: {exc}")
+
+
     async def health_check(self) -> Dict[str, Any]:
         """Health check specific to options data collection."""
         return {
@@ -199,111 +252,118 @@ class DeribitOptionsAdapter(OptionsVenueAdapter):
         url = f"{self.BASE_URL}/public/get_book_summary_by_currency"
         params = {"currency": symbol, "kind": "option"}
         timeout = aiohttp.ClientTimeout(total=self.config.get("request_timeout", 7))
-        try:
-            async with self.session.get(url, params=params, timeout=timeout) as resp:
-                # Explicit status handling
-                if resp.status in (429, 418):
-                    retry_after = resp.headers.get("Retry-After")
-                    if retry_after:
-                        await asyncio.sleep(float(retry_after))
-                    else:
-                        await asyncio.sleep(1 + 2 * random.random())
-                    return []
-                elif not (200 <= resp.status < 300):
-                    # Log status and body, don't try to parse as JSON; truncate to 300 chars
-                    body = await resp.text()
-                    self.logger.error({"event": "surface_http_error", "status": resp.status, "body": body[:300]})
-                    return []
-                # Optionally soft-throttle if venue weight header present and config says to check
-                if self.config.get("check_weight_header", False):
-                    weight = resp.headers.get("X-Request-Weight")
-                    try:
-                        weight_val = int(weight) if weight is not None else 0
-                    except Exception:
-                        weight_val = 0
-                    if weight_val > self.config.get("weight_cap", 100):
-                        await asyncio.sleep(1)
-                try:
-                    data = await resp.json()
-                except Exception:
-                    body = await resp.text()
-                    self.logger.error({"event": "json_parse_error", "body": body[:500]})
-                    return []
-                now_us = int(time.time() * 1_000_000)
-                surface = []
-                drop_expired = self.config.get("drop_expired", False)
-                now_ts = int(time.time() * 1_000_000)
-                for o in data.get("result", []):
-                    try:
-                        instr_name = o.get("instrument_name", "")
-                        instr = instr_name.split("-")
-                        if len(instr) != 4:
-                            raise ValueError("Malformed instrument_name")
-                        # Expiry parsing must be UTC
-                        expiry = int(datetime.strptime(instr[1], "%d%b%y").replace(tzinfo=timezone.utc).timestamp() * 1_000_000)
-                        if drop_expired and expiry < now_ts:
-                            continue
-                        strike = Decimal(instr[2])
-                        # Option type case-hardening
-                        opt_type = instr[3].upper()
-                        if opt_type == "C":
-                            option_type = OptionType.CALL
-                        elif opt_type == "P":
-                            option_type = OptionType.PUT
+        async def _perform_request() -> List[OptionSurfacePoint]:
+            try:
+                if self.session is None:
+                    raise RuntimeError("aiohttp ClientSession is not initialized. Call 'start()' before making requests.")
+                async with self.session.get(url, params=params, timeout=timeout) as resp:
+                    # Explicit status handling
+                    if resp.status in (429, 418):
+                        self._record_rate_limit_response()
+                        retry_after = resp.headers.get("Retry-After")
+                        if retry_after:
+                            await asyncio.sleep(float(retry_after))
                         else:
-                            raise ValueError(f"Unknown option type: {instr[3]}")
-                        # Deribit creation_timestamp is ms, convert to us
-                        venue_ts = int(o["creation_timestamp"]) * 1000 if "creation_timestamp" in o else None
-                        # Use explicit is not None for all numeric fields, with underlying fallback
-                        def dec_field(field, fallback=None):
-                            v = o.get(field)
-                            if v is not None:
-                                return Decimal(str(v))
-                            if fallback is not None:
-                                v2 = o.get(fallback)
-                                return Decimal(str(v2)) if v2 is not None else None
-                            return None
-                        # IV normalization: prefer iv, else mark_iv, bid_iv, ask_iv
-                        iv_val = o.get("iv")
-                        if iv_val is None:
-                            for alt_iv in ("mark_iv", "bid_iv", "ask_iv"):
-                                iv_val = o.get(alt_iv)
-                                if iv_val is not None:
-                                    break
-                        iv = Decimal(str(iv_val)) if iv_val is not None else None
-                        # Underlying price fallback: use index_price if underlying_price missing
-                        underlying_price = dec_field("underlying_price", fallback="index_price")
-                        pt = OptionSurfacePoint(
-                            symbol,
-                            "deribit",
-                            now_us,
-                            expiry,
-                            strike,
-                            option_type,
-                            iv,
-                            dec_field("delta"),
-                            dec_field("gamma"),
-                            dec_field("vega"),
-                            dec_field("theta"),
-                            dec_field("rho"),
-                            dec_field("mark_price"),
-                            underlying_price,
-                            dec_field("volume"),
-                            dec_field("open_interest"),
-                            venue_ts
-                        )
-                        # For this endpoint, ignore since (creation_timestamp is not an event time)
-                        surface.append(pt)
-                    except Exception as ex:
-                        # Only log instrument_name and error, not full row
-                        self.logger.error({"event": "instrument_parse_error", "instrument_name": o.get("instrument_name", ""), "error": str(ex)})
-                        continue
-                return surface
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            self.logger.error({"event": "fetch_surface_error", "error": str(e)})
-            return []
+                            await asyncio.sleep(1 + 2 * random.random())
+                        return []
+                    elif not (200 <= resp.status < 300):
+                        body = await resp.text()
+                        self.logger.error({"event": "surface_http_error", "status": resp.status, "body": body[:300]})
+                        return []
+                    if self.config.get("check_weight_header", False):
+                        weight = resp.headers.get("X-Request-Weight")
+                        try:
+                            weight_val = int(weight) if weight is not None else 0
+                        except Exception:
+                            weight_val = 0
+                        if weight_val > self.config.get("weight_cap", 100):
+                            await asyncio.sleep(1)
+                    try:
+                        data = await resp.json()
+                    except Exception:
+                        body = await resp.text()
+                        self.logger.error({"event": "json_parse_error", "body": body[:500]})
+                        return []
+                    now_us = int(time.time() * 1_000_000)
+                    surface = []
+                    drop_expired = self.config.get("drop_expired", False)
+
+                    now_ts = int(time.time() * 1_000_000)
+                    for o in data.get("result", []):
+                        try:
+                            instr_name = o.get("instrument_name", "")
+                            instr = instr_name.split("-")
+                            if len(instr) != 4:
+                                raise ValueError("Malformed instrument_name")
+                            expiry = int(datetime.strptime(instr[1], "%d%b%y").replace(tzinfo=timezone.utc).timestamp() * 1_000_000)
+                            if drop_expired and expiry < now_ts:
+                                continue
+                            strike = Decimal(instr[2])
+                            opt_type = instr[3].upper()
+                            if opt_type == "C":
+                                option_type = OptionType.CALL
+                            elif opt_type == "P":
+                                option_type = OptionType.PUT
+                            else:
+                                raise ValueError(f"Unknown option type: {instr[3]}")
+                            venue_ts = int(o["creation_timestamp"]) * 1000 if "creation_timestamp" in o else None
+
+                            def dec_field(field, fallback=None):
+                                v = o.get(field)
+                                if v is not None:
+                                    return Decimal(str(v))
+                                if fallback is not None:
+                                    v2 = o.get(fallback)
+                                    return Decimal(str(v2)) if v2 is not None else None
+                                return None
+
+                            iv_val = o.get("iv")
+                            if iv_val is None:
+                                for alt_iv in ("mark_iv", "bid_iv", "ask_iv"):
+                                    iv_val = o.get(alt_iv)
+                                    if iv_val is not None:
+                                        break
+                            iv = Decimal(str(iv_val)) if iv_val is not None else None
+                            underlying_price = dec_field("underlying_price", fallback="index_price")
+                            pt = OptionSurfacePoint(
+                                symbol,
+                                "deribit",
+                                now_us,
+                                expiry,
+                                strike,
+                                option_type,
+                                iv,
+                                dec_field("delta"),
+                                dec_field("gamma"),
+                                dec_field("vega"),
+                                dec_field("theta"),
+                                dec_field("rho"),
+                                dec_field("mark_price"),
+                                underlying_price,
+                                dec_field("volume"),
+                                dec_field("open_interest"),
+                                venue_ts
+                            )
+                            surface.append(pt)
+                        except Exception as ex:
+                            self.logger.error({"event": "instrument_parse_error", "instrument_name": o.get("instrument_name", ""), "error": str(ex)})
+                            continue
+                    return surface
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self.logger.error({"event": "fetch_surface_error", "error": str(e)})
+                return []
+
+        if self._rate_limit_enabled and self.streaming_bus and self.rate_budget_domain:
+            try:
+                async with self.streaming_bus.rate_limit(self.rate_budget_domain, timeout=self.rate_budget_timeout):
+                    return await _perform_request()
+            except asyncio.TimeoutError:
+                self._record_rate_budget_timeout()
+                self.logger.warning(f"Rate budget timeout for {self.venue} while fetching {symbol} surface")
+                return []
+        return await _perform_request()
 
 class OKXOptionsAdapter(OptionsVenueAdapter):
     BASE_URL = "https://www.okx.com/api/v5"
@@ -323,155 +383,155 @@ class OKXOptionsAdapter(OptionsVenueAdapter):
         url = f"{self.BASE_URL}/public/opt-summary"
         params = {"uly": okx_symbol}
         timeout = aiohttp.ClientTimeout(total=self.config.get("request_timeout", 7))
-        
-        try:
-            async with self.session.get(url, params=params, timeout=timeout) as resp:
-                # Handle rate limiting
-                if resp.status in (429, 418):
-                    retry_after = resp.headers.get("Retry-After")
-                    if retry_after:
-                        await asyncio.sleep(float(retry_after))
-                    else:
-                        await asyncio.sleep(1 + 2 * random.random())
-                    return []
-                elif not (200 <= resp.status < 300):
-                    body = await resp.text()
-                    self.logger.error({"event": "surface_http_error", "status": resp.status, "body": body[:300]})
-                    return []
-                    
-                # Handle response weight throttling
-                if self.config.get("check_weight_header", False):
-                    weight = resp.headers.get("X-Request-Weight")
-                    try:
-                        weight_val = int(weight) if weight is not None else 0
-                    except Exception:
-                        weight_val = 0
-                    if weight_val > self.config.get("weight_cap", 100):
-                        await asyncio.sleep(1)
-                        
-                try:
-                    data = await resp.json()
-                except Exception:
-                    body = await resp.text()
-                    self.logger.error({"event": "json_parse_error", "body": body[:500]})
-                    return []
-                    
-                # Check OKX response format
-                if data.get("code") != "0":
-                    self.logger.error({"event": "okx_api_error", "code": data.get("code"), "msg": data.get("msg")})
-                    return []
-                    
-                now_us = int(time.time() * 1_000_000)
-                surface = []
-                drop_expired = self.config.get("drop_expired", False)
-                now_ts = int(time.time() * 1_000_000)
-                
-                for option in data.get("data", []):
-                    try:
-                        # Parse OKX instrument name: BTC-USD-241025-70000-C
-                        inst_id = option.get("instId", "")
-                        parts = inst_id.split("-")
-                        if len(parts) != 5:
-                            self.logger.warning(f"Malformed OKX instrument ID: {inst_id}")
-                            continue
-                            
-                        # Extract expiry from instrument name (YYMMDD format)
-                        expiry_str = parts[2]  # e.g., "241025"
-                        try:
-                            # Convert YYMMDD to datetime
-                            expiry_dt = datetime.strptime(f"20{expiry_str}", "%Y%m%d").replace(
-                                hour=8, minute=0, second=0, tzinfo=timezone.utc  # OKX options expire at 08:00 UTC
-                            )
-                            expiry_us = int(expiry_dt.timestamp() * 1_000_000)
-                        except ValueError:
-                            self.logger.warning(f"Invalid expiry date in {inst_id}: {expiry_str}")
-                            continue
-                            
-                        if drop_expired and expiry_us < now_ts:
-                            continue
-                            
-                        # Extract strike price
-                        try:
-                            strike = Decimal(parts[3])
-                        except (ValueError, IndexError):
-                            self.logger.warning(f"Invalid strike in {inst_id}: {parts[3] if len(parts) > 3 else 'missing'}")
-                            continue
-                            
-                        # Extract option type
-                        option_type_str = parts[4].upper()
-                        if option_type_str == "C":
-                            option_type = OptionType.CALL
-                        elif option_type_str == "P":
-                            option_type = OptionType.PUT
+
+        async def _perform_request() -> List[OptionSurfacePoint]:
+            try:
+                async with self.session.get(url, params=params, timeout=timeout) as resp:
+                    if resp.status in (429, 418):
+                        self._record_rate_limit_response()
+                        retry_after = resp.headers.get("Retry-After")
+                        if retry_after:
+                            await asyncio.sleep(float(retry_after))
                         else:
-                            self.logger.warning(f"Unknown option type in {inst_id}: {option_type_str}")
-                            continue
-                            
-                        # Helper function to safely convert to Decimal
-                        def safe_decimal(value, field_name=""):
-                            if value is None or value == "":
-                                return None
+                            await asyncio.sleep(1 + 2 * random.random())
+                        return []
+                    elif not (200 <= resp.status < 300):
+                        body = await resp.text()
+                        self.logger.error({"event": "surface_http_error", "status": resp.status, "body": body[:300]})
+                        return []
+
+                    if self.config.get("check_weight_header", False):
+                        weight = resp.headers.get("X-Request-Weight")
+                        try:
+                            weight_val = int(weight) if weight is not None else 0
+                        except Exception:
+                            weight_val = 0
+                        if weight_val > self.config.get("weight_cap", 100):
+                            await asyncio.sleep(1)
+
+                    try:
+                        data = await resp.json()
+                    except Exception:
+                        body = await resp.text()
+                        self.logger.error({"event": "json_parse_error", "body": body[:500]})
+                        return []
+
+                    if data.get("code") != "0":
+                        self.logger.error({"event": "okx_api_error", "code": data.get("code"), "msg": data.get("msg")})
+                        return []
+
+                    now_us = int(time.time() * 1_000_000)
+                    surface = []
+                    drop_expired = self.config.get("drop_expired", False)
+                    now_ts = int(time.time() * 1_000_000)
+
+                    for option in data.get("data", []):
+                        try:
+                            inst_id = option.get("instId", "")
+                            parts = inst_id.split("-")
+                            if len(parts) != 5:
+                                self.logger.warning(f"Malformed OKX instrument ID: {inst_id}")
+                                continue
+
+                            expiry_str = parts[2]
                             try:
-                                return Decimal(str(value))
-                            except (ValueError, TypeError):
-                                if field_name:
-                                    self.logger.warning(f"Invalid {field_name} value: {value}")
-                                return None
-                                
-                        # Extract option Greeks and pricing data
-                        iv = safe_decimal(option.get("iv"), "iv")
-                        delta = safe_decimal(option.get("delta"), "delta")
-                        gamma = safe_decimal(option.get("gamma"), "gamma")
-                        vega = safe_decimal(option.get("vega"), "vega") 
-                        theta = safe_decimal(option.get("theta"), "theta")
-                        rho = None  # OKX doesn't provide rho
-                        
-                        mark_price = safe_decimal(option.get("markPx"), "markPx")
-                        underlying_price = safe_decimal(option.get("uly"), "underlying")
-                        volume = safe_decimal(option.get("vol24h"), "volume")
-                        open_interest = safe_decimal(option.get("oi"), "open_interest")
-                        
-                        # OKX timestamps are in milliseconds
-                        venue_timestamp_ms = option.get("ts")
-                        venue_timestamp_us = int(venue_timestamp_ms) * 1000 if venue_timestamp_ms else None
-                        
-                        point = OptionSurfacePoint(
-                            symbol=symbol,
-                            venue="okx",
-                            timestamp_utc_us=now_us,
-                            expiry=expiry_us,
-                            strike=strike,
-                            option_type=option_type,
-                            iv=iv,
-                            delta=delta,
-                            gamma=gamma,
-                            vega=vega,
-                            theta=theta,
-                            rho=rho,
-                            mark_price=mark_price,
-                            underlying_price=underlying_price,
-                            volume=volume,
-                            open_interest=open_interest,
-                            venue_timestamp_utc_us=venue_timestamp_us
-                        )
-                        
-                        surface.append(point)
-                        
-                    except Exception as ex:
-                        self.logger.error({
-                            "event": "instrument_parse_error", 
-                            "instrument_id": option.get("instId", ""), 
-                            "error": str(ex)
-                        })
-                        continue
-                        
-                return surface
-                
-        except asyncio.CancelledError:
-            raise
-        except Exception as e:
-            self.logger.error({"event": "fetch_surface_error", "error": str(e)})
-            return []
+                                expiry_dt = datetime.strptime(f"20{expiry_str}", "%Y%m%d").replace(
+                                    hour=8, minute=0, second=0, tzinfo=timezone.utc
+                                )
+                                expiry_us = int(expiry_dt.timestamp() * 1_000_000)
+                            except ValueError:
+                                self.logger.warning(f"Invalid expiry date in {inst_id}: {expiry_str}")
+                                continue
+
+                            if drop_expired and expiry_us < now_ts:
+                                continue
+
+                            try:
+                                strike = Decimal(parts[3])
+                            except (ValueError, IndexError):
+                                self.logger.warning(f"Invalid strike in {inst_id}: {parts[3] if len(parts) > 3 else 'missing'}")
+                                continue
+
+                            option_type_str = parts[4].upper()
+                            if option_type_str == "C":
+                                option_type = OptionType.CALL
+                            elif option_type_str == "P":
+                                option_type = OptionType.PUT
+                            else:
+                                self.logger.warning(f"Unknown option type in {inst_id}: {option_type_str}")
+                                continue
+
+                            def safe_decimal(value, field_name=""):
+                                if value is None or value == "":
+                                    return None
+                                try:
+                                    return Decimal(str(value))
+                                except (ValueError, TypeError):
+                                    if field_name:
+                                        self.logger.warning(f"Invalid {field_name} value: {value}")
+                                    return None
+
+                            iv = safe_decimal(option.get("iv"), "iv")
+                            delta = safe_decimal(option.get("delta"), "delta")
+                            gamma = safe_decimal(option.get("gamma"), "gamma")
+                            vega = safe_decimal(option.get("vega"), "vega")
+                            theta = safe_decimal(option.get("theta"), "theta")
+                            rho = None
+
+                            mark_price = safe_decimal(option.get("markPx"), "markPx")
+                            underlying_price = safe_decimal(option.get("uly"), "underlying")
+                            volume = safe_decimal(option.get("vol24h"), "volume")
+                            open_interest = safe_decimal(option.get("oi"), "open_interest")
+
+                            venue_timestamp_ms = option.get("ts")
+                            venue_timestamp_us = int(venue_timestamp_ms) * 1000 if venue_timestamp_ms else None
+
+                            point = OptionSurfacePoint(
+                                symbol=symbol,
+                                venue="okx",
+                                timestamp_utc_us=now_us,
+                                expiry=expiry_us,
+                                strike=strike,
+                                option_type=option_type,
+                                iv=iv,
+                                delta=delta,
+                                gamma=gamma,
+                                vega=vega,
+                                theta=theta,
+                                rho=rho,
+                                mark_price=mark_price,
+                                underlying_price=underlying_price,
+                                volume=volume,
+                                open_interest=open_interest,
+                                venue_timestamp_utc_us=venue_timestamp_us
+                            )
+
+                            surface.append(point)
+
+                        except Exception as ex:
+                            self.logger.error({
+                                "event": "instrument_parse_error",
+                                "instrument_id": option.get("instId", ""),
+                                "error": str(ex)
+                            })
+                            continue
+
+                    return surface
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                self.logger.error({"event": "fetch_surface_error", "error": str(e)})
+                return []
+
+        if self._rate_limit_enabled and self.streaming_bus and self.rate_budget_domain:
+            try:
+                async with self.streaming_bus.rate_limit(self.rate_budget_domain, timeout=self.rate_budget_timeout):
+                    return await _perform_request()
+            except asyncio.TimeoutError:
+                self._record_rate_budget_timeout()
+                self.logger.warning(f"Rate budget timeout for {self.venue} while fetching {symbol} surface")
+                return []
+        return await _perform_request()
 
 # =============================
 # MAIN AGENT
@@ -515,7 +575,9 @@ class OptionsChainCollectorAgent:
             'strike_range_coverage': 0.0,
             'time_to_expiry_coverage': 0.0,
             'duplicate_rate': 0.0,
-            'health_check_failures': 0
+            'health_check_failures': 0,
+            'rate_limit_responses': {},
+            'rate_budget_timeouts': {}
         }
         
         # Component identification for circuit breaker
@@ -531,6 +593,8 @@ class OptionsChainCollectorAgent:
             "enable_sasl": False
         })
         self.streaming_bus = StreamingBus(streaming_config)
+        self.rate_budget_domains: Dict[str, str] = self.config.get("rate_budget_domains", {})
+        self.rate_budget_timeout = float(self.config.get("rate_budget_timeout_sec", 5.0))
         
         # Circuit breaker configuration with options-specific tuning
         base_threshold = self.config.get("circuit_breaker_failure_threshold", 3)
@@ -650,16 +714,18 @@ class OptionsChainCollectorAgent:
                 
                 if not is_healthy:
                     self.logger.warning("Options Chain Collector health check failed")
-                    if hasattr(self.streaming_bus, 'system_circuit_breaker'):
-                        await self.streaming_bus.system_circuit_breaker.record_component_failure(
-                            component_id=self.component_id,
-                            cascade_to_dependents=False
-                        )
+                    await self.streaming_bus.record_component_failure(
+                        component_id=self.component_id,
+                        cascade_failure=False,
+                        reason="options_chain_collector_health_check_failed",
+                        severity="high"
+                    )
                 else:
-                    if hasattr(self.streaming_bus, 'system_circuit_breaker'):
-                        await self.streaming_bus.system_circuit_breaker.record_component_success(
-                            component_id=self.component_id
-                        )
+                    await self.streaming_bus.record_component_success(
+                        component_id=self.component_id,
+                        reason="options_chain_collector_health_restored",
+                        severity="low"
+                    )
                 
                 await asyncio.sleep(self._health_check_interval)
                 
@@ -724,23 +790,47 @@ class OptionsChainCollectorAgent:
             for venue_cfg in venues_config:
                 venue = venue_cfg.get("name")
                 if venue == "deribit":
-                    self.adapters[venue] = DeribitOptionsAdapter(venue, venue_cfg)
+                    adapter = DeribitOptionsAdapter(venue, venue_cfg)
                 elif venue == "okx":
-                    self.adapters[venue] = OKXOptionsAdapter(venue, venue_cfg)
+                    adapter = OKXOptionsAdapter(venue, venue_cfg)
                 # Add more venues here
+                else:
+                    continue
+                domain = self.rate_budget_domains.get(venue, f"options.{venue}")
+                adapter.configure_rate_limit(
+                    self.streaming_bus,
+                    domain,
+                    self.rate_budget_timeout,
+                    self.integration_metrics,
+                    component_id=self.component_id
+                )
+                self.adapters[venue] = adapter
         elif isinstance(venues_config, dict):
             # Dict format: {"deribit": {...}, "okx": {...}}
             for venue, venue_cfg in venues_config.items():
                 if venue == "deribit":
-                    self.adapters[venue] = DeribitOptionsAdapter(venue, venue_cfg)
+                    adapter = DeribitOptionsAdapter(venue, venue_cfg)
                 elif venue == "okx":
-                    self.adapters[venue] = OKXOptionsAdapter(venue, venue_cfg)
+                    adapter = OKXOptionsAdapter(venue, venue_cfg)
                 # Add more venues here
+                else:
+                    continue
+                domain = self.rate_budget_domains.get(venue, f"options.{venue}")
+                adapter.configure_rate_limit(
+                    self.streaming_bus,
+                    domain,
+                    self.rate_budget_timeout,
+                    self.integration_metrics,
+                    component_id=self.component_id
+                )
+                self.adapters[venue] = adapter
     async def start(self):
         self.running = True
         
         # Register circuit breaker
         await self._register_circuit_breaker()
+
+        await self.streaming_bus.ensure_rate_budget_listener()
         
         # Start health monitoring
         if self._health_check_task is None:
@@ -799,9 +889,11 @@ class OptionsChainCollectorAgent:
         except Exception as e:
             self.logger.error(f"Options Chain Collector: Error in control message consumption: {e}")
             # Use the system circuit breaker to record failure
-            await self.streaming_bus.system_circuit_breaker.record_component_failure(
+            await self.streaming_bus.record_component_failure(
                 component_id=self.component_id,
-                cascade_to_dependents=False
+                cascade_failure=False,
+                reason="options_chain_collector_control_listener_failure",
+                severity="medium"
             )
     
     def _handle_control_message_wrapper(self, topic: str, partition_key: str, 
@@ -962,8 +1054,11 @@ class OptionsChainCollectorAgent:
                 quality_failures_this_batch = 0
                 
                 # Track successful data fetch
-                if hasattr(self.streaming_bus, 'system_circuit_breaker'):
-                    await self.streaming_bus.system_circuit_breaker.record_component_success(self.component_id)
+                await self.streaming_bus.record_component_success(
+                    component_id=self.component_id,
+                    reason="options_chain_collector_fetch_success",
+                    severity="low"
+                )
                 
                 for pt in surface:
                     # Validate options data quality before processing
@@ -1118,10 +1213,12 @@ class OptionsChainCollectorAgent:
                 self.integration_metrics['venue_api_errors'] += 1
                 self.logger.error({"event": "surface_collect_error", "venue": venue, "symbol": symbol, "error": str(e)})
                 # Record circuit breaker failure
-                if hasattr(self.streaming_bus, 'system_circuit_breaker'):
-                    await self.streaming_bus.system_circuit_breaker.record_component_failure(self.component_id)
-                elif hasattr(self.streaming_bus, 'record_component_failure'):
-                    await self.streaming_bus.record_component_failure(self.component_id)
+                await self.streaming_bus.record_component_failure(
+                    component_id=self.component_id,
+                    cascade_failure=False,
+                    reason="options_chain_surface_collection_failure",
+                    severity="high"
+                )
                 
             next_ts += interval
             await asyncio.sleep(max(0, next_ts - time.monotonic()))
@@ -1208,6 +1305,11 @@ async def main():
             {"name": "okx"}
         ],
         "symbols": ["BTC", "ETH"],
+        "rate_budget_domains": {
+            "deribit": "options.deribit",
+            "okx": "options.okx"
+        },
+        "rate_budget_timeout_sec": 5.0,
         "surface_interval_sec": 30
     }
     logging.basicConfig(level=logging.INFO)

@@ -17,6 +17,7 @@ import re
 from datetime import datetime, timezone
 import difflib
 import hashlib
+import statistics
 
 # Streaming Bus Integration
 from infra.bus.streaming_bus import StreamingBus
@@ -527,6 +528,190 @@ class SchemaValidatorAgent:
         return (dt.weekday() < 5 and  # Monday = 0, Friday = 4
                 9 <= dt.hour < 17)  # 9 AM to 5 PM
     
+    def _validate_temporal_consistency(self, timestamp_us: int, table_name: str, field_name: str) -> List[SchemaViolation]:
+        """
+        Enterprise-grade temporal consistency validation.
+        
+        Validates:
+        - Clock drift detection
+        - Sequence ordering validation
+        - Weekend/holiday filtering
+        - Time zone consistency
+        - Temporal gaps detection
+        - Future timestamp prevention
+        """
+        violations = []
+        
+        # Convert to datetime for analysis
+        try:
+            dt = datetime.fromtimestamp(timestamp_us / 1_000_000, tz=timezone.utc)
+        except (ValueError, OSError, OverflowError) as e:
+            violations.append(SchemaViolation(
+                table_name=table_name,
+                field_name=field_name,
+                violation_type="invalid_timestamp_conversion",
+                expected="valid timestamp that can be converted to datetime",
+                actual=f"timestamp {timestamp_us} caused error: {str(e)}",
+                row_identifier="temporal_validation",
+                severity="error"
+            ))
+            return violations
+        
+        # 1. Future timestamp prevention (allow small buffer for clock skew)
+        current_time_us = int(time.time() * 1_000_000)
+        max_future_buffer_us = 300_000_000  # 5 minutes buffer for clock skew
+        
+        if timestamp_us > current_time_us + max_future_buffer_us:
+            future_seconds = (timestamp_us - current_time_us) / 1_000_000
+            violations.append(SchemaViolation(
+                table_name=table_name,
+                field_name=field_name,
+                violation_type="future_timestamp_violation",
+                expected=f"timestamp within {max_future_buffer_us/1_000_000:.1f}s of current time",
+                actual=f"timestamp {future_seconds:.1f}s in the future",
+                row_identifier="temporal_validation",
+                severity="error"
+            ))
+        
+        # 2. Clock drift detection (track per table/field)
+        drift_key = f"{table_name}.{field_name}"
+        if not hasattr(self, '_temporal_drift_tracker'):
+            self._temporal_drift_tracker = {}
+            self._temporal_sequence_tracker = {}
+        
+        if drift_key not in self._temporal_drift_tracker:
+            self._temporal_drift_tracker[drift_key] = {
+                'last_timestamp': timestamp_us,
+                'drift_samples': [],
+                'max_samples': 100
+            }
+        else:
+            tracker = self._temporal_drift_tracker[drift_key]
+            time_diff = timestamp_us - tracker['last_timestamp']
+            
+            # Track drift samples (time differences)
+            tracker['drift_samples'].append(time_diff)
+            if len(tracker['drift_samples']) > tracker['max_samples']:
+                tracker['drift_samples'].pop(0)
+            
+            # Detect abnormal clock drift (sudden jumps > 1 hour)
+            if abs(time_diff) > 3600_000_000:  # 1 hour in microseconds
+                violations.append(SchemaViolation(
+                    table_name=table_name,
+                    field_name=field_name,
+                    violation_type="clock_drift_violation",
+                    expected="timestamp progression within reasonable bounds",
+                    actual=f"timestamp jumped by {time_diff/1_000_000:.1f}s",
+                    row_identifier="temporal_validation",
+                    severity="warning"
+                ))
+            
+            # Detect backwards time (strict ordering violation)
+            if time_diff < -60_000_000:  # Allow 1 minute tolerance for minor reordering
+                violations.append(SchemaViolation(
+                    table_name=table_name,
+                    field_name=field_name,
+                    violation_type="temporal_ordering_violation",
+                    expected="timestamps in non-decreasing order (±1min tolerance)",
+                    actual=f"timestamp went backwards by {abs(time_diff)/1_000_000:.1f}s",
+                    row_identifier="temporal_validation",
+                    severity="error"
+                ))
+            
+            tracker['last_timestamp'] = timestamp_us
+        
+        # 3. Sequence gap detection (for high-frequency data)
+        seq_key = f"{table_name}.{field_name}"
+        if seq_key not in self._temporal_sequence_tracker:
+            self._temporal_sequence_tracker[seq_key] = {
+                'expected_interval_us': None,
+                'last_timestamp': timestamp_us,
+                'interval_samples': [],
+                'max_gap_multiplier': 5.0
+            }
+        else:
+            seq_tracker = self._temporal_sequence_tracker[seq_key]
+            interval = timestamp_us - seq_tracker['last_timestamp']
+            
+            if interval > 0:  # Only track positive intervals
+                seq_tracker['interval_samples'].append(interval)
+                if len(seq_tracker['interval_samples']) > 50:
+                    seq_tracker['interval_samples'].pop(0)
+                
+                # Estimate expected interval from recent samples
+                if len(seq_tracker['interval_samples']) >= 10:
+                    seq_tracker['expected_interval_us'] = statistics.median(seq_tracker['interval_samples'])
+                    
+                    # Detect large gaps
+                    expected = seq_tracker['expected_interval_us']
+                    if interval > expected * seq_tracker['max_gap_multiplier']:
+                        gap_ratio = interval / expected
+                        violations.append(SchemaViolation(
+                            table_name=table_name,
+                            field_name=field_name,
+                            violation_type="temporal_gap_violation",
+                            expected=f"interval ~{expected/1_000_000:.3f}s (±{seq_tracker['max_gap_multiplier']}x)",
+                            actual=f"gap of {interval/1_000_000:.3f}s ({gap_ratio:.1f}x expected)",
+                            row_identifier="temporal_validation",
+                            severity="warning"
+                        ))
+            
+            seq_tracker['last_timestamp'] = timestamp_us
+        
+        # 4. Weekend/Holiday validation for market data
+        if table_name.startswith(('market_', 'trading_', 'exchange_')):
+            # Crypto markets are 24/7, but traditional market data should not appear on weekends
+            if 'stock' in table_name.lower() or 'equity' in table_name.lower():
+                if dt.weekday() >= 5:  # Saturday = 5, Sunday = 6
+                    violations.append(SchemaViolation(
+                        table_name=table_name,
+                        field_name=field_name,
+                        violation_type="weekend_market_data_violation",
+                        expected="no traditional market data on weekends",
+                        actual=f"timestamp on {dt.strftime('%A')} ({dt.isoformat()})",
+                        row_identifier="temporal_validation",
+                        severity="warning"
+                    ))
+        
+        # 5. Timezone consistency check (all timestamps should be UTC)
+        if dt.tzinfo != timezone.utc:
+            violations.append(SchemaViolation(
+                table_name=table_name,
+                field_name=field_name,
+                violation_type="timezone_consistency_violation",
+                expected="UTC timezone",
+                actual=f"timezone: {dt.tzinfo}",
+                row_identifier="temporal_validation",
+                severity="error"
+            ))
+        
+        # 6. Reasonable timestamp bounds (not too far in past/future)
+        min_reasonable_timestamp = datetime(2020, 1, 1, tzinfo=timezone.utc).timestamp() * 1_000_000
+        max_reasonable_timestamp = datetime(2030, 1, 1, tzinfo=timezone.utc).timestamp() * 1_000_000
+        
+        if timestamp_us < min_reasonable_timestamp:
+            violations.append(SchemaViolation(
+                table_name=table_name,
+                field_name=field_name,
+                violation_type="timestamp_too_old_violation",
+                expected="timestamp after 2020-01-01",
+                actual=f"timestamp: {dt.isoformat()}",
+                row_identifier="temporal_validation",
+                severity="warning"
+            ))
+        elif timestamp_us > max_reasonable_timestamp:
+            violations.append(SchemaViolation(
+                table_name=table_name,
+                field_name=field_name,
+                violation_type="timestamp_too_future_violation",
+                expected="timestamp before 2030-01-01",
+                actual=f"timestamp: {dt.isoformat()}",
+                row_identifier="temporal_validation",
+                severity="warning"
+            ))
+        
+        return violations
+    
     def _validate_cross_field_rules(self, schema: TableSchema, row: Dict[str, Any], row_id: str) -> List[SchemaViolation]:
         """Validate cross-field rules."""
         violations = []
@@ -562,54 +747,10 @@ class SchemaValidatorAgent:
                     ))
             
             elif rule.rule_type == "temporal_ordering":
-                # Validate temporal ordering between timestamp fields
-                if len(rule.fields) >= 2:
-                    timestamps = []
-                    for field_name in rule.fields:
-                        if field_name in row and row[field_name] is not None:
-                            timestamps.append((field_name, row[field_name]))
-                    
-                    # Check if timestamps are in order
-                    for i in range(1, len(timestamps)):
-                        try:
-                            prev_timestamp = timestamps[i-1][1]
-                            curr_timestamp = timestamps[i][1]
-                            
-                            # Ensure both are comparable (same type)
-                            if type(prev_timestamp) != type(curr_timestamp):
-                                # Try to convert to same type
-                                if isinstance(prev_timestamp, str) and isinstance(curr_timestamp, (int, float)):
-                                    try:
-                                        prev_timestamp = float(prev_timestamp)
-                                    except ValueError:
-                                        continue
-                                elif isinstance(curr_timestamp, str) and isinstance(prev_timestamp, (int, float)):
-                                    try:
-                                        curr_timestamp = float(curr_timestamp)
-                                    except ValueError:
-                                        continue
-                                elif isinstance(prev_timestamp, str) and isinstance(curr_timestamp, str):
-                                    try:
-                                        prev_timestamp = float(prev_timestamp)
-                                        curr_timestamp = float(curr_timestamp)
-                                    except ValueError:
-                                        continue
-                            
-                            # Only compare if both are numeric
-                            if isinstance(prev_timestamp, (int, float)) and isinstance(curr_timestamp, (int, float)):
-                                if curr_timestamp < prev_timestamp:
-                                    violations.append(SchemaViolation(
-                                        table_name=schema.name,
-                                        field_name=f"{timestamps[i-1][0]},{timestamps[i][0]}",
-                                        violation_type="temporal_ordering_violation",
-                                        expected=f"{timestamps[i-1][0]} <= {timestamps[i][0]}",
-                                        actual=f"{prev_timestamp} > {curr_timestamp}",
-                                        row_identifier=row_id,
-                                        severity=rule.severity
-                                    ))
-                        except (TypeError, ValueError):
-                            # Skip comparison if types are incompatible
-                            continue
+                # Enhanced temporal ordering validation between timestamp fields
+                violations.extend(self._validate_cross_field_temporal_ordering(
+                    schema.name, rule, row, row_id
+                ))
             
             elif rule.rule_type == "field_relationship":
                 # Validate field relationships using custom condition
@@ -625,6 +766,285 @@ class SchemaValidatorAgent:
                     ))
         
         return violations
+    
+    def _validate_cross_field_temporal_ordering(self, table_name: str, rule: CrossFieldRule, 
+                                              row: Dict[str, Any], row_id: str) -> List[SchemaViolation]:
+        """
+        Enhanced cross-field temporal ordering validation with enterprise-grade checks.
+        
+        Validates:
+        - Strict temporal ordering between multiple timestamp fields
+        - Reasonable time gaps between sequential events
+        - Context-aware validation rules for different data types
+        - Microsecond precision handling
+        """
+        violations = []
+        
+        if len(rule.fields) < 2:
+            return violations
+        
+        # Extract and normalize timestamps
+        timestamps = []
+        for field_name in rule.fields:
+            if field_name in row and row[field_name] is not None:
+                raw_timestamp = row[field_name]
+                
+                # Normalize timestamp to microseconds (int)
+                try:
+                    if isinstance(raw_timestamp, str):
+                        # Try parsing ISO format first, then float
+                        try:
+                            dt = datetime.fromisoformat(raw_timestamp.replace('Z', '+00:00'))
+                            normalized_ts = int(dt.timestamp() * 1_000_000)
+                        except ValueError:
+                            normalized_ts = int(float(raw_timestamp) * 1_000_000)
+                    elif isinstance(raw_timestamp, (int, float)):
+                        # Assume microseconds if > 1e12, else seconds
+                        if raw_timestamp > 1e12:
+                            normalized_ts = int(raw_timestamp)
+                        else:
+                            normalized_ts = int(raw_timestamp * 1_000_000)
+                    else:
+                        continue  # Skip incompatible types
+                    
+                    timestamps.append((field_name, normalized_ts, raw_timestamp))
+                    
+                except (ValueError, TypeError, OverflowError):
+                    violations.append(SchemaViolation(
+                        table_name=table_name,
+                        field_name=field_name,
+                        violation_type="timestamp_normalization_error",
+                        expected="valid timestamp format",
+                        actual=f"could not normalize: {raw_timestamp}",
+                        row_identifier=row_id,
+                        severity="error"
+                    ))
+                    continue
+        
+        if len(timestamps) < 2:
+            return violations  # Need at least 2 timestamps to validate ordering
+        
+        # Validate temporal ordering
+        for i in range(1, len(timestamps)):
+            prev_field, prev_ts, prev_raw = timestamps[i-1]
+            curr_field, curr_ts, curr_raw = timestamps[i]
+            
+            # Basic ordering check
+            if curr_ts < prev_ts:
+                time_diff_ms = (prev_ts - curr_ts) / 1000
+                violations.append(SchemaViolation(
+                    table_name=table_name,
+                    field_name=f"{prev_field},{curr_field}",
+                    violation_type="temporal_ordering_violation",
+                    expected=f"{prev_field} <= {curr_field}",
+                    actual=f"{prev_field}({prev_ts}) > {curr_field}({curr_ts}) by {time_diff_ms:.1f}ms",
+                    row_identifier=row_id,
+                    severity=rule.severity
+                ))
+            
+            # Context-aware gap validation
+            time_gap_us = curr_ts - prev_ts
+            gap_violations = self._validate_temporal_gap_context(
+                table_name, prev_field, curr_field, time_gap_us, row_id, rule.severity
+            )
+            violations.extend(gap_violations)
+        
+        # Validate simultaneous timestamp constraints
+        simultaneous_violations = self._validate_simultaneous_timestamp_constraints(
+            table_name, timestamps, row_id, rule.severity
+        )
+        violations.extend(simultaneous_violations)
+        
+        return violations
+    
+    def _validate_temporal_gap_context(self, table_name: str, prev_field: str, curr_field: str,
+                                     gap_us: int, row_id: str, severity: str) -> List[SchemaViolation]:
+        """Validate temporal gaps based on field context and table type."""
+        violations = []
+        
+        # Define reasonable gaps for different field combinations
+        gap_constraints = {
+            # Trading/execution sequence validation
+            ('signal_timestamp', 'order_timestamp'): (0, 1_000_000),  # 0-1s
+            ('order_timestamp', 'ack_timestamp'): (0, 5_000_000),     # 0-5s
+            ('ack_timestamp', 'fill_timestamp'): (0, 30_000_000),     # 0-30s
+            ('order_timestamp', 'fill_timestamp'): (0, 60_000_000),   # 0-60s
+            
+            # Market data sequence validation
+            ('trade_timestamp', 'book_timestamp'): (-1_000_000, 1_000_000),  # ±1s
+            ('quote_timestamp', 'trade_timestamp'): (-5_000_000, 0),         # quote before trade
+            
+            # Settlement and clearing
+            ('trade_timestamp', 'settlement_timestamp'): (0, 259_200_000_000),  # 0-3 days
+            ('settlement_timestamp', 'clear_timestamp'): (0, 86_400_000_000),   # 0-1 day
+            
+            # On-chain validation
+            ('block_timestamp', 'tx_timestamp'): (-30_000_000, 30_000_000),  # ±30s block tolerance
+            ('tx_timestamp', 'confirmation_timestamp'): (0, 1800_000_000),   # 0-30min confirmation
+        }
+        
+        # Check for exact field name matches
+        field_pair = (prev_field, curr_field)
+        if field_pair in gap_constraints:
+            min_gap, max_gap = gap_constraints[field_pair]
+            
+            if gap_us < min_gap:
+                violations.append(SchemaViolation(
+                    table_name=table_name,
+                    field_name=f"{prev_field},{curr_field}",
+                    violation_type="temporal_gap_too_small",
+                    expected=f"gap >= {min_gap/1_000_000:.3f}s",
+                    actual=f"gap = {gap_us/1_000_000:.3f}s",
+                    row_identifier=row_id,
+                    severity=severity
+                ))
+            elif gap_us > max_gap:
+                violations.append(SchemaViolation(
+                    table_name=table_name,
+                    field_name=f"{prev_field},{curr_field}",
+                    violation_type="temporal_gap_too_large",
+                    expected=f"gap <= {max_gap/1_000_000:.3f}s",
+                    actual=f"gap = {gap_us/1_000_000:.3f}s",
+                    row_identifier=row_id,
+                    severity=severity
+                ))
+        
+        # Pattern-based validation for common timestamp patterns
+        elif prev_field.endswith('_timestamp') and curr_field.endswith('_timestamp'):
+            # Generic timestamp pair - check for suspiciously large gaps
+            max_reasonable_gap = 86400_000_000  # 1 day
+            
+            if gap_us > max_reasonable_gap:
+                violations.append(SchemaViolation(
+                    table_name=table_name,
+                    field_name=f"{prev_field},{curr_field}",
+                    violation_type="temporal_gap_suspicious",
+                    expected=f"reasonable gap < {max_reasonable_gap/1_000_000:.0f}s",
+                    actual=f"gap = {gap_us/1_000_000:.1f}s",
+                    row_identifier=row_id,
+                    severity="warning"
+                ))
+        
+        return violations
+    
+    def _validate_simultaneous_timestamp_constraints(self, table_name: str, timestamps: List[tuple],
+                                                   row_id: str, severity: str) -> List[SchemaViolation]:
+        """Validate constraints for timestamps that should be simultaneous or have specific relationships."""
+        violations = []
+        
+        # Check for duplicated timestamps (might indicate clock resolution issues)
+        timestamp_values = [ts for _, ts, _ in timestamps]
+        unique_timestamps = set(timestamp_values)
+        
+        if len(unique_timestamps) < len(timestamp_values):
+            # Find duplicates
+            from collections import Counter
+            counts = Counter(timestamp_values)
+            duplicates = [ts for ts, count in counts.items() if count > 1]
+            
+            duplicate_fields = []
+            for dup_ts in duplicates:
+                fields = [field for field, ts, _ in timestamps if ts == dup_ts]
+                duplicate_fields.extend(fields)
+            
+            violations.append(SchemaViolation(
+                table_name=table_name,
+                field_name=','.join(duplicate_fields),
+                violation_type="duplicate_timestamps",
+                expected="unique timestamps for different events",
+                actual=f"duplicate timestamp(s): {duplicates}",
+                row_identifier=row_id,
+                severity="warning"
+            ))
+        
+        # Check for microsecond precision consistency
+        precision_issues = []
+        for field, ts_us, raw_value in timestamps:
+            # Check if timestamp has suspicious precision (e.g., always ends in 000)
+            if ts_us % 1000 == 0:  # Millisecond precision
+                precision_issues.append((field, 'millisecond'))
+            elif ts_us % 1_000_000 == 0:  # Second precision
+                precision_issues.append((field, 'second'))
+        
+        # If we have mixed precision, warn about potential issues
+        precisions = set(precision for _, precision in precision_issues)
+        if len(precisions) > 1:
+            violations.append(SchemaViolation(
+                table_name=table_name,
+                field_name=','.join([field for field, _ in precision_issues]),
+                violation_type="mixed_timestamp_precision",
+                expected="consistent timestamp precision across fields",
+                actual=f"mixed precisions: {precisions}",
+                row_identifier=row_id,
+                severity="warning"
+            ))
+        
+        return violations
+    
+    def reset_temporal_tracking(self, table_name: Optional[str] = None, field_name: Optional[str] = None) -> None:
+        """
+        Reset temporal tracking state for maintenance or testing.
+        
+        Args:
+            table_name: If specified, reset tracking for specific table only
+            field_name: If specified (with table_name), reset tracking for specific field only
+        """
+        if not hasattr(self, '_temporal_drift_tracker'):
+            return
+        
+        if table_name and field_name:
+            # Reset specific field
+            key = f"{table_name}.{field_name}"
+            self._temporal_drift_tracker.pop(key, None)
+            self._temporal_sequence_tracker.pop(key, None)
+            logger.info(f"Reset temporal tracking for {key}")
+        elif table_name:
+            # Reset all fields for table
+            keys_to_remove = [k for k in self._temporal_drift_tracker.keys() if k.startswith(f"{table_name}.")]
+            for key in keys_to_remove:
+                self._temporal_drift_tracker.pop(key, None)
+                self._temporal_sequence_tracker.pop(key, None)
+            logger.info(f"Reset temporal tracking for table {table_name} ({len(keys_to_remove)} fields)")
+        else:
+            # Reset all tracking
+            field_count = len(self._temporal_drift_tracker)
+            self._temporal_drift_tracker.clear()
+            self._temporal_sequence_tracker.clear()
+            logger.info(f"Reset all temporal tracking ({field_count} fields)")
+    
+    def get_temporal_tracking_stats(self) -> Dict[str, Any]:
+        """Get current temporal tracking statistics for monitoring."""
+        if not hasattr(self, '_temporal_drift_tracker'):
+            return {}
+        
+        stats = {
+            'tracked_fields': len(self._temporal_drift_tracker),
+            'fields': {}
+        }
+        
+        for key, tracker in self._temporal_drift_tracker.items():
+            field_stats = {
+                'last_timestamp': tracker['last_timestamp'],
+                'drift_samples_count': len(tracker['drift_samples']),
+            }
+            
+            if tracker['drift_samples']:
+                field_stats.update({
+                    'avg_interval_us': statistics.mean(tracker['drift_samples']),
+                    'median_interval_us': statistics.median(tracker['drift_samples']),
+                    'min_interval_us': min(tracker['drift_samples']),
+                    'max_interval_us': max(tracker['drift_samples'])
+                })
+            
+            # Add sequence tracking stats if available
+            if hasattr(self, '_temporal_sequence_tracker') and key in self._temporal_sequence_tracker:
+                seq_tracker = self._temporal_sequence_tracker[key]
+                field_stats['expected_interval_us'] = seq_tracker.get('expected_interval_us')
+                field_stats['interval_samples_count'] = len(seq_tracker.get('interval_samples', []))
+            
+            stats['fields'][key] = field_stats
+        
+        return stats
     
     def register_schema(self, schema: TableSchema) -> None:
         """Register a table schema for validation."""
@@ -1020,8 +1440,9 @@ class SchemaValidatorAgent:
             # dict_violations may have modified the dictionary if coercions occurred
             # _validate_dict_contents handles the mutation internally
         
-        # Timestamp validation with bounds
+        # Enhanced timestamp validation with enterprise-grade temporal consistency
         if field_schema.field_type == FieldType.TIMESTAMP_US and isinstance(value, int):
+            # Basic bounds validation
             if value < self.min_timestamp_us or value > self.max_timestamp_us:
                 violations.append(SchemaViolation(
                     table_name=table_name,
@@ -1031,7 +1452,12 @@ class SchemaValidatorAgent:
                     actual=str(value),
                     row_identifier=row_id
                 ))
-        
+            
+            # Enterprise-grade temporal consistency validation
+            temporal_violations = self._validate_temporal_consistency(
+                value, table_name, field_schema.name
+            )
+            violations.extend(temporal_violations)
         
         # Business hours validation for timestamps
         if (field_schema.business_hours_only and 

@@ -22,8 +22,8 @@ import logging
 import time
 import ssl
 import threading
-from typing import Dict, List, Optional, Any, Callable, Union, Deque
-from dataclasses import dataclass, asdict
+from typing import Dict, List, Optional, Any, Callable, Union, Deque, Set, Tuple
+from dataclasses import dataclass, asdict, field
 from enum import Enum
 from collections import defaultdict, deque
 import hashlib
@@ -127,6 +127,296 @@ def validate_compression_type(compression_type: str) -> str:
 
 logger = logging.getLogger(__name__)
 
+
+@dataclass
+class RateDomainState:
+    """Runtime state for a single rate-limited domain."""
+    domain: str
+    qps: float
+    burst: float
+    tokens: float
+    last_refill: float
+    recent_borrows: Deque[Tuple[float, float]] = field(default_factory=lambda: deque(maxlen=1024))
+    wait_events: Deque[float] = field(default_factory=lambda: deque(maxlen=256))
+    throttled_events: int = 0
+    last_update_ts: float = field(default_factory=lambda: time.time())
+
+
+class NullRateBudgetLease:
+    """No-op async context manager when rate limiting is disabled."""
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        return False
+
+
+class RateBudgetLease:
+    """Async context manager representing a successful borrow from a rate budget."""
+
+    __slots__ = ("manager", "domain", "permits", "started_at", "waited_sec")
+
+    def __init__(self, manager: "RateBudgetManager", domain: str, permits: float,
+                 waited_sec: float):
+        self.manager = manager
+        self.domain = domain
+        self.permits = permits
+        self.started_at = time.monotonic()
+        self.waited_sec = waited_sec
+
+    async def __aenter__(self) -> "RateBudgetLease":
+        return self
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb) -> bool:
+        self.manager.record_completion(self.domain, self.permits, self.waited_sec,
+                                       duration=time.monotonic() - self.started_at)
+        return False
+
+
+class RateBudgetBorrowProxy:
+    """Wrapper returning an async context from RateBudgetManager.borrow."""
+
+    __slots__ = ("manager", "domain", "permits", "timeout", "_lease")
+
+    def __init__(self, manager: "RateBudgetManager", domain: str,
+                 permits: float = 1.0, timeout: Optional[float] = None):
+        self.manager = manager
+        self.domain = domain
+        self.permits = permits
+        self.timeout = timeout
+        self._lease: Optional[Union[RateBudgetLease, NullRateBudgetLease]] = None
+
+    async def __aenter__(self):
+        self._lease = await self.manager.borrow(self.domain, self.permits, self.timeout)
+        return await self._lease.__aenter__()
+
+    async def __aexit__(self, exc_type, exc_val, exc_tb):
+        if self._lease:
+            return await self._lease.__aexit__(exc_type, exc_val, exc_tb)
+        return False
+
+
+class RateBudgetManager:
+    """
+    Cooperative token-bucket manager that enforces cross-agent rate budgets per domain.
+
+    Agents borrow permits before issuing external calls (HTTP/RPC). DQO can push budget
+    updates by publishing to the control topic. Metrics are tracked per-domain for
+    observability (qps utilization, wait ratio, throttled events, etc.).
+    """
+
+    CONTROL_TOPIC = "control.rate_budget"
+
+    def __init__(self, initial_config: Optional[Dict[str, Any]] = None):
+        self._domains: Dict[str, RateDomainState] = {}
+        self._lock = asyncio.Lock()
+        self._enabled = True
+        self._default_qps = None
+        self._default_burst = None
+        self._metrics: Dict[str, Dict[str, Any]] = defaultdict(dict)
+        self._429_counts: Dict[str, int] = defaultdict(int)
+        self.control_topic = self.CONTROL_TOPIC
+
+        if initial_config:
+            self.load_config(initial_config)
+
+    @property
+    def enabled(self) -> bool:
+        return self._enabled
+
+    def load_config(self, config: Dict[str, Any]) -> None:
+        """Initialize rate budget configuration from static config."""
+        self._enabled = bool(config.get("enabled", True))
+        self.control_topic = config.get("control_topic", self.CONTROL_TOPIC)
+        self._default_qps = config.get("default_qps")
+        self._default_burst = config.get("default_burst")
+
+        domains_cfg = config.get("domains", {})
+        if isinstance(domains_cfg, list):
+            domains_iter = domains_cfg
+        elif isinstance(domains_cfg, dict):
+            domains_iter = [
+                {"name": name, **(settings if isinstance(settings, dict) else {})}
+                for name, settings in domains_cfg.items()
+            ]
+        else:
+            domains_iter = []
+
+        for domain_settings in domains_iter:
+            name = domain_settings.get("name") or domain_settings.get("domain")
+            if not name:
+                continue
+            qps = float(domain_settings.get("qps", self._default_qps or 0.0))
+            burst = float(domain_settings.get("burst", domain_settings.get("burst_tokens",
+                                                                          self._default_burst or qps * 2 or 1.0)))
+            self._upsert_domain(name, qps, burst)
+
+    def _upsert_domain(self, domain: str, qps: float, burst: float) -> None:
+        now = time.monotonic()
+        burst = max(burst, qps) if qps > 0 else burst
+        state = self._domains.get(domain)
+        if state:
+            state.qps = max(0.0, qps)
+            state.burst = max(0.0, burst)
+            state.tokens = min(state.tokens, state.burst)
+            state.last_update_ts = time.time()
+        else:
+            initial_tokens = burst if burst > 0 else qps
+            self._domains[domain] = RateDomainState(
+                domain=domain,
+                qps=max(0.0, qps),
+                burst=max(0.0, burst),
+                tokens=max(0.0, initial_tokens),
+                last_refill=now
+            )
+        logger.info(f"RateBudgetManager: domain={domain} qps={qps} burst={burst}")
+
+    async def borrow(self, domain: str, permits: float = 1.0,
+                     timeout: Optional[float] = None) -> Union[RateBudgetLease, NullRateBudgetLease]:
+        """Borrow permits for a given domain, respecting token-bucket limits."""
+        if not self.enabled:
+            return NullRateBudgetLease()
+
+        domain_state = self._domains.get(domain)
+        if domain_state is None:
+            # If no domain configured, allow borrow immediately.
+            return NullRateBudgetLease()
+
+        deadline = None
+        loop = asyncio.get_event_loop()
+        if timeout is not None:
+            deadline = loop.time() + timeout
+
+        waited_total = 0.0
+
+        while True:
+            async with self._lock:
+                state = self._domains.get(domain)
+                if state is None:
+                    return NullRateBudgetLease()
+
+                now = time.monotonic()
+                self._refill(state, now)
+
+                if permits <= 0 or state.tokens >= permits:
+                    tokens_to_consume = max(permits, 0.0)
+                    state.tokens = max(0.0, state.tokens - tokens_to_consume)
+                    state.recent_borrows.append((now, tokens_to_consume))
+                    self._metrics[domain]["last_borrow_ts"] = time.time()
+                    return RateBudgetLease(self, domain, tokens_to_consume, waited_total)
+
+                # Need to wait for tokens
+                state.throttled_events += 1
+                wait_needed = (permits - state.tokens) / max(state.qps, 1e-6) if state.qps > 0 else 0.1
+                wait_needed = max(wait_needed, 0.01)
+                state.wait_events.append(wait_needed)
+
+            if deadline and loop.time() + wait_needed > deadline:
+                raise asyncio.TimeoutError(f"Rate budget timeout for domain {domain}")
+
+            await asyncio.sleep(min(wait_needed, 0.5))
+            waited_total += min(wait_needed, 0.5)
+
+    def _refill(self, state: RateDomainState, now: float) -> None:
+        if state.qps <= 0:
+            state.tokens = 0.0
+            state.last_refill = now
+            return
+
+        elapsed = max(0.0, now - state.last_refill)
+        if elapsed <= 0:
+            return
+
+        state.tokens = min(
+            state.burst,
+            state.tokens + elapsed * state.qps
+        )
+        state.last_refill = now
+
+    def record_completion(self, domain: str, permits: float, waited: float,
+                          duration: float) -> None:
+        """Record metrics after the protected operation finishes."""
+        stats = self._metrics[domain]
+        stats.setdefault("completed", 0)
+        stats.setdefault("total_duration_sec", 0.0)
+        stats.setdefault("total_wait_sec", 0.0)
+        stats.setdefault("permits", 0.0)
+
+        stats["completed"] += 1
+        stats["total_duration_sec"] += duration
+        stats["total_wait_sec"] += waited
+        stats["permits"] += permits
+
+    def record_429(self, domain: str) -> None:
+        """Allow collectors to report external 429/limit responses."""
+        self._429_counts[domain] += 1
+
+    def apply_control_message(self, message: Dict[str, Any]) -> None:
+        """Handle control message payload to update budgets."""
+        if not isinstance(message, dict):
+            return
+
+        if "enabled" in message:
+            self._enabled = bool(message["enabled"])
+            logger.info(f"RateBudgetManager: enabled={self._enabled}")
+
+        domains = []
+        if "domains" in message and isinstance(message["domains"], list):
+            domains = message["domains"]
+        elif "domain" in message:
+            domains = [message]
+
+        for entry in domains:
+            if not isinstance(entry, dict):
+                continue
+            name = entry.get("name") or entry.get("domain")
+            if not name:
+                continue
+            qps = entry.get("qps")
+            burst = entry.get("burst") or entry.get("burst_tokens")
+            if qps is None and burst is None:
+                continue
+            current_state = self._domains.get(name)
+            if qps is None and current_state:
+                qps = current_state.qps
+            if burst is None and current_state:
+                burst = current_state.burst
+            if qps is None:
+                qps = self._default_qps or 0.0
+            if burst is None:
+                burst = self._default_burst or qps * 2 or 1.0
+            self._upsert_domain(name, float(qps), float(burst))
+
+    def snapshot(self) -> Dict[str, Any]:
+        """Return a metrics snapshot suitable for Prom/Grafana export."""
+        result: Dict[str, Any] = {}
+        now = time.monotonic()
+        for domain, state in self._domains.items():
+            recent_tokens = [permits for ts, permits in state.recent_borrows if now - ts <= 1.0]
+            qps_utilization = sum(recent_tokens)
+            wait_samples = list(state.wait_events)
+            avg_wait = sum(wait_samples) / len(wait_samples) if wait_samples else 0.0
+            stats = self._metrics.get(domain, {})
+            completed = stats.get("completed", 0)
+            avg_duration = (stats.get("total_duration_sec", 0.0) / completed) if completed else 0.0
+            avg_wait_recorded = (stats.get("total_wait_sec", 0.0) / completed) if completed else 0.0
+
+            result[domain] = {
+                "configured_qps": state.qps,
+                "configured_burst": state.burst,
+                "available_tokens": state.tokens,
+                "qps_utilization": qps_utilization,
+                "avg_wait_sec": avg_wait,
+                "avg_wait_recorded_sec": avg_wait_recorded,
+                "avg_duration_sec": avg_duration,
+                "throttled_events": state.throttled_events,
+                "borrow_count": completed,
+                "last_update_ts": state.last_update_ts,
+                "429_count": self._429_counts.get(domain, 0),
+            }
+
+        return result
 def generate_uuidv7() -> str:
     """
     Generate a UUIDv7 with time-ordered properties for institutional traceability.
@@ -281,6 +571,18 @@ class CircuitBreakerState(Enum):
 
 
 @dataclass
+class BreakerIntent:
+    """Intent published by agents or systems requesting breaker state changes."""
+    component_id: str
+    intent: str  # e.g. "trip", "recover", "probe"
+    reason: str
+    severity: str = "medium"
+    requested_by: str = "system"
+    metadata: Dict[str, Any] = field(default_factory=dict)
+    timestamp_us: int = field(default_factory=lambda: int(time.time_ns() // 1000))
+
+
+@dataclass
 class CircuitBreakerConfig:
     """Configuration for component circuit breakers."""
     component_id: str                    # Unique component identifier
@@ -344,7 +646,7 @@ class CircuitBreakerState_Instance:
         """Record failed execution."""
         now_us = int(time.time_ns() // 1000)
         self.last_failure_time_us = now_us
-        
+
         if self.state == CircuitBreakerState.CLOSED:
             self.failure_count += 1
             if self.failure_count >= self.config.failure_threshold:
@@ -354,11 +656,27 @@ class CircuitBreakerState_Instance:
             self.state = CircuitBreakerState.OPEN
             self.opened_time_us = now_us
             self.failure_count += 1
-    
+
     def record_call_attempt(self):
         """Record call attempt in half-open state."""
         if self.state == CircuitBreakerState.HALF_OPEN:
             self.half_open_call_count += 1
+
+    def force_open(self):
+        now_us = int(time.time_ns() // 1000)
+        self.state = CircuitBreakerState.OPEN
+        self.opened_time_us = now_us
+
+    def force_close(self):
+        self.state = CircuitBreakerState.CLOSED
+        self.failure_count = 0
+        self.success_count = 0
+        self.half_open_call_count = 0
+
+    def force_half_open(self):
+        self.state = CircuitBreakerState.HALF_OPEN
+        self.success_count = 0
+        self.half_open_call_count = 0
 
 
 class SystemCircuitBreakerManager:
@@ -372,7 +690,8 @@ class SystemCircuitBreakerManager:
         self.dependency_graph: Dict[str, List[str]] = {}  # component -> dependencies
         self.dependents_graph: Dict[str, List[str]] = {}  # component -> dependents
         self._lock = asyncio.Lock()
-    
+        self._last_intents: Dict[str, BreakerIntent] = {}
+
     async def register_component(self, config: CircuitBreakerConfig):
         """Register a component with its circuit breaker configuration."""
         async with self._lock:
@@ -410,22 +729,43 @@ class SystemCircuitBreakerManager:
             
             return True
     
-    async def record_component_success(self, component_id: str):
+    async def record_component_success(self, component_id: str,
+                                       reason: str = "success",
+                                       severity: str = "low") -> Dict[str, Any]:
         """Record successful component execution."""
         async with self._lock:
             if component_id in self.breakers:
-                self.breakers[component_id].record_success()
-    
+                breaker = self.breakers[component_id]
+                breaker.record_success()
+                intent = BreakerIntent(component_id=component_id,
+                                       intent="recover",
+                                       reason=reason,
+                                       severity=severity,
+                                       requested_by="system")
+                self._last_intents[component_id] = intent
+                return self._export_state(component_id)
+        return {}
+
     async def record_component_failure(self, component_id: str, 
-                                     cascade_to_dependents: bool = True):
+                                     cascade_to_dependents: bool = True,
+                                     reason: str = "failure",
+                                     severity: str = "high") -> Dict[str, Any]:
         """Record component failure and optionally cascade to dependents."""
         async with self._lock:
             if component_id not in self.breakers:
-                return
+                return {}
             
             breaker = self.breakers[component_id]
             old_state = breaker.state
             breaker.record_failure()
+            intent_type = "trip" if breaker.state == CircuitBreakerState.OPEN else "degrade"
+            intent = BreakerIntent(component_id=component_id,
+                                   intent=intent_type,
+                                   reason=reason,
+                                   severity=severity,
+                                   requested_by="system")
+            self._last_intents[component_id] = intent
+            state_snapshot = self._export_state(component_id)
             
             # If circuit just opened, cascade to dependents
             if (cascade_to_dependents and 
@@ -433,21 +773,41 @@ class SystemCircuitBreakerManager:
                 breaker.state == CircuitBreakerState.OPEN):
                 
                 await self._cascade_failure_to_dependents(component_id)
-    
+            return state_snapshot
+
     async def _cascade_failure_to_dependents(self, failed_component: str):
         """Cascade failure to dependent components."""
         dependents = self.dependents_graph.get(failed_component, [])
         for dependent in dependents:
             if dependent in self.breakers:
-                dep_breaker = self.breakers[dependent]
-                if dep_breaker.state == CircuitBreakerState.CLOSED:
-                    logger.warning(f"Cascading failure from {failed_component} to {dependent}")
-                    dep_breaker.state = CircuitBreakerState.OPEN
-                    dep_breaker.opened_time_us = int(time.time_ns() // 1000)
+                    dep_breaker = self.breakers[dependent]
+                    if dep_breaker.state == CircuitBreakerState.CLOSED:
+                        logger.warning(f"Cascading failure from {failed_component} to {dependent}")
+                        dep_breaker.state = CircuitBreakerState.OPEN
+                        dep_breaker.opened_time_us = int(time.time_ns() // 1000)
                     
                     # Continue cascade
                     await self._cascade_failure_to_dependents(dependent)
     
+    async def submit_manual_intent(self, intent: BreakerIntent) -> Dict[str, Any]:
+        """Submit a manual breaker intent from agents or orchestrator."""
+        async with self._lock:
+            breaker = self.breakers.get(intent.component_id)
+            if not breaker:
+                return {}
+
+            if intent.intent in {"trip", "open"}:
+                breaker.force_open()
+            elif intent.intent in {"recover", "close"}:
+                breaker.force_close()
+            elif intent.intent in {"probe", "half_open"}:
+                breaker.force_half_open()
+
+            self._last_intents[intent.component_id] = intent
+            if breaker.state == CircuitBreakerState.OPEN:
+                await self._cascade_failure_to_dependents(intent.component_id)
+            return self._export_state(intent.component_id)
+
     async def get_system_health_status(self) -> Dict[str, Any]:
         """Get overall system health status."""
         async with self._lock:
@@ -455,7 +815,8 @@ class SystemCircuitBreakerManager:
                 "healthy_components": [],
                 "degraded_components": [],
                 "failed_components": [],
-                "dependency_violations": []
+                "dependency_violations": [],
+                "components": {comp: self._export_state(comp) for comp in self.breakers}
             }
             
             for component_id, breaker in self.breakers.items():
@@ -467,6 +828,31 @@ class SystemCircuitBreakerManager:
                     status["failed_components"].append(component_id)
             
             return status
+    
+    async def get_component_state(self, component_id: str) -> Dict[str, Any]:
+        """Return the latest state snapshot for a specific component."""
+        async with self._lock:
+            return self._export_state(component_id)
+
+    def _export_state(self, component_id: str) -> Dict[str, Any]:
+        breaker = self.breakers.get(component_id)
+        if not breaker:
+            return {}
+        intent = self._last_intents.get(component_id)
+        return {
+            "component_id": component_id,
+            "state": breaker.state.value,
+            "failure_count": breaker.failure_count,
+            "success_count": breaker.success_count,
+            "last_failure_time_us": breaker.last_failure_time_us,
+            "opened_time_us": breaker.opened_time_us,
+            "intent": intent.intent if intent else None,
+            "intent_reason": intent.reason if intent else None,
+            "intent_severity": intent.severity if intent else None,
+            "intent_requested_by": intent.requested_by if intent else None,
+            "intent_timestamp_us": intent.timestamp_us if intent else None,
+            "metadata": intent.metadata if intent else {}
+        }
 
 
 class TopicType(Enum):
@@ -862,9 +1248,10 @@ class StreamingBus:
             "consumer_errors": 0,
             "transactions_committed": 0,
             "transactions_aborted": 0,
-            "circuit_breaker_triggers": 0
+            "circuit_breaker_triggers": 0,
+            "rate_budget_updates": 0
         }
-        
+
         # Per-topic metrics with rate tracking
         self.topic_metrics: Dict[str, Dict[str, Any]] = defaultdict(lambda: {
             "message_count": 0,
@@ -881,6 +1268,16 @@ class StreamingBus:
         self.health_check_interval = 30.0  # 30 seconds
         self.health_check_task: Optional[asyncio.Task] = None
         self.last_health_check = 0.0
+
+        # Global rate budget manager
+        self.rate_budget = RateBudgetManager(config.get("rate_budget"))
+        self._rate_budget_control_task: Optional[asyncio.Task] = None
+        self._rate_budget_control_enabled = self.rate_budget.enabled and config.get(
+            "rate_budget_control_enabled", True
+        )
+        self._rate_budget_consumer_group = config.get(
+            "rate_budget_consumer_group", f"{self.client_id}.rate_budget"
+        )
         
         # Consumer lag monitoring  
         self.consumer_lag_thresholds = {
@@ -895,6 +1292,61 @@ class StreamingBus:
         self._start_time = time.time()
         
         logger.info(f"Enhanced streaming bus initialized with servers: {self.bootstrap_servers}")
+
+    def rate_limit(self, domain: str, permits: float = 1.0,
+                   timeout: Optional[float] = None) -> RateBudgetBorrowProxy:
+        """
+        Return an async context manager that enforces the configured rate budget.
+        
+        Usage:
+            async with streaming_bus.rate_limit("onchain_rpc"):
+                await call_external_api()
+        """
+        return RateBudgetBorrowProxy(self.rate_budget, domain, permits, timeout)
+
+    def record_rate_limit_429(self, domain: str) -> None:
+        """Record an upstream 429/limit response for observability."""
+        self.rate_budget.record_429(domain)
+
+    def get_rate_budget_metrics(self) -> Dict[str, Any]:
+        """Expose rate budget metrics for monitoring."""
+        return self.rate_budget.snapshot()
+
+    async def ensure_rate_budget_listener(self) -> None:
+        """
+        Ensure the control topic listener is running so that rate budgets can
+        be tuned at runtime by the DQO.
+        """
+        if not self._rate_budget_control_enabled:
+            return
+        if not KAFKA_AVAILABLE:
+            logger.warning("Rate budget control listener disabled - Kafka unavailable")
+            return
+        if self._rate_budget_control_task and not self._rate_budget_control_task.done():
+            return
+
+        async def _handler(topic: str, partition_key: str,
+                           message: Dict[str, Any], headers: Dict[str, str]) -> None:
+            try:
+                self.rate_budget.apply_control_message(message)
+                self.metrics["rate_budget_updates"] += 1
+            except Exception as exc:
+                logger.error(f"Failed to apply rate budget control message: {exc}")
+
+        async def _runner() -> None:
+            try:
+                await self.subscribe_with_worker_pool(
+                    consumer_group=self._rate_budget_consumer_group,
+                    topics=[self.rate_budget.control_topic],
+                    handler=_handler,
+                    pool_size=1
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                logger.error(f"Rate budget control listener stopped unexpectedly: {exc}")
+
+        self._rate_budget_control_task = asyncio.create_task(_runner())
     
     def _build_security_config(self) -> Dict[str, Any]:
         """Build security configuration for producers/consumers."""
@@ -1802,6 +2254,25 @@ class StreamingBus:
             cleanup_policy="delete"
         ))
         
+        # Centralized breaker coordination topics
+        self.register_topic_config(TopicConfig(
+            name="control.breaker_intent",
+            partitions=2,
+            replication_factor=3,
+            retention_ms=604800000,  # 7 days
+            compression_type=CompressionType.GZIP,
+            cleanup_policy="delete"
+        ))
+        
+        self.register_topic_config(TopicConfig(
+            name="control.breaker_state",
+            partitions=2,
+            replication_factor=3,
+            retention_ms=604800000,  # 7 days
+            compression_type=CompressionType.GZIP,
+            cleanup_policy="delete"
+        ))
+        
         self.register_topic_config(TopicConfig(
             name="control.command_acks",
             partitions=2,
@@ -2070,6 +2541,8 @@ class StreamingBus:
             
             # Control Topics (used by circuit breaker)
             "control.circuit_breaker",
+            "control.breaker_intent",
+            "control.breaker_state",
             "control.command_acks"
         }
         
@@ -2111,7 +2584,7 @@ class StreamingBus:
         return summary
     
     async def subscribe_with_worker_pool(self, consumer_group: str, topics: List[str], 
-                                        handler: Callable[[str, str, Dict[str, Any], Dict[str, str]], None],
+                                        handler: Callable[[str, str, Dict[str, Any], Dict[str, str]], Any],
                                         pool_size: int = 16) -> None:
         """
         Pure transport: Subscribe with worker pool (no domain logic).
@@ -2119,7 +2592,7 @@ class StreamingBus:
         Args:
             consumer_group: Consumer group identifier
             topics: List of topics to subscribe to
-            handler: Function(topic, partition_key, payload, headers) - gets raw data
+            handler: Async function(topic, partition_key, payload, headers) - gets raw data
             pool_size: Number of concurrent workers
         """
         if not KAFKA_AVAILABLE or AIOKafkaConsumer is None:
@@ -2420,21 +2893,126 @@ class StreamingBus:
         )
         await self.system_circuit_breaker.register_component(config)
         logger.info(f"Registered circuit breaker for component: {component_id}")
+        
+        # Broadcast initial state so downstream consumers have a baseline view
+        try:
+            initial_state = await self.system_circuit_breaker.get_component_state(component_id)
+            if initial_state:
+                await self._publish_breaker_state(initial_state)
+        except Exception as exc:
+            logger.debug(f"Unable to publish initial breaker state for {component_id}: {exc}")
     
     async def can_component_execute(self, component_id: str) -> bool:
         """Check if component can execute based on circuit breaker state."""
         return await self.system_circuit_breaker.can_component_execute(component_id)
     
-    async def record_component_success(self, component_id: str) -> None:
-        """Record successful component operation."""
-        await self.system_circuit_breaker.record_component_success(component_id)
+    async def record_component_success(self, component_id: str,
+                                       reason: str = "success",
+                                       severity: str = "low",
+                                       metadata: Optional[Dict[str, Any]] = None) -> None:
+        """Publish a recovery intent for the specified component."""
+        intent = BreakerIntent(
+            component_id=component_id,
+            intent="recover",
+            reason=reason,
+            severity=severity,
+            requested_by="streaming_bus",
+            metadata=metadata or {}
+        )
+        await self.publish_breaker_intent(intent)
     
     async def record_component_failure(self, component_id: str, 
-                                     cascade_failure: bool = True) -> None:
-        """Record component failure and handle cascading if needed."""
-        await self.system_circuit_breaker.record_component_failure(
-            component_id, cascade_to_dependents=cascade_failure)
-        logger.warning(f"Recorded failure for component: {component_id}")
+                                     cascade_failure: bool = True,
+                                     reason: str = "failure",
+                                     severity: str = "high") -> None:
+        """Publish a breaker intent requesting a trip for the component."""
+        intent = BreakerIntent(
+            component_id=component_id,
+            intent="trip",
+            reason=reason,
+            severity=severity,
+            requested_by="streaming_bus",
+            metadata={"cascade_failure": cascade_failure}
+        )
+        await self.publish_breaker_intent(intent)
+        logger.warning(f"Requested breaker trip for component: {component_id} (reason={reason})")
+    
+    async def publish_breaker_intent(self, intent: BreakerIntent,
+                                     apply_locally: bool = False) -> Optional[Dict[str, Any]]:
+        """
+        Publish a breaker intent to the shared control topic and optionally apply it locally.
+        
+        Agents should call this instead of mutating circuit breaker state directly so that
+        the orchestrator/bus remains the source of truth for breaker coordination.
+        """
+        payload = {
+            "component_id": intent.component_id,
+            "intent": intent.intent,
+            "reason": intent.reason,
+            "severity": intent.severity,
+            "requested_by": intent.requested_by,
+            "timestamp_utc_us": intent.timestamp_us,
+            "metadata": intent.metadata or {}
+        }
+        
+        headers = {
+            "source": "system_circuit_breaker",
+            "component_id": intent.component_id,
+            "intent": intent.intent
+        }
+        
+        try:
+            await self.publish_with_headers(
+                topic="control.breaker_intent",
+                partition_key=intent.component_id,
+                payload=payload,
+                headers=headers
+            )
+        except Exception as exc:
+            logger.warning(f"Failed to publish breaker intent for {intent.component_id}: {exc}")
+        
+        state_snapshot: Optional[Dict[str, Any]] = None
+        if apply_locally:
+            try:
+                state_snapshot = await self.system_circuit_breaker.submit_manual_intent(intent)
+                if state_snapshot:
+                    await self._publish_breaker_state(state_snapshot)
+            except Exception as exc:
+                logger.error(f"Failed to apply breaker intent locally for {intent.component_id}: {exc}")
+        
+        return state_snapshot
+    
+    async def apply_breaker_intent(self, intent: BreakerIntent) -> Optional[Dict[str, Any]]:
+        """
+        Apply a breaker intent without re-publishing it. Intended for the orchestrator
+        once a decision has been made on a submitted intent.
+        """
+        try:
+            state_snapshot = await self.system_circuit_breaker.submit_manual_intent(intent)
+            if state_snapshot:
+                await self._publish_breaker_state(state_snapshot)
+            return state_snapshot
+        except Exception as exc:
+            logger.error(f"Failed to apply breaker intent for {intent.component_id}: {exc}")
+            return None
+    
+    async def _publish_breaker_state(self, state: Dict[str, Any]) -> None:
+        """
+        Broadcast the current breaker state snapshot so that downstream components can react.
+        """
+        try:
+            await self.publish_with_headers(
+                topic="control.breaker_state",
+                partition_key=state.get("component_id", "unknown"),
+                payload=state,
+                headers={
+                    "source": "system_circuit_breaker",
+                    "component_id": state.get("component_id", "unknown"),
+                    "state": state.get("state", "unknown")
+                }
+            )
+        except Exception as exc:
+            logger.warning(f"Failed to publish breaker state for {state.get('component_id')}: {exc}")
     
     async def get_system_health_status(self) -> Dict[str, Any]:
         """Get comprehensive system health status."""
@@ -2543,6 +3121,7 @@ class StreamingBus:
         
         return {
             "overall_status": "healthy" if healthy_brokers == total_brokers else "degraded",
+            "healthy": healthy_brokers == total_brokers,
             "brokers": {
                 "healthy": healthy_brokers,
                 "total": total_brokers,
@@ -2552,6 +3131,9 @@ class StreamingBus:
                 "active_count": len(self.consumers),
                 "high_lag_topics": high_lag_topics
             },
+            "rate_budgets": self.rate_budget.snapshot(),
+            "rate_budget_enabled": self.rate_budget.enabled,
+            "rate_budget_control_enabled": self._rate_budget_control_enabled,
             "last_health_check": self.last_health_check,
             "uptime_seconds": current_time - getattr(self, '_start_time', current_time)
         }
@@ -2684,6 +3266,15 @@ class StreamingBus:
         
         # Stop health monitoring first
         await self.stop_health_monitoring()
+
+        # Stop rate budget listener
+        if self._rate_budget_control_task:
+            self._rate_budget_control_task.cancel()
+            try:
+                await self._rate_budget_control_task
+            except asyncio.CancelledError:
+                pass
+            self._rate_budget_control_task = None
         
         # Final commits for all consumer pools
         for consumer_group, worker_pool in self.consumer_pools.items():

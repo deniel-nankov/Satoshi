@@ -193,6 +193,11 @@ async def health_check(
                 last_check=current_time,
                 components=bus_health
             )
+            if metrics is not None:
+                try:
+                    metrics.record_rate_budget_metrics(bus_health.get("rate_budgets", {}))
+                except Exception as metric_err:
+                    logger.warning(f"Failed to record rate budget metrics: {metric_err}")
             if not bus_health.get("healthy", False):
                 overall_status = "degraded"
         except Exception as e:

@@ -25,7 +25,7 @@ import random
 import math
 from abc import ABC, abstractmethod
 from decimal import Decimal
-from typing import Optional, List, Dict, Any, Set, Callable, Union
+from typing import Optional, List, Dict, Any, Set, Callable, Union, Awaitable, TypeVar
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta
 from enum import Enum
@@ -34,6 +34,7 @@ from collections import defaultdict, deque
 
 # Streaming Bus Integration
 from infra.bus.streaming_bus import StreamingBus
+from infra.monitoring.prometheus_metrics import get_metrics_collector
 
 
 # ============================================================================
@@ -52,6 +53,8 @@ class Side(Enum):
     BID = "bid"
     ASK = "ask"
 
+T = TypeVar("T")
+
 
 class DataType(Enum):
     TRADES = "trades"
@@ -60,6 +63,10 @@ class DataType(Enum):
     OI = "oi"
     BORROW = "borrow"
     MAINTENANCE = "maintenance"
+
+
+class RateBudgetTimeoutError(Exception):
+    """Raised when a shared rate budget borrow times out."""
 
 
 @dataclass
@@ -338,6 +345,12 @@ class VenueAdapter(ABC):
         self.rate_limit_permits_total = config.get("concurrent_requests", 5)
         self.rate_limit_permits_used = 0
         self.rate_limit_semaphore = asyncio.Semaphore(self.rate_limit_permits_total)
+        self.streaming_bus: Optional[StreamingBus] = None
+        self.rate_budget_domain: Optional[str] = None
+        self.rate_budget_timeout: float = float(config.get("rate_budget_timeout_sec", 5.0))
+        self._rate_limit_metrics: Optional[Dict[str, Any]] = None
+        self._rate_budget_enabled: bool = False
+        self._component_id: Optional[str] = venue
 
     @abstractmethod
     async def get_trades(self, symbol: str, since_timestamp_us: Optional[int] = None) -> List[TradeData]:
@@ -409,6 +422,64 @@ class VenueAdapter(ABC):
             finally:
                 self.session = None
 
+    def configure_rate_limit(self, streaming_bus: StreamingBus, domain: str,
+                              timeout_sec: float, metrics: Dict[str, Any],
+                              component_id: Optional[str] = None) -> None:
+        """Configure shared rate budget coordination for this adapter."""
+        self.streaming_bus = streaming_bus
+        self.rate_budget_domain = domain
+        self.rate_budget_timeout = float(timeout_sec)
+        self._rate_limit_metrics = metrics
+        self._rate_budget_enabled = True
+        self._component_id = component_id or self.venue
+
+    def _record_rate_limit_response(self) -> None:
+        if self.streaming_bus and self.rate_budget_domain:
+            try:
+                self.streaming_bus.record_rate_limit_429(self.rate_budget_domain)
+            except Exception as exc:
+                logger.warning(f"Failed to record rate limit response for {self.venue}: {exc}")
+        if isinstance(self._rate_limit_metrics, dict):
+            domain = self.rate_budget_domain or self.venue
+            responses = self._rate_limit_metrics.setdefault('rate_limit_responses', {})
+            responses[domain] = responses.get(domain, 0) + 1
+        self._publish_rate_metrics()
+
+    def _record_rate_budget_timeout(self, message: Optional[str] = None) -> None:
+        if isinstance(self._rate_limit_metrics, dict):
+            domain = self.rate_budget_domain or self.venue
+            timeouts = self._rate_limit_metrics.setdefault('rate_budget_timeouts', {})
+            timeouts[domain] = timeouts.get(domain, 0) + 1
+        if message:
+            logger.warning(message)
+        self._publish_rate_metrics()
+
+    async def _execute_with_rate_budget(self, fn: Callable[[], Awaitable[T]],
+                                         timeout_message: Optional[str] = None) -> T:
+        if self._rate_budget_enabled and self.streaming_bus and self.rate_budget_domain:
+            try:
+                async with self.streaming_bus.rate_limit(self.rate_budget_domain, timeout=self.rate_budget_timeout):
+                    return await fn()
+            except asyncio.TimeoutError:
+                self._record_rate_budget_timeout(timeout_message)
+                raise RateBudgetTimeoutError(timeout_message or "rate budget timeout")
+        return await fn()
+
+    def _publish_rate_metrics(self) -> None:
+        if not self._rate_limit_metrics:
+            return
+        try:
+            collector = get_metrics_collector()
+            collector.record_rate_limit_counters(
+                self._component_id or self.venue,
+                {
+                    "rate_limit_responses": self._rate_limit_metrics.get('rate_limit_responses', {}),
+                    "rate_budget_timeouts": self._rate_limit_metrics.get('rate_budget_timeouts', {})
+                }
+            )
+        except Exception as exc:
+            logger.debug(f"Failed to publish rate metrics for {self.venue}: {exc}")
+
     async def health_check(self) -> Dict[str, Any]:
         """Comprehensive health check for production monitoring."""
         health_status = {
@@ -475,6 +546,9 @@ class VenueAdapter(ABC):
     def rate_limit_context(self):
         """Context manager for safe rate limiting with public counters."""
         return RateLimitContext(self)
+    def _check_rate_limit_status(self, resp: aiohttp.ClientResponse) -> None:
+        if resp.status in (429, 418):
+            self._record_rate_limit_response()
     
     def normalize_timestamp(self, timestamp: Any) -> int:
         if isinstance(timestamp, int):
@@ -506,6 +580,7 @@ class BinanceFuturesAdapter(VenueAdapter):
         params = {"symbol": normalized_symbol}
         async with self.rate_limit_context():
             async with self.session.get(f"{self.base_url}/futures/data/openInterest", params=params) as resp:
+                self._check_rate_limit_status(resp)
                 resp.raise_for_status()
                 try:
                     data = await resp.json()
@@ -534,6 +609,7 @@ class BinanceFuturesAdapter(VenueAdapter):
         params = {"symbol": normalized_symbol}
         async with self.rate_limit_semaphore:
             async with self.session.get(f"{self.base_url}/fapi/v1/premiumIndex", params=params) as resp:
+                self._check_rate_limit_status(resp)
                 resp.raise_for_status()
                 try:
                     data = await resp.json()
@@ -566,6 +642,7 @@ class BinanceFuturesAdapter(VenueAdapter):
         params = {"symbol": normalized_symbol, "limit": depth}
         async with self.rate_limit_semaphore:
             async with self.session.get(f"{self.base_url}/fapi/v1/depth", params=params) as resp:
+                self._check_rate_limit_status(resp)
                 resp.raise_for_status()
                 try:
                     data = await resp.json()
@@ -598,11 +675,13 @@ class BinanceFuturesAdapter(VenueAdapter):
         async with self.rate_limit_semaphore:
             async with self.session.get(f"{self.base_url}/fapi/v1/aggTrades", params=params) as resp:
                 if resp.status == 429:
+                    self._record_rate_limit_response()
                     retry_after = resp.headers.get('Retry-After')
                     if retry_after:
                         await asyncio.sleep(int(retry_after))
                     else:
                         await asyncio.sleep(1)
+                self._check_rate_limit_status(resp)
                 resp.raise_for_status()
                 try:
                     data = await resp.json()
@@ -639,6 +718,7 @@ class BinanceFuturesAdapter(VenueAdapter):
         params = {"symbol": normalized_symbol, "period": period, "limit": limit}
         async with self.rate_limit_semaphore:
             async with self.session.get(f"{self.base_url}/futures/data/openInterestHist", params=params) as resp:
+                self._check_rate_limit_status(resp)
                 resp.raise_for_status()
                 try:
                     data = await resp.json()
@@ -662,7 +742,7 @@ class BinanceAdapter(VenueAdapter):
         """Fetch recent trades from Binance using aggTrades endpoint."""
         async def _fetch():
             if not self.session:
-                raise RuntimeError("Session is not initialized. Did you forget to call the 'start' method?")
+                raise RuntimeError("Session is not initialized. Did you forget to call the 'start' method?'")
             
             normalized_symbol = symbol.upper()  # Ensure uppercase for Binance
             params = {"symbol": normalized_symbol, "limit": 1000}
@@ -670,16 +750,17 @@ class BinanceAdapter(VenueAdapter):
                 # Add +1ms to avoid inclusive duplicate on startTime
                 since_ms = (since_timestamp_us // 1000) + 1
                 params["startTime"] = since_ms
-                
+
             async with self.rate_limit_context():
                 async with self.session.get(f"{self.base_url}/api/v3/aggTrades", params=params) as resp:
                     if resp.status == 429:
-                        # Respect Retry-After header if present
+                        self._record_rate_limit_response()
                         retry_after = resp.headers.get('Retry-After')
                         if retry_after:
                             await asyncio.sleep(int(retry_after))
                         else:
                             await asyncio.sleep(1)  # Default pause
+                    self._check_rate_limit_status(resp)
                     resp.raise_for_status()
                     try:
                         data = await resp.json()
@@ -694,11 +775,11 @@ class BinanceAdapter(VenueAdapter):
                             venue=self.venue,
                             venue_type=self.venue_type,
                             symbol=normalized_symbol,
-                            timestamp_utc_us=self.normalize_timestamp(trade["T"]),  # Event time
+                            timestamp_utc_us=self.normalize_timestamp(trade["T"]),
                             price=Decimal(str(trade["p"])),
                             quantity=Decimal(str(trade["q"])),
-                            side=Side.BUY if not trade["m"] else Side.SELL,  # m=true means maker sell
-                            trade_id=str(trade["a"]),  # Aggregate trade ID
+                            side=Side.BUY if not trade["m"] else Side.SELL,
+                            trade_id=str(trade["a"]),
                             venue_timestamp_utc_us=self.normalize_timestamp(trade["T"]),
                             capture_timestamp_utc_us=capture_time
                         ))
@@ -720,12 +801,13 @@ class BinanceAdapter(VenueAdapter):
             async with self.rate_limit_semaphore:
                 async with self.session.get(f"{self.base_url}/api/v3/depth", params=params) as resp:
                     if resp.status == 429:
-                        # Respect Retry-After header if present
+                        self._record_rate_limit_response()
                         retry_after = resp.headers.get('Retry-After')
                         if retry_after:
                             await asyncio.sleep(int(retry_after))
                         else:
-                            await asyncio.sleep(1)  # Default pause
+                            await asyncio.sleep(1)
+                    self._check_rate_limit_status(resp)
                     resp.raise_for_status()
                     try:
                         data = await resp.json()
@@ -740,11 +822,11 @@ class BinanceAdapter(VenueAdapter):
                         venue=self.venue,
                         venue_type=self.venue_type,
                         symbol=normalized_symbol,
-                        timestamp_utc_us=current_time,  # Capture time for books
+                        timestamp_utc_us=current_time,
                         bids=bids,
                         asks=asks,
-                        venue_timestamp_utc_us=None,  # Don't treat lastUpdateId as timestamp
-                        sequence_number=data.get("lastUpdateId")  # Store as sequence number
+                        venue_timestamp_utc_us=None,
+                        sequence_number=data.get("lastUpdateId")
                     )
                 
         result = await self.retry_manager.execute_with_retry(f"book_{self.venue}_{symbol}", _fetch)
@@ -773,13 +855,13 @@ class BinanceAdapter(VenueAdapter):
                     if resp.status == 400:
                         # Asset not supported for margin
                         return None
+                    self._check_rate_limit_status(resp)
                     resp.raise_for_status()
                     data = await resp.json()
-                    
+
                     if not data:
                         return None
-                        
-                    # Get most recent rate
+
                     latest = data[-1] if data else None
                     if latest:
                         capture_time = int(time.time() * 1_000_000)
@@ -788,7 +870,7 @@ class BinanceAdapter(VenueAdapter):
                             venue_type=self.venue_type,
                             symbol=symbol,
                             timestamp_utc_us=self.normalize_timestamp(latest.get("timestamp", capture_time // 1000)),
-                            borrow_rate_annual=Decimal(str(latest.get("dailyInterestRate", "0"))) * 365  # Convert daily to annual
+                            borrow_rate_annual=Decimal(str(latest.get("dailyInterestRate", "0"))) * 365
                         )
         except Exception as e:
             logger.warning(f"Failed to fetch borrow rate for {symbol}: {e}")
@@ -804,25 +886,24 @@ class BinanceAdapter(VenueAdapter):
             # Binance system status API
             async with self.rate_limit_semaphore:
                 async with self.session.get(f"{self.base_url}/sapi/v1/system/status") as resp:
+                    self._check_rate_limit_status(resp)
                     resp.raise_for_status()
                     data = await resp.json()
-                    
+
                     windows = []
                     capture_time = int(time.time() * 1_000_000)
-                    
-                    # Check if system is in maintenance
-                    if data.get("status") != 0:  # 0 = normal, 1 = maintenance
-                        # Create a maintenance window for current time
+
+                    if data.get("status") != 0:
                         windows.append(MaintenanceWindow(
                             venue=self.venue,
                             venue_type=self.venue_type,
                             start_time_utc_us=capture_time,
-                            end_time_utc_us=capture_time + (24 * 60 * 60 * 1_000_000),  # Assume 24h max
+                            end_time_utc_us=capture_time + (24 * 60 * 60 * 1_000_000),
                             affected_symbols=["ALL"],
                             maintenance_type="system",
                             description=data.get("msg", "System maintenance")
                         ))
-                        
+
                     return windows
                     
         except Exception as e:
@@ -849,6 +930,7 @@ class CoinbaseAdapter(VenueAdapter):
         url = f"{self.base_url}/products/{product_id}/trades"
         async with self.rate_limit_semaphore:
             async with self.session.get(url, params=params) as resp:
+                self._check_rate_limit_status(resp)
                 resp.raise_for_status()
                 try:
                     data = await resp.json()
@@ -886,6 +968,7 @@ class CoinbaseAdapter(VenueAdapter):
         url = f"{self.base_url}/products/{product_id}/book"
         async with self.rate_limit_semaphore:
             async with self.session.get(url, params=params) as resp:
+                self._check_rate_limit_status(resp)
                 resp.raise_for_status()
                 try:
                     data = await resp.json()
@@ -918,6 +1001,7 @@ class CoinbaseAdapter(VenueAdapter):
         url = f"{self.base_url}/products/{product_id}/stats"
         async with self.rate_limit_semaphore:
             async with self.session.get(url) as resp:
+                self._check_rate_limit_status(resp)
                 resp.raise_for_status()
                 try:
                     data = await resp.json()
@@ -952,6 +1036,7 @@ class CoinbaseAdapter(VenueAdapter):
                 async with self.session.get(f"{self.base_url}/products/{product_id}") as resp:
                     if resp.status == 404:
                         return None
+                    self._check_rate_limit_status(resp)
                     resp.raise_for_status()
                     data = await resp.json()
                     
@@ -1007,6 +1092,7 @@ class CoinbaseAdapter(VenueAdapter):
             # Coinbase status API
             async with self.rate_limit_semaphore:
                 async with self.session.get("https://status.coinbase.com/api/v2/incidents.json") as resp:
+                    self._check_rate_limit_status(resp)
                     resp.raise_for_status()
                     data = await resp.json()
                     
@@ -1060,7 +1146,9 @@ class GeminiAdapter(VenueAdapter):
             async with self.rate_limit_semaphore:
                 async with self.session.get(f"{self.base_url}/v1/trades/{gemini_symbol}", params=params) as resp:
                     if resp.status == 429:
+                        self._record_rate_limit_response()
                         await asyncio.sleep(1)
+                    self._check_rate_limit_status(resp)
                     resp.raise_for_status()
                     data = await resp.json()
                     
@@ -1097,6 +1185,7 @@ class GeminiAdapter(VenueAdapter):
         try:
             async with self.rate_limit_semaphore:
                 async with self.session.get(f"{self.base_url}/v1/book/{gemini_symbol}") as resp:
+                    self._check_rate_limit_status(resp)
                     resp.raise_for_status()
                     data = await resp.json()
                     
@@ -1183,7 +1272,9 @@ class KrakenAdapter(VenueAdapter):
             async with self.rate_limit_semaphore:
                 async with self.session.get(f"{self.base_url}/0/public/Trades", params=params) as resp:
                     if resp.status == 429:
+                        self._record_rate_limit_response()
                         await asyncio.sleep(1)
+                    self._check_rate_limit_status(resp)
                     resp.raise_for_status()
                     data = await resp.json()
                     
@@ -1235,6 +1326,7 @@ class KrakenAdapter(VenueAdapter):
             async with self.rate_limit_semaphore:
                 async with self.session.get(f"{self.base_url}/0/public/Depth", 
                                           params={"pair": kraken_symbol, "count": depth}) as resp:
+                    self._check_rate_limit_status(resp)
                     resp.raise_for_status()
                     data = await resp.json()
                     
@@ -1322,6 +1414,7 @@ class KrakenAdapter(VenueAdapter):
                 
             async with self.rate_limit_semaphore:
                 async with self.session.get(f"{self.base_url}/0/public/SystemStatus") as resp:
+                    self._check_rate_limit_status(resp)
                     resp.raise_for_status()
                     data = await resp.json()
                     
@@ -1375,7 +1468,9 @@ class OKXAdapter(VenueAdapter):
             async with self.rate_limit_semaphore:
                 async with self.session.get(f"{self.base_url}/api/v5/market/trades", params=params) as resp:
                     if resp.status == 429:
+                        self._record_rate_limit_response()
                         await asyncio.sleep(1)
+                    self._check_rate_limit_status(resp)
                     resp.raise_for_status()
                     data = await resp.json()
                     
@@ -1414,6 +1509,7 @@ class OKXAdapter(VenueAdapter):
             async with self.rate_limit_semaphore:
                 async with self.session.get(f"{self.base_url}/api/v5/market/books", 
                                           params={"instId": okx_symbol, "sz": str(depth)}) as resp:
+                    self._check_rate_limit_status(resp)
                     resp.raise_for_status()
                     data = await resp.json()
                     
@@ -1505,6 +1601,7 @@ class OKXAdapter(VenueAdapter):
             async with self.rate_limit_semaphore:
                 async with self.session.get(f"{self.base_url}/api/v5/public/funding-rate", 
                                           params={"instId": okx_symbol}) as resp:
+                    self._check_rate_limit_status(resp)
                     resp.raise_for_status()
                     data = await resp.json()
                     
@@ -1540,6 +1637,7 @@ class OKXAdapter(VenueAdapter):
             async with self.rate_limit_semaphore:
                 async with self.session.get(f"{self.base_url}/api/v5/public/open-interest", 
                                           params={"instId": okx_symbol}) as resp:
+                    self._check_rate_limit_status(resp)
                     resp.raise_for_status()
                     data = await resp.json()
                     
@@ -1573,6 +1671,7 @@ class OKXAdapter(VenueAdapter):
                 
             async with self.rate_limit_semaphore:
                 async with self.session.get(f"{self.base_url}/api/v5/system/status") as resp:
+                    self._check_rate_limit_status(resp)
                     resp.raise_for_status()
                     data = await resp.json()
                     
@@ -1744,6 +1843,8 @@ class ExchangeConnectorAgent:
             'total_requests': 0,
             'successful_requests': 0,
             'failed_requests': 0,
+            'rate_limit_responses': {},
+            'rate_budget_timeouts': {},
             'circuit_breaker_trips': 0,
             'health_checks_performed': 0,
             'health_checks_failed': 0,
@@ -1768,6 +1869,8 @@ class ExchangeConnectorAgent:
             "enable_sasl": False
         })
         self.streaming_bus = StreamingBus(streaming_config)
+        self.rate_budget_domains: Dict[str, str] = self.config.get("rate_budget_domains", {})
+        self.rate_budget_timeout = float(self.config.get("rate_budget_timeout_sec", 5.0))
         
         # Circuit breaker configuration with adaptive thresholds
         # Since this agent manages multiple venues, use a balanced approach
@@ -1920,6 +2023,15 @@ class ExchangeConnectorAgent:
                 adapter = OKXAdapter(venue_config)
             else:
                 raise ValueError(f"Unknown adapter class: {venue_class}")
+
+            domain = self.rate_budget_domains.get(venue_name, f"exchange.{venue_name}")
+            adapter.configure_rate_limit(
+                self.streaming_bus,
+                domain,
+                self.rate_budget_timeout,
+                self.integration_metrics,
+                component_id=self.component_id
+            )
             self.adapters[venue_name] = adapter
             
     async def start(self):
@@ -1929,6 +2041,8 @@ class ExchangeConnectorAgent:
         
         # Register circuit breaker with enhanced integration
         await self._register_circuit_breaker()
+
+        await self.streaming_bus.ensure_rate_budget_listener()
         
         # Initialize sequence numbers for each venue
         for venue_name in self.adapters.keys():
@@ -1964,25 +2078,34 @@ class ExchangeConnectorAgent:
                     self.tasks.append(task)
                 # OI collector (if supported)
                 if self._adapter_supports(adapter, 'get_open_interest'):
-                    # Try once to see if implemented
                     try:
-                        oi = await adapter.get_open_interest(symbol)
+                        async def _probe_oi():
+                            return await adapter.get_open_interest(symbol)
+                        oi = await adapter._execute_with_rate_budget(
+                            _probe_oi,
+                            timeout_message=f"Rate budget timeout probing OI for {adapter.venue}:{symbol}"
+                        )
                         if oi is not None:
-                            task = asyncio.create_task(
-                                self._collect_oi(adapter, symbol)
-                            )
+                            task = asyncio.create_task(self._collect_oi(adapter, symbol))
                             self.tasks.append(task)
+                    except RateBudgetTimeoutError:
+                        logger.warning(f"Skipping initial OI probe due to rate budget timeout for {adapter.venue}:{symbol}")
                     except Exception:
                         pass
                 # Borrow collector (if supported)
                 if self._adapter_supports(adapter, 'get_borrow_rate'):
                     try:
-                        borrow = await adapter.get_borrow_rate(symbol)
+                        async def _probe_borrow():
+                            return await adapter.get_borrow_rate(symbol)
+                        borrow = await adapter._execute_with_rate_budget(
+                            _probe_borrow,
+                            timeout_message=f"Rate budget timeout probing borrow for {adapter.venue}:{symbol}"
+                        )
                         if borrow is not None:
-                            task = asyncio.create_task(
-                                self._collect_borrow(adapter, symbol)
-                            )
+                            task = asyncio.create_task(self._collect_borrow(adapter, symbol))
                             self.tasks.append(task)
+                    except RateBudgetTimeoutError:
+                        logger.warning(f"Skipping initial borrow probe due to rate budget timeout for {adapter.venue}:{symbol}")
                     except Exception:
                         pass
         # Start metrics reporting
@@ -2011,7 +2134,21 @@ class ExchangeConnectorAgent:
         while self.running:
             try:
                 start_time = time.time()
-                oi = await adapter.get_open_interest(symbol)
+
+                async def _fetch_oi():
+                    return await adapter.get_open_interest(symbol)
+
+                try:
+                    oi = await adapter._execute_with_rate_budget(
+                        _fetch_oi,
+                        timeout_message=f"Rate budget timeout fetching OI for {adapter.venue}:{symbol}"
+                    )
+                except RateBudgetTimeoutError:
+                    self.integration_metrics['failed_requests'] += 1
+                    next_ts += interval_sec
+                    await asyncio.sleep(interval_sec)
+                    continue
+
                 latency_ms = (time.time() - start_time) * 1000
                 self.metrics.record_success(operation_key, latency_ms)
                 if oi:
@@ -2044,7 +2181,21 @@ class ExchangeConnectorAgent:
         while self.running:
             try:
                 start_time = time.time()
-                borrow = await adapter.get_borrow_rate(symbol)
+
+                async def _fetch_borrow():
+                    return await adapter.get_borrow_rate(symbol)
+
+                try:
+                    borrow = await adapter._execute_with_rate_budget(
+                        _fetch_borrow,
+                        timeout_message=f"Rate budget timeout fetching borrow for {adapter.venue}:{symbol}"
+                    )
+                except RateBudgetTimeoutError:
+                    self.integration_metrics['failed_requests'] += 1
+                    next_ts += interval_sec
+                    await asyncio.sleep(interval_sec)
+                    continue
+
                 latency_ms = (time.time() - start_time) * 1000
                 self.metrics.record_success(operation_key, latency_ms)
                 if borrow:
@@ -2090,9 +2241,11 @@ class ExchangeConnectorAgent:
         except Exception as e:
             logger.error(f"Error in control message consumption: {e}")
             # Use the system circuit breaker to record failure
-            await self.streaming_bus.system_circuit_breaker.record_component_failure(
+            await self.streaming_bus.record_component_failure(
                 component_id=self.circuit_breaker_id,
-                cascade_to_dependents=False
+                cascade_failure=False,
+                reason="exchange_connector_control_listener_failure",
+                severity="medium"
             )
     
     def _handle_control_message_wrapper(self, topic: str, partition_key: str, 
@@ -2215,10 +2368,23 @@ class ExchangeConnectorAgent:
             
             try:
                 start_time = time.time()
-                capture_time = int(time.time() * 1_000_000)  # Define capture time here
-                
-                trades = await adapter.get_trades(symbol, last_timestamp)
-                
+                capture_time = int(time.time() * 1_000_000)
+
+                async def _fetch_trades():
+                    return await adapter.get_trades(symbol, last_timestamp)
+
+                try:
+                    trades = await adapter._execute_with_rate_budget(
+                        _fetch_trades,
+                        timeout_message=f"Rate budget timeout fetching trades for {adapter.venue}:{symbol}"
+                    )
+                except RateBudgetTimeoutError:
+                    self.integration_metrics['failed_requests'] += 1
+                    await self.streaming_bus.record_component_failure(self.circuit_breaker_id)
+                    next_ts += interval_sec
+                    await asyncio.sleep(interval_sec)
+                    continue
+
                 latency_ms = (time.time() - start_time) * 1000
                 self.metrics.record_success(operation_key, latency_ms)
                 
@@ -2325,9 +2491,21 @@ class ExchangeConnectorAgent:
         while self.running:
             try:
                 start_time = time.time()
-                
-                book = await adapter.get_book(symbol)
-                
+
+                async def _fetch_book():
+                    return await adapter.get_book(symbol)
+
+                try:
+                    book = await adapter._execute_with_rate_budget(
+                        _fetch_book,
+                        timeout_message=f"Rate budget timeout fetching book for {adapter.venue}:{symbol}"
+                    )
+                except RateBudgetTimeoutError:
+                    self.integration_metrics['failed_requests'] += 1
+                    next_ts += interval_sec
+                    await asyncio.sleep(interval_sec)
+                    continue
+
                 latency_ms = (time.time() - start_time) * 1000
                 self.metrics.record_success(operation_key, latency_ms)
                 
@@ -2371,7 +2549,20 @@ class ExchangeConnectorAgent:
             try:
                 start_time = time.time()
                 
-                funding = await adapter.get_funding(symbol)
+                async def _fetch_funding():
+                    return await adapter.get_funding(symbol)
+
+                try:
+                    funding = await adapter._execute_with_rate_budget(
+                        _fetch_funding,
+                        timeout_message=f"Rate budget timeout fetching funding for {adapter.venue}:{symbol}"
+                    )
+                except RateBudgetTimeoutError:
+                    self.integration_metrics['failed_requests'] += 1
+                    next_ts += interval_sec
+                    await asyncio.sleep(interval_sec)
+                    continue
+
                 if funding:
                     latency_ms = (time.time() - start_time) * 1000
                     self.metrics.record_success(operation_key, latency_ms)
@@ -2661,6 +2852,13 @@ async def main():
             }
         ],
         "symbols": ["BTCUSDT", "ETHUSDT"],
+        "rate_budget_domains": {
+            "binance": "exchange.binance",
+            "coinbase": "exchange.coinbase",
+            "kraken": "exchange.kraken",
+            "okx": "exchange.okx"
+        },
+        "rate_budget_timeout_sec": 5.0,
         "trade_interval_sec": 1,
         "book_interval_sec": 5,
         "funding_interval_sec": 300,

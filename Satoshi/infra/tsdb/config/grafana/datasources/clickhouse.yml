@@ -1,0 +1,13 @@
+apiVersion: 1
+datasources:
+  - name: ClickHouse
+    type: grafana-clickhouse-datasource
+    access: proxy
+    url: http://clickhouse-server:8123
+    database: satoshi_tsdb
+    basicAuth: false
+    isDefault: true
+    jsonData:
+      defaultDatabase: satoshi_tsdb
+      timeout: 60
+      queryTimeout: 60

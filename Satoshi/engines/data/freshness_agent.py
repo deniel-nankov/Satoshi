@@ -22,7 +22,7 @@ import json
 from threading import Lock
 
 # Streaming Bus Integration
-from infra.bus.streaming_bus import StreamingBus
+from infra.bus.streaming_bus import StreamingBus, BreakerIntent
 
 logger = logging.getLogger(__name__)
 
@@ -1468,17 +1468,55 @@ class FreshnessAgent:
                     component_id = comp_id
                     break
             
-            if component_id and request.action.lower() == "open":
-                # Coordinate with system-wide circuit breaker
-                logger.warning(f"Freshness failure detected, opening system circuit breaker for {component_id}")
-                await self.streaming_bus.record_component_failure(
-                    component_id=component_id,
-                    cascade_failure=True  # Enable cascade to dependents
-                )
-            elif component_id and request.action.lower() == "close":
-                # Signal component recovery
-                logger.info(f"Freshness restored, recording recovery for {component_id}")
-                await self.streaming_bus.record_component_success(component_id)
+            breaker_intent = None
+            action = request.action.lower()
+            if component_id:
+                metadata = {
+                    "stream_name": request.stream_name,
+                    "staleness_duration_us": request.staleness_duration_us,
+                    "confidence": request.confidence,
+                    "raw_metadata": request.metadata
+                }
+                
+                if action == "open":
+                    severity = (request.metadata or {}).get("severity", "critical")
+                    breaker_intent = BreakerIntent(
+                        component_id=component_id,
+                        intent="trip",
+                        reason=request.reason,
+                        severity=severity,
+                        requested_by=self.circuit_breaker_id,
+                        metadata=metadata
+                    )
+                elif action == "close":
+                    severity = (request.metadata or {}).get("severity", "low")
+                    breaker_intent = BreakerIntent(
+                        component_id=component_id,
+                        intent="recover",
+                        reason=request.reason,
+                        severity=severity,
+                        requested_by=self.circuit_breaker_id,
+                        metadata=metadata
+                    )
+                elif action == "half_open":
+                    severity = (request.metadata or {}).get("severity", "medium")
+                    breaker_intent = BreakerIntent(
+                        component_id=component_id,
+                        intent="probe",
+                        reason=request.reason,
+                        severity=severity,
+                        requested_by=self.circuit_breaker_id,
+                        metadata=metadata
+                    )
+            
+            if breaker_intent:
+                try:
+                    await self.streaming_bus.publish_breaker_intent(breaker_intent)
+                    logger.debug(f"Published breaker intent {breaker_intent.intent} for {component_id}")
+                except Exception as publish_exc:
+                    logger.error(f"Failed to publish breaker intent for {component_id}: {publish_exc}")
+                    # Fallback to legacy direct mutation for safety
+                    await self.streaming_bus.apply_breaker_intent(breaker_intent)
             
             # Keep existing queue-based approach for backwards compatibility
             if not self.output_queues['circuit_breaker_requests'].full():

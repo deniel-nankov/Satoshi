@@ -528,7 +528,7 @@ class MemoryGovernor:
     with memory bounds, watermarking, and automatic cleanup.
     """
     
-    def __init__(self, global_config: StateConfig = None):
+    def __init__(self, global_config: Optional[StateConfig] = None):
         self.global_config = global_config or StateConfig()
         
         # State stores registry
@@ -577,7 +577,7 @@ class MemoryGovernor:
             return False
     
     async def process_message(self, topic: str, message: Dict[str, Any], 
-                            state_store_name: str = None) -> bool:
+                            state_store_name: Optional[str] = None) -> bool:
         """
         Process a message with proper watermarking and state management.
         

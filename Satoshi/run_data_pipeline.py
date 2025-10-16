@@ -27,6 +27,9 @@ from typing import Optional, List
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
 
+# Import configuration
+from config import EXCHANGE_CONFIG, OPTIONS_CONFIG, ONCHAIN_CONFIG, EVENTS_CONFIG, STREAMING_BUS_CONFIG
+
 # Import infrastructure
 from infra.bus.streaming_bus import StreamingBus
 from infra.monitoring.prometheus_metrics import get_metrics_collector
@@ -99,138 +102,24 @@ class DataPipelineManager:
         logger.info(f"Data Pipeline Manager initialized in {config_mode} mode")
     
     def _get_streaming_bus_config(self) -> dict:
-        """Get streaming bus configuration based on mode."""
-        base_config = {
-            "bootstrap_servers": ["localhost:9092"],
-            "client_id": "satoshi-data-pipeline",
-            "security_protocol": "PLAINTEXT",
-            "environment": self.config_mode
-        }
-        
-        if self.config_mode == "institutional":
-            # Production-grade configuration
-            base_config.update({
-                "enable_ssl": True,
-                "ssl_cafile": "/path/to/ca-cert",
-                "ssl_certfile": "/path/to/client-cert",
-                "ssl_keyfile": "/path/to/client-key",
-                "security_protocol": "SSL"
-            })
-        
-        return base_config
+        """Get streaming bus configuration from config.py."""
+        return STREAMING_BUS_CONFIG
     
     def _get_exchange_connector_config(self) -> dict:
-        """
-        Get exchange connector configuration.
-        
-        IMPLEMENTED VENUES (6):
-        - binance: Spot trading
-        - binance_futures: Perpetuals/futures
-        - coinbase: Coinbase Pro
-        - gemini: Gemini exchange
-        - kraken: Kraken exchange
-        - okx: OKX exchange
-        
-        ⚠️  CONFIGURATION REQUIRED:
-        Copy config_template.py to config.py and add your API keys!
-        """
-        return {
-            "venues": {
-                # Copy from config_template.py or config.py
-                # See config_template.py for ALL 6 exchange configurations
-                "binance": {
-                    "enabled": False,  # Set to True after adding API keys
-                    "api_key": "YOUR_BINANCE_API_KEY",
-                    "api_secret": "YOUR_BINANCE_SECRET",
-                    "symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
-                    "data_types": ["trades", "book"],
-                    "rate_limit_qps": 100
-                },
-                # Add more venues from config_template.py
-            },
-            "streaming_bus": self._get_streaming_bus_config(),
-            "circuit_breaker_failure_threshold": 5 if self.config_mode == "development" else 3,
-            "health_check_interval": 60.0,
-            "max_retries": 5,
-            "target_uptime_pct": 99.9 if self.config_mode == "institutional" else 99.0
-        }
+        """Get exchange connector configuration from config.py."""
+        return EXCHANGE_CONFIG
     
     def _get_options_collector_config(self) -> dict:
-        """Get options chain collector configuration."""
-        return {
-            "venues": ["deribit", "binance_options"],
-            "symbols": ["BTC", "ETH"],
-            "collection_interval_sec": 60,
-            "streaming_bus": self._get_streaming_bus_config(),
-            "rate_limit_qps": 20
-        }
+        """Get options chain collector configuration from config.py."""
+        return OPTIONS_CONFIG
     
     def _get_onchain_collector_config(self) -> dict:
-        """
-        Get onchain collector configuration.
-        
-        SUPPORTED CHAINS (7):
-        - ethereum: Ethereum mainnet
-        - bsc: Binance Smart Chain
-        - polygon: Polygon PoS
-        - arbitrum: Arbitrum One (L2)
-        - optimism: Optimism (L2)
-        - base: Base (Coinbase L2)
-        - avalanche: Avalanche C-Chain
-        
-        ⚠️  CONFIGURATION REQUIRED:
-        Add RPC endpoints (Alchemy, Infura, etc.) in config.py
-        """
-        return {
-            "chains": {
-                # Copy from config_template.py - 7 chains configured
-                "ethereum": {
-                    "enabled": False,  # Set to True after adding RPC URL
-                    "rpc_url": "https://eth-mainnet.g.alchemy.com/v2/YOUR_ALCHEMY_KEY",
-                    "block_polling_interval": 12.0,
-                    "confirmations_required": 12
-                },
-                # Add more chains from config_template.py
-            },
-            "streaming_bus": self._get_streaming_bus_config(),
-            "rate_limit_qps": 10
-        }
+        """Get onchain collector configuration from config.py."""
+        return ONCHAIN_CONFIG
     
     def _get_events_collector_config(self) -> dict:
-        """
-        Get events collector configuration.
-        
-        IMPLEMENTED SOURCES (10+):
-        - snapshot: DAO governance proposals
-        - compound_governance: Compound proposals
-        - github: Protocol release monitoring (6+ repos)
-        - binance_status: Exchange maintenance
-        - coinbase_status: Exchange health
-        - token_unlocks: Token vesting schedules
-        - cryptopanic: Crypto news aggregator
-        - coindesk: News RSS feed
-        
-        ⚠️  CONFIGURATION REQUIRED:
-        Add API keys for GitHub, CryptoPanic, etc. in config.py
-        """
-        return {
-            "sources": {
-                # Copy complete config from config_template.py
-                "github": {
-                    "enabled": False,  # Set to True after adding token
-                    "token": "YOUR_GITHUB_TOKEN",
-                    "tracked_repos": [
-                        "ethereum/go-ethereum",
-                        "bitcoin/bitcoin",
-                        "solana-labs/solana"
-                    ],
-                    "poll_interval_sec": 600
-                },
-                # Add more sources from config_template.py
-            },
-            "streaming_bus": self._get_streaming_bus_config(),
-            "rate_limit_qps": 5
-        }
+        """Get events collector configuration from config.py."""
+        return EVENTS_CONFIG
     
     async def initialize_components(self):
         """Initialize all pipeline components."""

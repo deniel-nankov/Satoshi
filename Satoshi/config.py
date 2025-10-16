@@ -159,13 +159,30 @@ OPTIONS_CONFIG = {
 # =============================================================================
 # ⛓️ ONCHAIN COLLECTOR CONFIGURATION
 # =============================================================================
+#
+# 🎯 INFRASTRUCTURE STRATEGY:
+#
+# PHASE 1 (Current - $49/month QuickNode Build Plan):
+#   • Ethereum: QuickNode premium endpoint (90% of on-chain alpha)
+#   • L2 chains: Free public RPCs (Arbitrum, Base, Polygon, Optimism)
+#   • Expected alpha: 100-190 bps daily
+#   • Cost: $49/month
+#
+# PHASE 2 (Upgrade to $499/month QuickNode Scale Plan when revenue justifies):
+#   • Replace all free RPCs with dedicated QuickNode endpoints
+#   • 5 premium endpoints = higher reliability, lower latency, no rate limits
+#   • Expected alpha: 150-290 bps daily
+#   • Upgrade trigger: $500k+ AUM or when free RPC rate limits hit
+#
+# =============================================================================
 
 ONCHAIN_CONFIG = {
     "chains": {
-        # ===== ETHEREUM MAINNET (QuickNode) =====
+        # ===== ETHEREUM MAINNET (QuickNode Premium - Build Plan) =====
         "ethereum": {
             "enabled": True,
-            "rpc_url": "https://docs-demo.quiknode.pro/QN_44410a76eaa34dd598bda30478383d6a/",
+            "rpc_url": "https://rough-boldest-bird.quiknode.pro/0b65e1be858da25e93b81fd776f043f1dc11501b/",
+            "ws_url": "wss://rough-boldest-bird.quiknode.pro/0b65e1be858da25e93b81fd776f043f1dc11501b/",
             "fallback_rpcs": [
                 "https://eth.llamarpc.com",
                 "https://rpc.ankr.com/eth"
@@ -180,13 +197,15 @@ ONCHAIN_CONFIG = {
             "priority": "critical"  # Highest alpha per your architecture
         },
         
-        # ===== ARBITRUM (L2 - QuickNode) =====
+        # ===== ARBITRUM (L2 - Free Public RPC → Upgrade to QuickNode at Scale Plan) =====
         "arbitrum": {
             "enabled": True,
-            "rpc_url": "https://docs-demo.arbitrum-mainnet.quiknode.pro/QN_44410a76eaa34dd598bda30478383d6a/",
+            "rpc_url": "https://arb1.arbitrum.io/rpc",  # Free public RPC
+            # TODO: Replace with QuickNode endpoint when upgrading to Scale plan ($499/mo)
+            # "rpc_url": "https://YOUR-ARBITRUM-ENDPOINT.arbitrum-mainnet.quiknode.pro/YOUR-TOKEN/",
             "fallback_rpcs": [
-                "https://arb1.arbitrum.io/rpc",
-                "https://rpc.ankr.com/arbitrum"
+                "https://rpc.ankr.com/arbitrum",
+                "https://arbitrum.llamarpc.com"
             ],
             "block_polling_interval": 0.25,  # 250ms blocks
             "confirmations_required": 1,
@@ -202,13 +221,15 @@ ONCHAIN_CONFIG = {
             "priority": "high"
         },
         
-        # ===== BASE (Coinbase L2 - QuickNode) =====
+        # ===== BASE (Coinbase L2 - Free Public RPC → Upgrade to QuickNode at Scale Plan) =====
         "base": {
             "enabled": True,
-            "rpc_url": "https://docs-demo.base-mainnet.quiknode.pro/QN_44410a76eaa34dd598bda30478383d6a/",
+            "rpc_url": "https://mainnet.base.org",  # Free public RPC
+            # TODO: Replace with QuickNode endpoint when upgrading to Scale plan ($499/mo)
+            # "rpc_url": "https://YOUR-BASE-ENDPOINT.base-mainnet.quiknode.pro/YOUR-TOKEN/",
             "fallback_rpcs": [
-                "https://mainnet.base.org",
-                "https://base.llamarpc.com"
+                "https://base.llamarpc.com",
+                "https://base.blockpi.network/v1/rpc/public"
             ],
             "block_polling_interval": 2.0,
             "confirmations_required": 1,
@@ -222,13 +243,15 @@ ONCHAIN_CONFIG = {
             "note": "Pairs with Coinbase market data for CEX<->L2 arbitrage"
         },
         
-        # ===== POLYGON (QuickNode) =====
+        # ===== POLYGON (Free Public RPC → Upgrade to QuickNode at Scale Plan) =====
         "polygon": {
             "enabled": True,
-            "rpc_url": "https://docs-demo.matic.quiknode.pro/QN_44410a76eaa34dd598bda30478383d6a/",
+            "rpc_url": "https://polygon-rpc.com",  # Free public RPC
+            # TODO: Replace with QuickNode endpoint when upgrading to Scale plan ($499/mo)
+            # "rpc_url": "https://YOUR-POLYGON-ENDPOINT.matic.quiknode.pro/YOUR-TOKEN/",
             "fallback_rpcs": [
-                "https://polygon-rpc.com",
-                "https://rpc.ankr.com/polygon"
+                "https://rpc.ankr.com/polygon",
+                "https://polygon.llamarpc.com"
             ],
             "block_polling_interval": 2.0,
             "confirmations_required": 256,  # Polygon checkpoint system
@@ -243,13 +266,15 @@ ONCHAIN_CONFIG = {
             "priority": "medium"
         },
         
-        # ===== OPTIMISM (QuickNode) =====
+        # ===== OPTIMISM (Free Public RPC → Upgrade to QuickNode at Scale Plan) =====
         "optimism": {
             "enabled": True,
-            "rpc_url": "https://docs-demo.optimism.quiknode.pro/QN_44410a76eaa34dd598bda30478383d6a/",
+            "rpc_url": "https://mainnet.optimism.io",  # Free public RPC
+            # TODO: Replace with QuickNode endpoint when upgrading to Scale plan ($499/mo)
+            # "rpc_url": "https://YOUR-OPTIMISM-ENDPOINT.optimism.quiknode.pro/YOUR-TOKEN/",
             "fallback_rpcs": [
-                "https://mainnet.optimism.io",
-                "https://rpc.ankr.com/optimism"
+                "https://rpc.ankr.com/optimism",
+                "https://optimism.llamarpc.com"
             ],
             "block_polling_interval": 2.0,
             "confirmations_required": 1,

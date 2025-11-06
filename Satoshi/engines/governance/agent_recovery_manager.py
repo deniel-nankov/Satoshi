@@ -122,7 +122,7 @@ class AgentRecoveryManager:
         self.agent_configs = {
             "exchange_connector": AgentConfig(
                 agent_id="exchange_connector",
-                module_path="engines.data.exchange_connector",
+                module_path="engines.data.bronze.exchange_connector",
                 dependencies=[],
                 max_memory_mb=2048,
                 max_cpu_percent=85.0,
@@ -130,7 +130,7 @@ class AgentRecoveryManager:
             ),
             "events_collector": AgentConfig(
                 agent_id="events_collector", 
-                module_path="engines.data.events_collector",
+                module_path="engines.data.bronze.events_collector",
                 dependencies=["exchange_connector"],
                 max_memory_mb=1024,
                 max_cpu_percent=70.0,
@@ -138,7 +138,7 @@ class AgentRecoveryManager:
             ),
             "onchain_collector": AgentConfig(
                 agent_id="onchain_collector",
-                module_path="engines.data.onchain_collector", 
+                module_path="engines.data.bronze.onchain_collector", 
                 dependencies=[],
                 max_memory_mb=1536,
                 max_cpu_percent=75.0,
@@ -146,7 +146,7 @@ class AgentRecoveryManager:
             ),
             "options_chain_collector": AgentConfig(
                 agent_id="options_chain_collector",
-                module_path="engines.data.options_chain_collector",
+                module_path="engines.data.bronze.options_chain_collector",
                 dependencies=["exchange_connector"],
                 max_memory_mb=1024,
                 max_cpu_percent=80.0,
@@ -154,7 +154,7 @@ class AgentRecoveryManager:
             ),
             "anomaly_detector": AgentConfig(
                 agent_id="anomaly_detector",
-                module_path="engines.data.anomaly_detector",
+                module_path="engines.data.silver.anomaly_detector",
                 dependencies=["exchange_connector", "events_collector"],
                 max_memory_mb=2048,
                 max_cpu_percent=90.0,
@@ -162,7 +162,7 @@ class AgentRecoveryManager:
             ),
             "schema_validator": AgentConfig(
                 agent_id="schema_validator",
-                module_path="engines.data.schema_validator",
+                module_path="engines.data.silver.schema_validator",
                 dependencies=["exchange_connector"],
                 max_memory_mb=512,
                 max_cpu_percent=60.0,
@@ -170,7 +170,7 @@ class AgentRecoveryManager:
             ),
             "freshness_agent": AgentConfig(
                 agent_id="freshness_agent",
-                module_path="engines.data.freshness_agent",
+                module_path="engines.data.silver.freshness_agent",
                 dependencies=["exchange_connector"],
                 max_memory_mb=512,
                 max_cpu_percent=50.0,
@@ -178,7 +178,7 @@ class AgentRecoveryManager:
             ),
             "leakage_police": AgentConfig(
                 agent_id="leakage_police",
-                module_path="engines.data.leakage_police",
+                module_path="engines.data.silver.leakage_police",
                 dependencies=["exchange_connector", "events_collector"],
                 max_memory_mb=1024,
                 max_cpu_percent=70.0,
@@ -186,7 +186,7 @@ class AgentRecoveryManager:
             ),
             "reconciler_agent": AgentConfig(
                 agent_id="reconciler_agent",
-                module_path="engines.data.reconciler_agent",
+                module_path="engines.data.silver.reconciler_agent",
                 dependencies=["exchange_connector", "events_collector"],
                 max_memory_mb=1024,
                 max_cpu_percent=75.0,
@@ -218,6 +218,9 @@ class AgentRecoveryManager:
             "dependency_check_enabled": True,
             "cascade_prevention_enabled": True
         }
+        
+        # Sequence tracking for canonical headers
+        self._sequence_numbers: Dict[str, int] = defaultdict(int)
         
         # Task management
         self._tasks = []
@@ -676,16 +679,16 @@ class AgentRecoveryManager:
                 }
             }
             
-            await self.streaming_bus.publish_with_headers(
-                topic="alerts.agent_escalation",
+            topic = "alerts.agent_escalation"
+            self._sequence_numbers[topic] += 1
+            await self.streaming_bus.publish_with_canonical_headers(
+                topic=topic,
+                partition_key=agent_id,
                 payload=escalation_data,
-                headers={
-                    "alert_type": "agent_escalation",
-                    "agent_id": agent_id,
-                    "reason": reason,
-                    "priority": "HIGH" if self.agent_configs[agent_id].critical_for_trading else "MEDIUM"
-                },
-                partition_key=agent_id
+                source_id=f"agent_recovery_manager.escalation.{agent_id}",
+                sequence_number=self._sequence_numbers[topic],
+                correlation_id=f"escalation_{agent_id}_{self.session_id}",
+                producer_version="2.0.0"
             )
             
             logger.error(f"🚨 ESCALATED TO HUMAN: {agent_id} - {reason}")
@@ -740,18 +743,16 @@ class AgentRecoveryManager:
             if event.error_message:
                 event_data["error_message"] = event.error_message
             
-            headers = {
-                "event_type": "agent_recovery",
-                "agent_id": event.agent_id,
-                "action": event.action.value,
-                "success": str(event.success)
-            }
-            
-            await self.streaming_bus.publish_with_headers(
-                topic="events.agent_recovery",
+            topic = "events.agent_recovery"
+            self._sequence_numbers[topic] += 1
+            await self.streaming_bus.publish_with_canonical_headers(
+                topic=topic,
+                partition_key=event.agent_id,
                 payload=event_data,
-                headers=headers,
-                partition_key=event.agent_id
+                source_id=f"agent_recovery_manager.recovery.{event.agent_id}",
+                sequence_number=self._sequence_numbers[topic],
+                correlation_id=f"recovery_{event.agent_id}_{int(event.timestamp.timestamp())}",
+                producer_version="2.0.0"
             )
             
         except Exception as e:
@@ -767,14 +768,16 @@ class AgentRecoveryManager:
                 "session_id": self.session_id
             }
             
-            await self.streaming_bus.publish_with_headers(
-                topic="events.dependency_failure",
+            topic = "events.dependency_failure"
+            self._sequence_numbers[topic] += 1
+            await self.streaming_bus.publish_with_canonical_headers(
+                topic=topic,
+                partition_key=agent_id,
                 payload=event_data,
-                headers={
-                    "event_type": "dependency_failure",
-                    "agent_id": agent_id
-                },
-                partition_key=agent_id
+                source_id=f"agent_recovery_manager.dependency.{agent_id}",
+                sequence_number=self._sequence_numbers[topic],
+                correlation_id=f"dependency_{agent_id}_{self.session_id}",
+                producer_version="2.0.0"
             )
             
         except Exception as e:
@@ -820,14 +823,16 @@ class AgentRecoveryManager:
                     }
                 }
                 
-                await self.streaming_bus.publish_with_headers(
-                    topic="metrics.agent_health",
+                topic = "metrics.agent_health"
+                self._sequence_numbers[topic] += 1
+                await self.streaming_bus.publish_with_canonical_headers(
+                    topic=topic,
+                    partition_key=self.session_id,
                     payload=health_data,
-                    headers={
-                        "metric_type": "agent_health",
-                        "source": "recovery_manager"
-                    },
-                    partition_key=self.session_id
+                    source_id="agent_recovery_manager.health_metrics",
+                    sequence_number=self._sequence_numbers[topic],
+                    correlation_id=f"health_{self.session_id}",
+                    producer_version="2.0.0"
                 )
                 
                 await asyncio.sleep(60)  # Publish every minute

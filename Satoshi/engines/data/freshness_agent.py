@@ -24,6 +24,15 @@ from threading import Lock
 # Streaming Bus Integration
 from infra.bus.streaming_bus import StreamingBus, BreakerIntent
 
+# Import centralized Prometheus metrics
+try:
+    from infra.monitoring.prometheus_metrics import MetricsCollector
+    _metrics_collector = MetricsCollector()
+    METRICS_AVAILABLE = True
+except ImportError:
+    _metrics_collector = None
+    METRICS_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -571,12 +580,20 @@ class FreshnessAgent:
         }
         
         # Streaming Bus Integration
-        streaming_config = self.config.get("streaming_bus", {
-            "bootstrap_servers": "localhost:9092",
-            "enable_ssl": False,
-            "enable_sasl": False
-        })
-        self.streaming_bus = StreamingBus(streaming_config)
+        # FIX: Accept injected StreamingBus instance to avoid creating separate instance
+        # If streaming_bus provided in config, use it. Otherwise create new instance (backward compatibility)
+        if "streaming_bus" in self.config and isinstance(self.config["streaming_bus"], StreamingBus):
+            self.streaming_bus = self.config["streaming_bus"]
+            logger.info("FreshnessAgent using injected StreamingBus instance (shared)")
+        else:
+            # Fallback: create new instance (old behavior)
+            streaming_config = self.config.get("streaming_config", {
+                "bootstrap_servers": "localhost:9092",
+                "enable_ssl": False,
+                "enable_sasl": False
+            })
+            self.streaming_bus = StreamingBus(streaming_config)
+            logger.warning("FreshnessAgent creating separate StreamingBus instance (not recommended)")
         
         # Component identification for circuit breaker
         self.component_id = "freshness_agent"
@@ -612,6 +629,10 @@ class FreshnessAgent:
             'freshness_incidents': asyncio.Queue(maxsize=1000),
             'circuit_breaker_requests': asyncio.Queue(maxsize=100)
         }
+        
+        # Canonical headers: Sequence tracking for institutional compliance
+        # Changed from topic-keyed to source_id-keyed for correct monotonic sequencing
+        self._sequence_numbers: Dict[str, int] = defaultdict(int)  # source_id -> sequence_number
         
         # Incident tracking for false positive analysis
         self.recent_incidents: Dict[str, deque] = defaultdict(lambda: deque(maxlen=1000))
@@ -1386,7 +1407,18 @@ class FreshnessAgent:
                 logger.debug(f"Burst recovery detected for {stream_name}, expediting clearance")
     
     async def _enqueue_freshness_incident(self, incident: FreshnessIncident) -> None:
-        """Enqueue freshness incident to output queue and publish to streaming bus."""
+        """
+        Enqueue freshness incident to output queue and publish to streaming bus.
+        
+        CRITICAL FIX: Use fire-and-forget pattern to prevent deadlocks.
+        Publishing incidents synchronously during check_freshness() creates circular dependency:
+        - check_freshness() awaits publish
+        - publish awaits Kafka producer
+        - producer might be waiting on consumer
+        - consumer is blocked waiting for check_freshness() to complete
+        
+        Solution: Create task but don't await it (fire-and-forget).
+        """
         try:
             # Keep backward compatibility with output queue
             if not self.output_queues['freshness_incidents'].full():
@@ -1394,8 +1426,9 @@ class FreshnessAgent:
             else:
                 logger.warning(f"Freshness incidents queue full, dropping incident for {incident.stream_name}")
                 
-            # Publish to streaming bus
-            await self._publish_freshness_incident(incident)
+            # Publish to streaming bus asynchronously (fire-and-forget to prevent deadlock)
+            # Don't await - let it run in background
+            asyncio.create_task(self._publish_freshness_incident(incident))
             
         except Exception as e:
             logger.error(f"Failed to enqueue freshness incident: {e}")
@@ -1432,18 +1465,30 @@ class FreshnessAgent:
             # Use stream name as partition key for locality
             partition_key = f"freshness_{incident.stream_name}"
             
-            await self.streaming_bus.publish_with_headers(
+            # Get sequence number for this source_id (changed from topic-keyed to source_id-keyed)
+            source_id = f"{self.component_id}.{incident.stream_name}"
+            self._sequence_numbers[source_id] += 1
+            
+            await self.streaming_bus.publish_with_canonical_headers(
                 topic="incidents.Freshness",
                 partition_key=partition_key,
                 payload=incident_data,
-                headers={
-                    "data_type": "freshness_incident",
-                    "stream": incident.stream_name,
-                    "level": incident.level.value,
-                    "severity": incident.severity.upper()
-                },
+                source_id=source_id,
+                sequence_number=self._sequence_numbers[source_id],
+                correlation_id=f"freshness_{incident.stream_name}_{incident.level.value}",
+                producer_version="2.0.0",
                 dedupe_key=f"freshness_{incident.stream_name}_{incident.level.value}_{incident.timestamp_utc_us}"
             )
+            
+            # Update Prometheus metrics
+            if METRICS_AVAILABLE and _metrics_collector:
+                _metrics_collector.increment_counter(
+                    'freshness_violations_total',
+                    labels={
+                        'stream_name': incident.stream_name,
+                        'severity': incident.severity
+                    }
+                )
             
         except Exception as e:
             logger.error(f"Failed to publish freshness incident to streaming bus: {e}")
@@ -1452,6 +1497,10 @@ class FreshnessAgent:
         """
         Enhanced circuit breaker request handling with system-wide coordination.
         Integrates with StreamingBus circuit breaker manager for dependency-aware failures.
+        
+        CRITICAL FIX: Use fire-and-forget pattern to prevent deadlocks.
+        Same issue as _enqueue_freshness_incident - publishing during check_freshness()
+        can create circular dependency with Kafka consumer/producer.
         """
         try:
             # Map stream names to component IDs for circuit breaker coordination
@@ -1509,14 +1558,9 @@ class FreshnessAgent:
                         metadata=metadata
                     )
             
-            if breaker_intent:
-                try:
-                    await self.streaming_bus.publish_breaker_intent(breaker_intent)
-                    logger.debug(f"Published breaker intent {breaker_intent.intent} for {component_id}")
-                except Exception as publish_exc:
-                    logger.error(f"Failed to publish breaker intent for {component_id}: {publish_exc}")
-                    # Fallback to legacy direct mutation for safety
-                    await self.streaming_bus.apply_breaker_intent(breaker_intent)
+            if breaker_intent and component_id:
+                # Fire-and-forget: Create task but don't await to prevent deadlock
+                asyncio.create_task(self._publish_breaker_intent_safe(breaker_intent, component_id))
             
             # Keep existing queue-based approach for backwards compatibility
             if not self.output_queues['circuit_breaker_requests'].full():
@@ -1526,6 +1570,19 @@ class FreshnessAgent:
                 
         except Exception as e:
             logger.error(f"Failed to enqueue circuit breaker request: {e}")
+    
+    async def _publish_breaker_intent_safe(self, breaker_intent: BreakerIntent, component_id: str) -> None:
+        """Safely publish breaker intent with fallback."""
+        try:
+            await self.streaming_bus.publish_breaker_intent(breaker_intent)
+            logger.debug(f"Published breaker intent {breaker_intent.intent} for {component_id}")
+        except Exception as publish_exc:
+            logger.error(f"Failed to publish breaker intent for {component_id}: {publish_exc}")
+            # Fallback to legacy direct mutation for safety
+            try:
+                await self.streaming_bus.apply_breaker_intent(breaker_intent)
+            except Exception as fallback_exc:
+                logger.error(f"Fallback breaker intent application failed: {fallback_exc}")
     
     async def start(self) -> None:
         """Start the freshness monitoring agent with streaming bus consumer."""
@@ -1560,6 +1617,10 @@ class FreshnessAgent:
             )
         )
         self._background_tasks.add(self._consumer_task)
+        
+        # Give consumer time to initialize before returning
+        # This prevents multiple consumers from starting simultaneously
+        await asyncio.sleep(0.1)
         
         # Start health monitoring
         self._health_check_task = asyncio.create_task(self._health_monitor_loop())

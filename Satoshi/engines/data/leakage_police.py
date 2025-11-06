@@ -83,6 +83,17 @@ import warnings
 
 from infra.bus.streaming_bus import StreamingBus, BreakerIntent
 
+# Import centralized Prometheus metrics
+try:
+    from infra.monitoring.prometheus_metrics import MetricsCollector
+    _metrics_collector = MetricsCollector()
+    METRICS_AVAILABLE = True
+except ImportError:
+    _metrics_collector = None
+    METRICS_AVAILABLE = False
+
+logger = logging.getLogger(__name__)
+
 
 class LeakageType(Enum):
     """Types of data leakage that can be detected."""
@@ -309,6 +320,9 @@ class LeakagePolice:
         # Cache for efficiency
         self.feature_hash_cache: Dict[str, str] = {}
         self.correlation_cache: Dict[str, float] = {}
+        
+        # Canonical headers: Sequence tracking for institutional compliance
+        self._sequence_numbers: Dict[str, int] = defaultdict(int)  # topic -> sequence_number
         self.split_hash_cache: Dict[Tuple[str, str], Set[str]] = {}  # (split_name, batch_key) -> hash_set
         self.exclude_cols_sorted = sorted(self.config.hash_exclude_fields)  # Pre-sort for efficiency
         
@@ -675,15 +689,32 @@ class LeakagePolice:
                 "circuit_breaker_id": self.circuit_breaker_id
             }
             
-            # Use exponential backoff retry for resilient publishing
+            # Get sequence number for incidents
+            self._sequence_numbers["incidents.leakage"] += 1
+            
+            # Use exponential backoff retry for resilient publishing with canonical headers
             await self._exponential_backoff_retry(
                 "publish_leakage_incident",
-                self.streaming_bus.publish_with_headers,
+                self.streaming_bus.publish_with_canonical_headers,
                 topic="incidents.leakage",
                 payload=incident_data,
-                headers=headers,
-                partition_key=incident.incident_id
+                partition_key=incident.incident_id,
+                source_id=f"{self.component_id}.{incident.leakage_type.value}",
+                sequence_number=self._sequence_numbers["incidents.leakage"],
+                correlation_id=f"leakage_{self.session_id}_{incident.incident_id}",
+                producer_version="2.0.0"
             )
+            
+            # Update Prometheus metrics
+            if METRICS_AVAILABLE and _metrics_collector:
+                _metrics_collector.increment_counter(
+                    'leakage_incidents_total',
+                    labels={
+                        'leakage_type': incident.leakage_type.value,
+                        'severity': incident.severity.value,
+                        'source': ''  # Add empty source to match metric definition
+                    }
+                )
             
             self.logger.info(f"Published leakage incident: {incident.incident_id}")
             return True
@@ -780,11 +811,16 @@ class LeakagePolice:
                 "comprehensive_metrics": self.get_comprehensive_metrics()
             }
             
-            await self.streaming_bus.publish_with_headers(
+            # Get sequence number for telemetry
+            self._sequence_numbers["telemetry.health"] += 1
+            
+            await self.streaming_bus.publish_with_canonical_headers(
                 topic="telemetry.health",
                 payload=metrics_payload,
-                headers={"component": "leakage_police", "metric_type": "health"},
-                partition_key=self.circuit_breaker_id
+                partition_key=self.circuit_breaker_id,
+                source_id=f"{self.component_id}.health",
+                sequence_number=self._sequence_numbers["telemetry.health"],
+                producer_version="2.0.0"
             )
             
         except Exception as e:

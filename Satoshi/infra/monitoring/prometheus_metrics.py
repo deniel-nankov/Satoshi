@@ -10,6 +10,12 @@ Metrics Categories:
 - Application: Request rates, error rates, latencies
 - Business: Trade counts, PnL, risk exposure
 - Infrastructure: Kafka lag, database connections, circuit breakers
+
+Architecture:
+- Uses official prometheus_client library for metric registration
+- Maintains global REGISTRY for cross-process visibility
+- Provides high-level API with automatic label handling
+- Thread-safe operations for concurrent access
 """
 
 import time
@@ -20,6 +26,15 @@ from dataclasses import dataclass, field
 from collections import defaultdict, deque
 from threading import Lock
 import logging
+
+# Prometheus client library for official metric types and REGISTRY
+try:
+    from prometheus_client import Counter, Gauge, Histogram, Summary, Info
+    from prometheus_client import REGISTRY, CollectorRegistry
+    PROMETHEUS_CLIENT_AVAILABLE = True
+except ImportError:
+    PROMETHEUS_CLIENT_AVAILABLE = False
+    logger.warning("prometheus_client not available - metrics will not be exposed")
 
 logger = logging.getLogger(__name__)
 
@@ -50,14 +65,27 @@ class MetricsCollector:
     High-performance metrics collector optimized for HFT workloads.
     
     Features:
-    - Sub-millisecond metric recording
-    - Lock-free counters for hot paths
+    - Official prometheus_client integration with global REGISTRY
+    - Sub-millisecond metric recording with lock-free operations
     - Automatic system metrics collection
-    - Prometheus exposition format
+    - Thread-safe metric registration and updates
+    - Dynamic label support for dimensional metrics
+    
+    Architecture:
+    - Primary storage: prometheus_client metrics (Counter, Gauge, Histogram)
+    - Fallback storage: Internal dictionaries for compatibility
+    - Global REGISTRY ensures metrics visible across process boundaries
     """
     
     def __init__(self, collection_interval: float = 1.0):
         self.collection_interval = collection_interval
+        
+        # prometheus_client metric objects (registered with global REGISTRY)
+        self._prom_counters: Dict[str, Counter] = {}
+        self._prom_gauges: Dict[str, Gauge] = {}
+        self._prom_histograms: Dict[str, Histogram] = {}
+        
+        # Legacy internal storage (for backward compatibility and custom operations)
         self.metrics: Dict[str, TimeSeries] = {}
         self.counters: Dict[str, float] = defaultdict(float)
         self.gauges: Dict[str, float] = {}
@@ -77,6 +105,8 @@ class MetricsCollector:
         
         # Initialize core metrics
         self._initialize_core_metrics()
+        
+        logger.info(f"MetricsCollector initialized (prometheus_client={'available' if PROMETHEUS_CLIENT_AVAILABLE else 'unavailable'})")
     
     def _initialize_core_metrics(self) -> None:
         """Initialize essential system, application, and crypto-native business metrics."""
@@ -97,30 +127,35 @@ class MetricsCollector:
         # =================================================================================
         
         # Schema Validator Metrics
+        self.register_gauge("schema_validator_status", "Schema validator agent status (1=healthy, 0=unhealthy)")
         self.register_counter("schema_validation_total", "Total schema validations performed", {"table_name": "", "status": "", "venue": ""})
         self.register_histogram("schema_validation_duration_seconds", "Time spent validating schemas", labels={"table_name": "", "venue": ""})
         self.register_counter("schema_violations_total", "Total schema violations detected", {"table_name": "", "violation_type": "", "venue": ""})
         self.register_gauge("schema_compliance_ratio", "Ratio of compliant vs total messages", {"table_name": "", "venue": ""})
         
-        # Leakage Police Metrics  
+        # Leakage Police Metrics
+        self.register_gauge("leakage_police_status", "Leakage police agent status (1=healthy, 0=unhealthy)")
         self.register_counter("leakage_incidents_total", "Total leakage incidents detected", {"leakage_type": "", "severity": "", "source": ""})
         self.register_gauge("leakage_detection_score", "Current leakage detection confidence score", {"feature_set": ""})
         self.register_histogram("leakage_analysis_duration_seconds", "Time spent analyzing for leakage", labels={"analysis_type": ""})
         self.register_gauge("temporal_leakage_risk", "Current temporal leakage risk score (0-1)", {"time_window": ""})
         
         # Anomaly Detector Metrics
+        self.register_gauge("anomaly_detector_status", "Anomaly detector agent status (1=healthy, 0=unhealthy)")
         self.register_counter("anomalies_detected_total", "Total anomalies detected", {"anomaly_type": "", "severity": "", "table": ""})
         self.register_gauge("anomaly_detection_score", "Current anomaly detection confidence", {"detector_type": "", "symbol": ""})
         self.register_histogram("anomaly_analysis_duration_seconds", "Time spent on anomaly detection")
         self.register_gauge("statistical_deviation_score", "Current statistical deviation from baseline", {"metric": "", "symbol": ""})
         
         # Freshness Agent Metrics
+        self.register_gauge("freshness_agent_status", "Freshness agent status (1=healthy, 0=unhealthy)")
         self.register_gauge("data_staleness_seconds", "Current data staleness in seconds", {"stream_name": "", "venue": ""})
         self.register_counter("freshness_violations_total", "Total freshness SLA violations", {"stream_name": "", "severity": ""})
         self.register_gauge("freshness_sla_ratio", "Ratio of fresh vs stale messages", {"stream_name": "", "sla_threshold": ""})
         self.register_histogram("freshness_check_duration_seconds", "Time spent checking data freshness")
         
-        # Reconciler Agent Metrics  
+        # Reconciler Agent Metrics
+        self.register_gauge("reconciler_agent_status", "Reconciler agent status (1=healthy, 0=unhealthy)")
         self.register_counter("reconciliation_discrepancies_total", "Total reconciliation discrepancies", {"source_pair": "", "discrepancy_type": ""})
         self.register_gauge("cross_source_accuracy_ratio", "Cross-source data accuracy ratio", {"source_pair": ""})
         self.register_histogram("reconciliation_duration_seconds", "Time spent on cross-source reconciliation", labels={"source_count": ""})
@@ -156,6 +191,38 @@ class MetricsCollector:
         self.register_gauge("bridge_inflows_24h_usd", "24-hour bridge inflows to exchanges", {"bridge": "", "destination": ""})
         self.register_gauge("whale_wallet_activity", "Large wallet activity score", {"token": "", "threshold_usd": ""})
         self.register_gauge("network_hash_rate", "Network hash rate", {"chain": ""})
+        
+        # =================================================================================
+        # DATA COLLECTION FLOW METRICS - Bronze Layer Ingestion
+        # =================================================================================
+        
+        # Onchain Data Collection
+        self.register_counter("onchain_blocks_processed_total", "Total blockchain blocks processed", {"chain": "", "status": ""})
+        self.register_counter("onchain_transfer_events_total", "Total ERC20/native transfer events collected", {"chain": "", "token": ""})
+        self.register_gauge("onchain_latest_block", "Latest block number processed", {"chain": ""})
+        self.register_gauge("onchain_sync_lag_blocks", "Number of blocks behind chain tip", {"chain": ""})
+        self.register_histogram("onchain_block_processing_duration_seconds", "Time to process a block batch", labels={"chain": "", "batch_size": ""})
+        self.register_counter("onchain_rpc_calls_total", "Total RPC calls made", {"chain": "", "method": "", "status": ""})
+        self.register_counter("onchain_events_published_total", "Total onchain events published to Kafka", {"chain": "", "event_type": ""})
+        
+        # Exchange Data Collection
+        self.register_counter("exchange_trades_collected_total", "Total trades collected from exchanges", {"exchange": "", "symbol": ""})
+        self.register_counter("exchange_orderbook_updates_total", "Total orderbook snapshots collected", {"exchange": "", "symbol": ""})
+        self.register_counter("exchange_api_calls_total", "Total exchange API calls made", {"exchange": "", "endpoint": "", "status": ""})
+        self.register_histogram("exchange_api_latency_seconds", "Exchange API response latency", labels={"exchange": "", "endpoint": ""})
+        self.register_counter("exchange_data_published_total", "Total exchange data published to Kafka", {"exchange": "", "data_type": ""})
+        self.register_gauge("exchange_websocket_status", "Exchange websocket connection status (1=connected)", {"exchange": "", "channel": ""})
+        
+        # Options Data Collection
+        self.register_counter("options_data_published_total", "Total options chain data published to Kafka", {"venue": "", "symbol": ""})
+        
+        # Events Data Collection
+        self.register_counter("events_data_published_total", "Total off-chain events published to Kafka", {"source": "", "event_type": ""})
+        
+        # Data Ingestion Rate Metrics
+        self.register_gauge("data_ingestion_rate_per_second", "Current data ingestion rate", {"source": "", "data_type": ""})
+        self.register_counter("data_bytes_ingested_total", "Total bytes ingested", {"source": "", "data_type": ""})
+        self.register_histogram("data_message_size_bytes", "Size of ingested messages", labels={"source": "", "data_type": ""})
         
         # Market Microstructure Metrics  
         self.register_gauge("orderbook_depth_bps", "Order book depth at N bps from mid", {"symbol": "", "venue": "", "depth_bps": ""})
@@ -199,6 +266,44 @@ class MetricsCollector:
         self.register_gauge("breaker_component_state", "Breaker state as observed by orchestrator (0=closed, 0.5=half_open, 1=open)", {"component_id": ""})
         self.register_gauge("breaker_state_last_update_timestamp", "Last update timestamp for breaker state", {"component_id": ""})
         
+        # =================================================================================
+        # DASHBOARD-REQUIRED METRICS (Grafana dashboard expectations)
+        # =================================================================================
+        
+        # Streaming Bus Health
+        self.register_gauge("streaming_bus_health_status", "StreamingBus health status (1=healthy, 0=unhealthy)")
+        self.register_gauge("streaming_bus_active_topics", "Number of active Kafka topics")
+        self.register_histogram("data_processing_latency_ms", "Data processing latency in milliseconds", labels={"layer": "", "component": ""})
+        self.register_gauge("data_quality_score", "Overall data quality score (0-100)", {"layer": ""})
+        
+        # Gold Layer - OHLCV Aggregator
+        self.register_counter("ohlcv_bars_created_total", "Total OHLCV bars created", {"interval": "", "venue": "", "symbol": ""})
+        self.register_histogram("ohlcv_bar_latency_p95", "95th percentile OHLCV bar latency", labels={"interval": ""})
+        self.register_gauge("ohlcv_active_windows", "Number of active OHLCV windows", {"interval": ""})
+        self.register_counter("ohlcv_circuit_breaker_trips", "OHLCV circuit breaker trip count", {"reason": ""})
+        self.register_counter("ohlcv_publish_failures", "OHLCV publish failure count", {"interval": "", "reason": ""})
+        
+        # Platinum Layer - Feature Engineering
+        self.register_histogram("feature_computation_seconds", "Time to compute features", labels={"symbol": "", "feature_type": ""})
+        self.register_counter("features_published_total", "Total features published", {"symbol": "", "feature_type": ""})
+        self.register_counter("feature_computation_errors_total", "Total feature computation errors", {"symbol": "", "error_type": ""})
+        self.register_gauge("feature_confidence_score", "Feature quality confidence score", {"symbol": ""})
+        self.register_gauge("feature_data_age_milliseconds", "Age of input data in milliseconds", {"symbol": ""})
+        
+        # Platinum Layer - OrderbookDepthAnalyzer (Microstructure Features)
+        self.register_counter("depth_features_computed_total", "Total orderbook depth features computed", {"symbol": "", "venue": ""})
+        self.register_histogram("depth_computation_duration_seconds", "Time to compute depth features", labels={"symbol": ""})
+        self.register_gauge("depth_spoofing_score", "Current spoofing detection score (0-1)", {"symbol": "", "venue": ""})
+        self.register_gauge("depth_imbalance_10bps", "Current 10bps depth imbalance (-1 to 1)", {"symbol": "", "venue": ""})
+        self.register_counter("depth_analyzer_errors_total", "Total depth analyzer errors", {"error_type": ""})
+        
+        # WorkloadDistributor / Partition Management Metrics
+        self.register_counter("workload_hot_keys_detected_total", "Total hot keys detected (BTC, ETH, etc.)", {"topic": ""})
+        self.register_counter("workload_skew_detections_total", "Total partition skew detections", {"topic": ""})
+        self.register_counter("workload_routing_decisions_total", "Partition routing decisions by strategy", {"topic": "", "strategy": ""})
+        self.register_gauge("workload_active_hot_keys", "Number of currently active hot keys", {"topic": ""})
+        self.register_gauge("workload_partition_load_imbalance", "Current partition load imbalance ratio", {"topic": ""})
+        
         # Quality pipeline orchestration metrics
         self.register_counter("quality_pipeline_messages_total", "Quality pipeline messages processed", {"source_topic": "", "decision": ""})
         self.register_histogram("quality_pipeline_duration_seconds", "End-to-end quality pipeline duration", labels={"source_topic": ""})
@@ -215,34 +320,82 @@ class MetricsCollector:
         self.register_gauge("rate_budget_timeouts_count", "Agent rate-budget timeout events", {"component": "", "domain": ""})
         
     def register_counter(self, name: str, help_text: str, labels: Optional[Dict[str, str]] = None) -> None:
-        """Register a counter metric."""
+        """
+        Register a counter metric with prometheus_client.
+        
+        Counters are monotonically increasing values (e.g., total requests, errors).
+        Registered with global REGISTRY for Prometheus scraping.
+        """
         with self._lock:
+            # Store in internal registry for backward compatibility
             self.metrics[name] = TimeSeries(
                 name=name,
                 help_text=help_text,
                 metric_type="counter",
                 labels=labels or {}
             )
+            
+            # Register with prometheus_client if available
+            if PROMETHEUS_CLIENT_AVAILABLE and name not in self._prom_counters:
+                try:
+                    label_names = list(labels.keys()) if labels else []
+                    self._prom_counters[name] = Counter(
+                        name,
+                        help_text,
+                        labelnames=label_names,
+                        registry=REGISTRY
+                    )
+                    logger.debug(f"Registered Counter: {name} with labels {label_names}")
+                except Exception as e:
+                    # Metric may already be registered (e.g., across multiple instances)
+                    logger.debug(f"Counter {name} already registered or error: {e}")
     
     def register_gauge(self, name: str, help_text: str, labels: Optional[Dict[str, str]] = None) -> None:
-        """Register a gauge metric."""
+        """
+        Register a gauge metric with prometheus_client.
+        
+        Gauges can go up or down (e.g., temperature, active connections).
+        Registered with global REGISTRY for Prometheus scraping.
+        """
         with self._lock:
+            # Store in internal registry for backward compatibility
             self.metrics[name] = TimeSeries(
                 name=name,
                 help_text=help_text,
                 metric_type="gauge",
                 labels=labels or {}
             )
+            
+            # Register with prometheus_client if available
+            if PROMETHEUS_CLIENT_AVAILABLE and name not in self._prom_gauges:
+                try:
+                    label_names = list(labels.keys()) if labels else []
+                    self._prom_gauges[name] = Gauge(
+                        name,
+                        help_text,
+                        labelnames=label_names,
+                        registry=REGISTRY
+                    )
+                    logger.debug(f"Registered Gauge: {name} with labels {label_names}")
+                except Exception as e:
+                    logger.debug(f"Gauge {name} already registered or error: {e}")
     
     def register_histogram(self, name: str, help_text: str, 
                          buckets: Optional[List[float]] = None, labels: Optional[Dict[str, str]] = None) -> None:
-        """Register a histogram metric."""
+        """
+        Register a histogram metric with prometheus_client.
+        
+        Histograms track distributions of values (e.g., request latencies).
+        Uses HFT-optimized buckets by default (microseconds to seconds).
+        Registered with global REGISTRY for Prometheus scraping.
+        """
         if buckets is None:
             # HFT-optimized latency buckets (microseconds to seconds)
             buckets = [0.000001, 0.000005, 0.00001, 0.00005, 0.0001, 0.0005, 
                       0.001, 0.005, 0.01, 0.05, 0.1, 0.5, 1.0, 5.0, 10.0]
         
         with self._lock:
+            # Store in internal registry for backward compatibility
             self.metrics[name] = TimeSeries(
                 name=name,
                 help_text=help_text,
@@ -251,13 +404,44 @@ class MetricsCollector:
             )
             # Store bucket configuration in TimeSeries metadata
             self.metrics[name].__dict__['buckets'] = buckets
+            
+            # Register with prometheus_client if available
+            if PROMETHEUS_CLIENT_AVAILABLE and name not in self._prom_histograms:
+                try:
+                    label_names = list(labels.keys()) if labels else []
+                    self._prom_histograms[name] = Histogram(
+                        name,
+                        help_text,
+                        labelnames=label_names,
+                        buckets=buckets,
+                        registry=REGISTRY
+                    )
+                    logger.debug(f"Registered Histogram: {name} with labels {label_names} and {len(buckets)} buckets")
+                except Exception as e:
+                    logger.debug(f"Histogram {name} already registered or error: {e}")
     
     def increment_counter(self, name: str, value: float = 1.0, labels: Optional[Dict[str, str]] = None) -> None:
-        """Increment a counter metric (thread-safe, lock-free for performance)."""
+        """
+        Increment a counter metric (thread-safe, uses prometheus_client).
+        
+        Updates both prometheus_client Counter and internal storage for compatibility.
+        Automatically handles label dimensions.
+        """
+        # Update internal counter (legacy compatibility)
         key = f"{name}_{hash(frozenset(labels.items()) if labels else frozenset())}"
         self.counters[key] += value
         
-        # Record sample for time series
+        # Update prometheus_client Counter if available
+        if PROMETHEUS_CLIENT_AVAILABLE and name in self._prom_counters:
+            try:
+                if labels:
+                    self._prom_counters[name].labels(**labels).inc(value)
+                else:
+                    self._prom_counters[name].inc(value)
+            except Exception as e:
+                logger.debug(f"Error updating prometheus Counter {name}: {e}")
+        
+        # Record sample for time series (internal tracking)
         sample = MetricSample(
             name=name,
             value=self.counters[key],
@@ -269,10 +453,27 @@ class MetricsCollector:
             self.metrics[name].samples.append(sample)
     
     def set_gauge(self, name: str, value: float, labels: Optional[Dict[str, str]] = None) -> None:
-        """Set a gauge metric value."""
+        """
+        Set a gauge metric value (thread-safe, uses prometheus_client).
+        
+        Updates both prometheus_client Gauge and internal storage for compatibility.
+        Gauges can be set to any value (unlike counters which only increment).
+        """
+        # Update internal gauge (legacy compatibility)
         key = f"{name}_{hash(frozenset(labels.items()) if labels else frozenset())}"
         self.gauges[key] = value
         
+        # Update prometheus_client Gauge if available
+        if PROMETHEUS_CLIENT_AVAILABLE and name in self._prom_gauges:
+            try:
+                if labels:
+                    self._prom_gauges[name].labels(**labels).set(value)
+                else:
+                    self._prom_gauges[name].set(value)
+            except Exception as e:
+                logger.debug(f"Error updating prometheus Gauge {name}: {e}")
+        
+        # Record sample for time series (internal tracking)
         sample = MetricSample(
             name=name,
             value=value,
@@ -284,7 +485,13 @@ class MetricsCollector:
             self.metrics[name].samples.append(sample)
     
     def observe_histogram(self, name: str, value: float, labels: Optional[Dict[str, str]] = None) -> None:
-        """Add an observation to a histogram metric."""
+        """
+        Observe a value in a histogram metric (thread-safe, uses prometheus_client).
+        
+        Updates both prometheus_client Histogram and internal storage for compatibility.
+        Histograms automatically calculate quantiles, sums, and bucket counts.
+        """
+        # Update internal histogram (legacy compatibility)
         key = f"{name}_{hash(frozenset(labels.items()) if labels else frozenset())}"
         self.histograms[key].append(value)
         
@@ -292,6 +499,17 @@ class MetricsCollector:
         if len(self.histograms[key]) > 1000:
             self.histograms[key] = self.histograms[key][-1000:]
         
+        # Update prometheus_client Histogram if available
+        if PROMETHEUS_CLIENT_AVAILABLE and name in self._prom_histograms:
+            try:
+                if labels:
+                    self._prom_histograms[name].labels(**labels).observe(value)
+                else:
+                    self._prom_histograms[name].observe(value)
+            except Exception as e:
+                logger.debug(f"Error updating prometheus Histogram {name}: {e}")
+        
+        # Record sample for time series (internal tracking)
         sample = MetricSample(
             name=name,
             value=value,
@@ -332,8 +550,9 @@ class MetricsCollector:
     async def collect_system_metrics(self) -> None:
         """Collect system-level metrics."""
         try:
-            # CPU metrics
-            cpu_percent = psutil.cpu_percent(interval=None)
+            # CPU metrics - use short blocking interval for accuracy
+            # interval=0.1 gives accurate reading without blocking too long
+            cpu_percent = psutil.cpu_percent(interval=0.1)
             self.set_gauge("system_cpu_percent", cpu_percent)
             
             # Memory metrics
@@ -768,6 +987,47 @@ class MetricsCollector:
             )
         except Exception as exc:
             logger.error(f"Error recording quality pipeline metrics: {exc}")
+    
+    def record_workload_distributor_metrics(self, workload_metrics: Dict[str, Any]) -> None:
+        """
+        Record WorkloadDistributor metrics for hot key detection and partition balance.
+        
+        Args:
+            workload_metrics: Dict with keys:
+                - hot_keys_detected: int (total lifetime hot keys detected)
+                - skew_detections: int (total skew detections)
+                - routing_decisions: Dict[str, int] (strategy -> count)
+                - active_hot_keys: Dict[str, List[str]] (topic -> [key1, key2, ...])
+        """
+        try:
+            # Record hot key detections (total)
+            if "hot_keys_detected" in workload_metrics:
+                self.set_gauge("workload_hot_keys_detected_total", 
+                             float(workload_metrics["hot_keys_detected"]),
+                             {"topic": "all"})
+            
+            # Record skew detections (total)
+            if "skew_detections" in workload_metrics:
+                self.set_gauge("workload_skew_detections_total",
+                             float(workload_metrics["skew_detections"]),
+                             {"topic": "all"})
+            
+            # Record routing decisions by strategy
+            routing_decisions = workload_metrics.get("routing_decisions", {})
+            for strategy, count in routing_decisions.items():
+                self.set_gauge("workload_routing_decisions_total",
+                             float(count),
+                             {"topic": "all", "strategy": strategy})
+            
+            # Record active hot keys per topic
+            active_hot_keys = workload_metrics.get("active_hot_keys", {})
+            for topic, keys in active_hot_keys.items():
+                self.set_gauge("workload_active_hot_keys",
+                             float(len(keys)),
+                             {"topic": topic})
+                
+        except Exception as exc:
+            logger.error(f"Error recording workload distributor metrics: {exc}")
 
 # =============================
 # CONVENIENCE DECORATORS

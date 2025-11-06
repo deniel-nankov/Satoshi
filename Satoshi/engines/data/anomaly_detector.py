@@ -22,6 +22,15 @@ from datetime import datetime, timezone
 # Streaming Bus Integration
 from infra.bus.streaming_bus import StreamingBus
 
+# Import centralized Prometheus metrics
+try:
+    from infra.monitoring.prometheus_metrics import MetricsCollector
+    _metrics_collector = MetricsCollector()
+    METRICS_AVAILABLE = True
+except ImportError:
+    _metrics_collector = None
+    METRICS_AVAILABLE = False
+
 logger = logging.getLogger(__name__)
 
 
@@ -414,6 +423,9 @@ class DataAnomalyDetector:
         
         # Performance metrics
         self.detections_count = 0
+        
+        # Canonical headers: Sequence tracking for institutional compliance
+        self._sequence_numbers: Dict[str, int] = defaultdict(int)  # topic -> sequence_number
         
         logger.info("Data Anomaly Detector initialized")
     
@@ -1942,18 +1954,30 @@ class DataAnomalyDetector:
             # Use table name as partition key for locality
             partition_key = f"anomaly_{incident.table_name}"
             
-            await self.streaming_bus.publish_with_headers(
+            # Get sequence number for incidents
+            self._sequence_numbers["incidents.Anomaly"] += 1
+            
+            await self.streaming_bus.publish_with_canonical_headers(
                 topic="incidents.Anomaly",
                 partition_key=partition_key,
                 payload=incident_data,
-                headers={
-                    "data_type": "anomaly_incident",
-                    "table": incident.table_name,
-                    "anomaly_type": incident.anomaly_type.value,
-                    "severity": incident.severity.value.upper()
-                },
+                source_id=f"anomaly_detector.{incident.anomaly_type.value}",
+                sequence_number=self._sequence_numbers["incidents.Anomaly"],
+                correlation_id=f"{incident.table_name}_{incident.field_name or 'global'}",
+                producer_version="2.0.0",
                 dedupe_key=f"anomaly_{incident.table_name}_{incident.field_name or 'global'}_{incident.anomaly_type.value}_{incident.detected_at}"
             )
+            
+            # Update Prometheus metrics
+            if METRICS_AVAILABLE and _metrics_collector:
+                _metrics_collector.increment_counter(
+                    'anomalies_detected_total',
+                    labels={
+                        'table': incident.table_name,
+                        'anomaly_type': incident.anomaly_type.value,
+                        'severity': incident.severity.value
+                    }
+                )
             
         except Exception as e:
             logger.exception(f"Failed to publish anomaly incident to streaming bus: {e}")

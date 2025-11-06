@@ -9,6 +9,7 @@ Do/Don't: Do coerce within explicit rules; don't silently reshape.
 import asyncio
 import logging
 import time
+from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import Dict, List, Optional, Any, Union, Set, Callable, Tuple, Pattern
 from decimal import Decimal, ROUND_HALF_EVEN
@@ -21,6 +22,15 @@ import statistics
 
 # Streaming Bus Integration
 from infra.bus.streaming_bus import StreamingBus
+
+# Import centralized Prometheus metrics
+try:
+    from infra.monitoring.prometheus_metrics import MetricsCollector
+    _metrics_collector = MetricsCollector()
+    METRICS_AVAILABLE = True
+except ImportError:
+    _metrics_collector = None
+    METRICS_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
 
@@ -280,6 +290,10 @@ class SchemaValidatorAgent:
         
         # Default coercion rules (only used if strict_mode=False)
         self.default_coercion_rules = self._build_default_coercion_rules()
+        
+        # Canonical headers: Sequence tracking for institutional compliance
+        # Changed from topic-keyed to source_id-keyed for correct monotonic sequencing per source
+        self._sequence_numbers: Dict[str, int] = defaultdict(int)  # source_id -> sequence_number
     
     def _build_default_coercion_rules(self) -> List[CoercionRule]:
         """Build default coercion rules for common type conversions."""
@@ -570,7 +584,7 @@ class SchemaValidatorAgent:
                 expected=f"timestamp within {max_future_buffer_us/1_000_000:.1f}s of current time",
                 actual=f"timestamp {future_seconds:.1f}s in the future",
                 row_identifier="temporal_validation",
-                severity="error"
+                severity="warning"  # Bronze layer - clock skew is common in distributed systems
             ))
         
         # 2. Clock drift detection (track per table/field)
@@ -606,7 +620,7 @@ class SchemaValidatorAgent:
                     severity="warning"
                 ))
             
-            # Detect backwards time (strict ordering violation)
+            # Detect backwards time (expect in streaming Bronze layer)
             if time_diff < -60_000_000:  # Allow 1 minute tolerance for minor reordering
                 violations.append(SchemaViolation(
                     table_name=table_name,
@@ -615,7 +629,7 @@ class SchemaValidatorAgent:
                     expected="timestamps in non-decreasing order (±1min tolerance)",
                     actual=f"timestamp went backwards by {abs(time_diff)/1_000_000:.1f}s",
                     row_identifier="temporal_validation",
-                    severity="error"
+                    severity="warning"  # Bronze layer - out-of-order is expected in streaming
                 ))
             
             tracker['last_timestamp'] = timestamp_us
@@ -1205,10 +1219,11 @@ class SchemaValidatorAgent:
             cross_field_violations = self._validate_cross_field_rules(schema, cleaned_row, row_id)
             violations.extend(cross_field_violations)
             
-            # Update metrics for successful validation
+            # Update metrics - only fail on ERROR severity (institutional Bronze layer)
             validation_time_ms = (time.time() - start_time) * 1000
-            passed = len(violations) == 0
-            self._update_validation_metrics(validation_time_ms, passed, len(violations))
+            error_violations = [v for v in violations if v.severity == "error"]
+            passed = len(error_violations) == 0
+            self._update_validation_metrics(validation_time_ms, passed, len(violations), table_name)
             
             return cleaned_row, violations, flags
             
@@ -1934,6 +1949,17 @@ class SchemaValidatorAgent:
             first_error_examples=first_error_examples
         )
         
+        # Update Prometheus metrics
+        if METRICS_AVAILABLE and _metrics_collector:
+            if failed_count > 0:
+                _metrics_collector.increment_counter('schema_validation_total', labels={'table_name': table_name, 'status': 'failed', 'venue': ''})
+            else:
+                _metrics_collector.increment_counter('schema_validation_total', labels={'table_name': table_name, 'status': 'success', 'venue': ''})
+            
+            # Record violations by type
+            for violation_type, count in violations_by_type.items():
+                _metrics_collector.increment_counter('schema_violations_total', value=count, labels={'table_name': table_name, 'violation_type': violation_type, 'venue': ''})
+        
         # Streaming Bus: Publish validation summary to clean.pass_fail
         try:
             validation_result = {
@@ -1952,11 +1978,17 @@ class SchemaValidatorAgent:
             # Use table name as partition key for schema locality
             partition_key = f"schema_validation_{table_name}"
             
-            await self.streaming_bus.publish_with_headers(
+            # Get sequence number for validation results (using source_id as key)
+            source_id_pass_fail = f"schema_validator.{table_name}"
+            self._sequence_numbers[source_id_pass_fail] += 1
+            
+            await self.streaming_bus.publish_with_canonical_headers(
                 topic="clean.pass_fail",
                 partition_key=partition_key,
                 payload=validation_result,
-                headers={"data_type": "validation_summary", "table": table_name}
+                source_id=source_id_pass_fail,
+                sequence_number=self._sequence_numbers[source_id_pass_fail],
+                producer_version="2.0.0"
             )
             
             # Also publish individual violations to incidents.SchemaViolation
@@ -1973,11 +2005,18 @@ class SchemaValidatorAgent:
                     "severity": violation.severity.upper()
                 }
                 
-                await self.streaming_bus.publish_with_headers(
+                # Get sequence number for incidents (using source_id as key for this topic too)
+                source_id_incidents = f"schema_validator.{table_name}.incidents"
+                self._sequence_numbers[source_id_incidents] += 1
+                
+                await self.streaming_bus.publish_with_canonical_headers(
                     topic="incidents.SchemaViolation",
                     partition_key=partition_key,
                     payload=violation_data,
-                    headers={"data_type": "schema_violation", "table": table_name}
+                    source_id=source_id_incidents,
+                    sequence_number=self._sequence_numbers[source_id_incidents],
+                    correlation_id=f"{table_name}_{violation.row_identifier}",  # Link violations to same row
+                    producer_version="2.0.0"
                 )
                 
         except Exception as e:
@@ -2287,15 +2326,25 @@ class SchemaValidatorAgent:
         else:
             raise Exception(f"Operation {operation_name} failed with no recorded exception")
     
-    def _update_validation_metrics(self, validation_time_ms: float, passed: bool, violations_count: int):
+    def _update_validation_metrics(self, validation_time_ms: float, passed: bool, violations_count: int, table_name: str = 'unknown'):
         """Update validation metrics."""
         self.metrics['validations_processed'] += 1
         if passed:
             self.metrics['validations_passed'] += 1
+            # Increment Prometheus counter for successful validations
+            if METRICS_AVAILABLE and _metrics_collector:
+                _metrics_collector.increment_counter('schema_validation_total', labels={'table_name': table_name, 'status': 'success', 'venue': ''})
         else:
             self.metrics['validations_failed'] += 1
+            # Increment Prometheus counter for failed validations
+            if METRICS_AVAILABLE and _metrics_collector:
+                _metrics_collector.increment_counter('schema_validation_total', labels={'table_name': table_name, 'status': 'failed', 'venue': ''})
         
         self.metrics['schema_violations'] += violations_count
+        # Increment Prometheus counter for violations
+        if violations_count > 0 and METRICS_AVAILABLE and _metrics_collector:
+            _metrics_collector.increment_counter('schema_violations_total', value=violations_count, labels={'table_name': table_name, 'violation_type': 'general', 'venue': ''})
+        
         self.metrics['last_validation_timestamp'] = time.time()
         
         # Update running average of validation time
@@ -2353,13 +2402,13 @@ class SchemaValidatorAgent:
                     name="quantity",
                     field_type=FieldType.STRING,  # Decimal as string for precision
                     required=True,
-                    pattern=r"^\d+(\.\d+)?$"  # Positive decimal
+                    pattern=r"^\d+(\.\d+)?([eE][+-]?\d+)?$"  # Positive decimal (including scientific notation)
                 ),
                 FieldSchema(
                     name="price",
                     field_type=FieldType.STRING,  # Decimal as string for precision
                     required=True,
-                    pattern=r"^\d+(\.\d+)?$"  # Positive decimal
+                    pattern=r"^\d+(\.\d+)?([eE][+-]?\d+)?$"  # Positive decimal (including scientific notation)
                 ),
                 FieldSchema(
                     name="trade_id",
@@ -2416,7 +2465,7 @@ class SchemaValidatorAgent:
                     name="quantity",
                     field_type=FieldType.STRING,
                     required=True,
-                    pattern=r"^\d+(\.\d+)?$"
+                    pattern=r"^\d+(\.\d+)?([eE][+-]?\d+)?$"  # Positive decimal (including scientific notation)
                 ),
                 FieldSchema(
                     name="side",
@@ -2645,6 +2694,13 @@ class SchemaValidatorAgent:
                     allow_enum_case_insensitive=True
                 ),
                 FieldSchema(
+                    name="data_type",
+                    field_type=FieldType.STRING,
+                    required=False,
+                    nullable=True,
+                    max_length=20
+                ),
+                FieldSchema(
                     name="event_type",
                     field_type=FieldType.STRING,
                     required=True,
@@ -2670,6 +2726,12 @@ class SchemaValidatorAgent:
                     required=True
                 ),
                 FieldSchema(
+                    name="timestamp",
+                    field_type=FieldType.TIMESTAMP_US,
+                    required=False,
+                    nullable=True
+                ),
+                FieldSchema(
                     name="from_address",
                     field_type=FieldType.ADDRESS,
                     required=True,
@@ -2687,27 +2749,61 @@ class SchemaValidatorAgent:
                     name="token",
                     field_type=FieldType.STRING,
                     nullable=True,
-                    max_length=50
+                    max_length=100  # Increased for token addresses
                 ),
                 FieldSchema(
                     name="amount",
                     field_type=FieldType.STRING,
                     nullable=True,
-                    pattern=r"^\d+(\.\d+)?$"
+                    pattern=r"^(\d+(\.\d+)?|\d+\.?\d*[eE][+-]?\d+)$"  # Supports both decimal and scientific notation
                 ),
                 FieldSchema(
                     name="value_usd",
                     field_type=FieldType.STRING,
+                    required=False,  # Bronze layer - calculated in Silver
                     nullable=True,
-                    pattern=r"^\d+(\.\d+)?$"
+                    pattern=r"^(\d+(\.\d+)?|\d+\.?\d*[eE][+-]?\d+)$"  # Supports both decimal and scientific notation
+                ),
+                FieldSchema(
+                    name="capture_timestamp",
+                    field_type=FieldType.TIMESTAMP_US,
+                    required=False,
+                    nullable=True
+                ),
+                FieldSchema(
+                    name="finalized",
+                    field_type=FieldType.BOOLEAN,
+                    required=False,
+                    nullable=True
+                ),
+                FieldSchema(
+                    name="reorg_depth",
+                    field_type=FieldType.INTEGER,
+                    required=False,
+                    nullable=True,
+                    min_value=0
+                ),
+                FieldSchema(
+                    name="block_hash",
+                    field_type=FieldType.HASH,
+                    required=False,
+                    nullable=True,
+                    pattern=r"^0x[a-fA-F0-9]{64}$",
+                    coercion_rules=[LOWERCASE_HASH_RULE]
+                ),
+                FieldSchema(
+                    name="extra",
+                    field_type=FieldType.DICT,
+                    required=False,
+                    nullable=True
                 )
             ],
-            primary_key=["chain", "tx_hash", "from_address", "to_address"],
-            foreign_keys={
-                "chain": "chains.name"
-            },
+            primary_key=["chain", "tx_hash", "block_number"],  # Updated to include block_number for better uniqueness
+            foreign_keys={},  # Removed chain FK since we don't have reference data loaded
             batch_constraints=["monotonic_increasing"],  # Block numbers should increase
-            strict_foreign_keys=False
+            strict_foreign_keys=False,
+            allow_extra_fields=True,  # Allow metadata fields not explicitly defined
+            unexpected_field_severity="info"  # Don't fail validation for extra fields
         )
         self.register_schema(onchain_flows_schema)
         
@@ -2890,6 +2986,235 @@ class SchemaValidatorAgent:
         )
         self.register_schema(offchain_events_schema)
         
+        # =============================
+        # MACRO/TRADFI DATA SCHEMAS
+        # =============================
+        
+        # TradFi Indices schema (VIX, DXY, SPY, DIA, QQQ)
+        tradfi_indices_schema = TableSchema(
+            name="tradfi_indices",
+            fields=[
+                FieldSchema(
+                    name="symbol",
+                    field_type=FieldType.STRING,
+                    required=True,
+                    max_length=20,
+                    trim_whitespace=True
+                ),
+                FieldSchema(
+                    name="price",
+                    field_type=FieldType.FLOAT,
+                    required=True,
+                    min_value=0.0
+                ),
+                FieldSchema(
+                    name="timestamp_utc_us",
+                    field_type=FieldType.TIMESTAMP_US,
+                    required=True
+                ),
+                FieldSchema(
+                    name="source",
+                    field_type=FieldType.STRING,
+                    required=True,
+                    max_length=50,
+                    enum_values={"alpha_vantage", "yahoo_finance"}
+                ),
+                FieldSchema(
+                    name="change_pct",
+                    field_type=FieldType.FLOAT,
+                    nullable=True
+                ),
+                FieldSchema(
+                    name="volume",
+                    field_type=FieldType.FLOAT,
+                    nullable=True,
+                    min_value=0.0
+                )
+            ],
+            primary_key=["symbol", "timestamp_utc_us", "source"],
+            strict_foreign_keys=False
+        )
+        self.register_schema(tradfi_indices_schema)
+        
+        # TradFi Equities schema (SPY, QQQ, TLT, GLD, USO)
+        tradfi_equities_schema = TableSchema(
+            name="tradfi_equities",
+            fields=[
+                FieldSchema(
+                    name="symbol",
+                    field_type=FieldType.STRING,
+                    required=True,
+                    max_length=20,
+                    trim_whitespace=True
+                ),
+                FieldSchema(
+                    name="price",
+                    field_type=FieldType.FLOAT,
+                    required=True,
+                    min_value=0.0
+                ),
+                FieldSchema(
+                    name="timestamp_utc_us",
+                    field_type=FieldType.TIMESTAMP_US,
+                    required=True
+                ),
+                FieldSchema(
+                    name="source",
+                    field_type=FieldType.STRING,
+                    required=True,
+                    max_length=50,
+                    enum_values={"alpha_vantage", "yahoo_finance"}
+                ),
+                FieldSchema(
+                    name="change_pct",
+                    field_type=FieldType.FLOAT,
+                    nullable=True
+                ),
+                FieldSchema(
+                    name="volume",
+                    field_type=FieldType.FLOAT,
+                    nullable=True,
+                    min_value=0.0
+                ),
+                FieldSchema(
+                    name="market_cap",
+                    field_type=FieldType.FLOAT,
+                    nullable=True,
+                    min_value=0.0
+                )
+            ],
+            primary_key=["symbol", "timestamp_utc_us", "source"],
+            strict_foreign_keys=False
+        )
+        self.register_schema(tradfi_equities_schema)
+        
+        # Macro Economic Indicators schema (FRED data)
+        macro_economic_indicators_schema = TableSchema(
+            name="macro_economic_indicators",
+            fields=[
+                FieldSchema(
+                    name="indicator_name",
+                    field_type=FieldType.STRING,
+                    required=True,
+                    max_length=100,
+                    trim_whitespace=True
+                ),
+                FieldSchema(
+                    name="indicator_code",
+                    field_type=FieldType.STRING,
+                    required=True,
+                    max_length=50,
+                    trim_whitespace=True
+                ),
+                FieldSchema(
+                    name="value",
+                    field_type=FieldType.FLOAT,
+                    required=True
+                ),
+                FieldSchema(
+                    name="timestamp_utc_us",
+                    field_type=FieldType.TIMESTAMP_US,
+                    required=True
+                ),
+                FieldSchema(
+                    name="source",
+                    field_type=FieldType.STRING,
+                    required=True,
+                    max_length=50,
+                    default_value="fred"
+                ),
+                FieldSchema(
+                    name="frequency",
+                    field_type=FieldType.STRING,
+                    nullable=True,
+                    max_length=20,
+                    enum_values={"daily", "weekly", "monthly", "quarterly", "annual"}
+                ),
+                FieldSchema(
+                    name="units",
+                    field_type=FieldType.STRING,
+                    nullable=True,
+                    max_length=50
+                )
+            ],
+            primary_key=["indicator_code", "timestamp_utc_us"],
+            strict_foreign_keys=False
+        )
+        self.register_schema(macro_economic_indicators_schema)
+        
+        # Crypto Market Metrics schema (CoinGecko data)
+        crypto_market_metrics_schema = TableSchema(
+            name="crypto_market_metrics",
+            fields=[
+                FieldSchema(
+                    name="timestamp_utc_us",
+                    field_type=FieldType.TIMESTAMP_US,
+                    required=True
+                ),
+                FieldSchema(
+                    name="source",
+                    field_type=FieldType.STRING,
+                    required=True,
+                    max_length=50,
+                    default_value="coingecko"
+                ),
+                FieldSchema(
+                    name="total_market_cap_usd",
+                    field_type=FieldType.FLOAT,
+                    required=True,
+                    min_value=0.0
+                ),
+                FieldSchema(
+                    name="total_volume_24h_usd",
+                    field_type=FieldType.FLOAT,
+                    required=True,
+                    min_value=0.0
+                ),
+                FieldSchema(
+                    name="btc_dominance_pct",
+                    field_type=FieldType.FLOAT,
+                    required=True,
+                    min_value=0.0,
+                    max_value=100.0
+                ),
+                FieldSchema(
+                    name="eth_dominance_pct",
+                    field_type=FieldType.FLOAT,
+                    nullable=True,
+                    min_value=0.0,
+                    max_value=100.0
+                ),
+                FieldSchema(
+                    name="defi_market_cap_usd",
+                    field_type=FieldType.FLOAT,
+                    nullable=True,
+                    min_value=0.0
+                ),
+                FieldSchema(
+                    name="defi_volume_24h_usd",
+                    field_type=FieldType.FLOAT,
+                    nullable=True,
+                    min_value=0.0
+                ),
+                FieldSchema(
+                    name="defi_dominance_pct",
+                    field_type=FieldType.FLOAT,
+                    nullable=True,
+                    min_value=0.0,
+                    max_value=100.0
+                ),
+                FieldSchema(
+                    name="active_cryptocurrencies",
+                    field_type=FieldType.INTEGER,
+                    nullable=True,
+                    min_value=0
+                )
+            ],
+            primary_key=["timestamp_utc_us", "source"],
+            strict_foreign_keys=False
+        )
+        self.register_schema(crypto_market_metrics_schema)
+        
         logger.info(f"Registered {len(self.schemas)} data ingestion schemas: {list(self.schemas.keys())}")
     
     async def _load_reference_data(self):
@@ -2904,10 +3229,20 @@ class SchemaValidatorAgent:
         self.update_reference_data("venues", "name", venues)
         
         # Load symbols from config or use defaults
+        # NOTE: Symbol normalization happens in Quality Orchestrator BEFORE validation,
+        # so we only need to list canonical formats (e.g., BTCUSDT, not BTC-USD)
         symbols = set(self.config.get("valid_symbols", [
+            # Spot pairs (canonical format after normalization)
             "BTCUSDT", "ETHUSDT", "ADAUSDT", "SOLUSDT", "DOTUSDT", "LINKUSDT",
-            "BTCUSD", "ETHUSD", "BTCEUR", "ETHEUR", "USDCUSDT", "BUSDUSDT",
-            "BTC-USD", "ETH-USD", "BTC-EUR", "ETH-EUR", "XBT-USD", "ETH-XBT"
+            "XRPUSDT", "AVAXUSDT", "MATICUSDT", "UNIUSDT", "ATOMUSDT", "ALGOUSDT",
+            "APTUSDT", "SUIUSDT", "NEARUSDT", "FTMUSDT", "LTCUSDT", "BCHUSDT",
+            "ICPUSDT", "VETUSDT", "AAVEUSDT", "MKRUSDT", "SNXUSDT", "CRVUSDT",
+            "COMPUSDT", "SUSHIUSDT", "YFIUSDT", "1INCHUSDT", "BALUSDT",
+            "ARBUSDT", "OPUSDT", "DOGEUSDT", "SHIBUSDT", "PEPEUSDT",
+            # Fiat pairs
+            "BTCUSD", "ETHUSD", "BTCEUR", "ETHEUR",
+            # Stablecoin pairs
+            "USDCUSDT", "BUSDUSDT"
         ]))
         self.update_reference_data("symbols", "symbol", symbols)
         
@@ -2992,8 +3327,8 @@ class SchemaValidatorAgent:
             logger.exception("Full startup error traceback:")
             raise  # Re-raise to prevent silent failure
     
-    def _handle_raw_message_sync(self, topic: str, partition_key: str, payload: Dict[str, Any], headers: Dict[str, str]) -> None:
-        """Synchronous handler for incoming raw data messages for validation."""
+    async def _handle_raw_message_sync(self, topic: str, partition_key: str, payload: Dict[str, Any], headers: Dict[str, str]) -> None:
+        """Asynchronous handler for incoming raw data messages for validation."""
         try:
             # Extract table name from topic
             table_name = self._extract_table_name_from_topic(topic)
@@ -3054,7 +3389,12 @@ class SchemaValidatorAgent:
             "raw_data.market.funding": "market_funding",
             "raw_data.market.oi": "market_oi",
             "raw_data.onchain.blocks": "onchain_blocks",
-            "raw_data.onchain.mempool": "onchain_mempool"
+            "raw_data.onchain.mempool": "onchain_mempool",
+            # Macro/TradFi/Crypto metrics
+            "raw_data.tradfi.indices": "tradfi_indices",
+            "raw_data.tradfi.equities": "tradfi_equities",
+            "raw_data.macro.economic_indicators": "macro_economic_indicators",
+            "raw_data.crypto.market_metrics": "crypto_market_metrics"
         }
         
         return topic_mapping.get(topic)
@@ -3080,7 +3420,13 @@ class SchemaValidatorAgent:
             # Events data
             "offchain_events": "clean.market.events",
             "calendar_events": "clean.market.events",
-            "governance_events": "clean.market.events"
+            "governance_events": "clean.market.events",
+            
+            # Macro/TradFi/Crypto metrics
+            "tradfi_indices": "clean.tradfi.indices",
+            "tradfi_equities": "clean.tradfi.equities",
+            "macro_economic_indicators": "clean.macro.economic_indicators",
+            "crypto_market_metrics": "clean.crypto.market_metrics"
         }
         
         return table_to_topic_mapping.get(table_name)
@@ -3122,54 +3468,43 @@ class SchemaValidatorAgent:
             }
         }
         
-        # **NEW: Publish cleaned data to appropriate clean.* topic**
-        if status in ["PASS", "COERCED"]:  # Only publish clean data if validation passed
-            clean_topic = self._get_clean_topic_for_table(table_name)
-            if clean_topic:
-                # Create clean data payload
-                clean_payload = {
-                    "table_name": table_name,
-                    "timestamp": int(time.time() * 1_000_000),
-                    "data": cleaned_row,  # The validated and cleaned data
-                    "validation_status": status,
-                    "coercion_count": len([v for v in violations if v.violation_type.endswith("_coerced")]),
-                    "source_row_id": violations[0].row_identifier if violations else headers.get("record_id", "unknown")
-                }
-                
-                # Use source row ID as partition key for ordering
-                clean_partition_key = violations[0].row_identifier if violations else headers.get("record_id", table_name)
-                
-                await self.streaming_bus.publish_with_headers(
-                    topic=clean_topic,
-                    partition_key=clean_partition_key,
-                    payload=clean_payload,
-                    headers={
-                        "data_type": "clean_data",
-                        "table": table_name,
-                        "validation_status": status,
-                        "source_topic": headers.get("original_topic", "unknown"),
-                        "venue": headers.get("venue", "unknown"),
-                        "chain": headers.get("chain", "unknown")
-                    },
-                    dedupe_key=f"clean_{table_name}_{clean_payload['source_row_id']}_{clean_payload['timestamp']}"
-                )
-                
-                # Gold layer curation removed - handled by separate Gold Layer component
-                # Schema Validator only handles raw_data.* → clean.* transformation
+        # **ARCHITECTURAL FIX: Schema Validator does NOT publish to clean topics**
+        # 
+        # REASON: Violates single responsibility + bypasses quality pipeline
+        # 
+        # CORRECT FLOW:
+        #   Schema Validator → returns validation result to Quality Orchestrator
+        #   Quality Orchestrator → runs full 6-stage pipeline → publishes if quality_score >= threshold
+        # 
+        # Publishing here would mean data reaches clean topics BEFORE:
+        #   - Leakage detection
+        #   - Anomaly detection  
+        #   - Freshness validation
+        #   - Cross-source reconciliation
+        # 
+        # This defeats the purpose of the quality orchestration pipeline.
+        # Only Quality Orchestrator should decide what data is "clean enough" to publish.
+        # 
+        # REMOVED CODE (lines 3189-3220):
+        #   - Direct publishing to clean.* topics
+        #   - Bypassed orchestrator's quality decision
+        # 
+        # Schema Validator now ONLY returns validation results.
+        # Quality Orchestrator makes the publishing decision.
         
-        # Publish to clean.pass_fail topic
+        # Publish to clean.pass_fail topic (validation summary only, not clean data)
         partition_key = f"schema_validation_{table_name}"
-        await self.streaming_bus.publish_with_headers(
+        
+        # Get sequence number for validation summary
+        self._sequence_numbers["clean.pass_fail"] += 1
+        
+        await self.streaming_bus.publish_with_canonical_headers(
             topic="clean.pass_fail",
             partition_key=partition_key,
             payload=validation_result,
-            headers={
-                "data_type": "validation_result", 
-                "table": table_name,
-                "status": status,
-                "original_topic": headers.get("original_topic", "unknown")
-            },
-            dedupe_key=f"{table_name}_{validation_result['row_id']}_{validation_result['timestamp']}"
+            source_id=f"schema_validator.{table_name}",
+            sequence_number=self._sequence_numbers["clean.pass_fail"],
+            producer_version="2.0.0"
         )
         
         # Publish individual schema violations to incidents
@@ -3190,16 +3525,17 @@ class SchemaValidatorAgent:
                     "coerced_value": str(violation.coerced_value) if violation.coerced_value is not None else None
                 }
                 
-                await self.streaming_bus.publish_with_headers(
+                # Get sequence number for incidents
+                self._sequence_numbers["incidents.SchemaViolation"] += 1
+                
+                await self.streaming_bus.publish_with_canonical_headers(
                     topic="incidents.SchemaViolation",
                     partition_key=partition_key,
                     payload=violation_data,
-                    headers={
-                        "data_type": "schema_violation", 
-                        "table": table_name,
-                        "severity": violation.severity.upper(),
-                        "violation_type": violation.violation_type
-                    },
+                    source_id=f"schema_validator.{table_name}",
+                    sequence_number=self._sequence_numbers["incidents.SchemaViolation"],
+                    correlation_id=f"{table_name}_{violation.row_identifier}",
+                    producer_version="2.0.0",
                     dedupe_key=f"schema_{violation.table_name}_{violation.row_identifier}_{violation.field_name}_{violation.violation_type}"
                 )
     
@@ -3219,15 +3555,16 @@ class SchemaValidatorAgent:
             "error_details": error_message[:500]  # Truncate long error messages
         }
         
-        await self.streaming_bus.publish_with_headers(
+        # Get sequence number for incidents
+        self._sequence_numbers["incidents.SchemaViolation"] += 1
+        
+        await self.streaming_bus.publish_with_canonical_headers(
             topic="incidents.SchemaViolation",
             partition_key=f"schema_error_{topic}",
             payload=error_data,
-            headers={
-                "data_type": "schema_processing_error", 
-                "source_topic": topic,
-                "severity": "ERROR"
-            },
+            source_id=f"schema_validator.{topic}",
+            sequence_number=self._sequence_numbers["incidents.SchemaViolation"],
+            producer_version="2.0.0",
             dedupe_key=f"schema_error_{topic}_{headers.get('record_id', int(time.time_ns()))}"
         )
     

@@ -32,6 +32,18 @@ import uuid
 import struct
 import random
 
+# Adaptive rate limiting
+from infra.bus.adaptive_rate_limiter import AdaptiveRateLimiterPool
+
+# Import centralized Prometheus metrics
+try:
+    from infra.monitoring.prometheus_metrics import MetricsCollector
+    _metrics_collector = MetricsCollector()
+    METRICS_AVAILABLE = True
+except ImportError:
+    _metrics_collector = None
+    METRICS_AVAILABLE = False
+
 # Kafka imports with proper fallbacks
 try:
     from aiokafka import AIOKafkaProducer, AIOKafkaConsumer
@@ -142,281 +154,67 @@ class RateDomainState:
     last_update_ts: float = field(default_factory=lambda: time.time())
 
 
-class NullRateBudgetLease:
-    """No-op async context manager when rate limiting is disabled."""
+# ==========================================================================
+# ADAPTIVE RATE LIMITING (AIMD Algorithm)
+# ==========================================================================
 
-    async def __aenter__(self):
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb):
-        return False
-
-
-class RateBudgetLease:
-    """Async context manager representing a successful borrow from a rate budget."""
-
-    __slots__ = ("manager", "domain", "permits", "started_at", "waited_sec")
-
-    def __init__(self, manager: "RateBudgetManager", domain: str, permits: float,
-                 waited_sec: float):
-        self.manager = manager
+class AdaptiveRateLimitContext:
+    """
+    Async context manager for adaptive rate limiting using AIMD algorithm.
+    
+    Automatically acquires permits before the protected block and records
+    success/failure after, enabling the rate limiter to adapt dynamically.
+    """
+    
+    def __init__(self, pool, domain: str, timeout: Optional[float] = None):
+        self.pool = pool
         self.domain = domain
-        self.permits = permits
-        self.started_at = time.monotonic()
-        self.waited_sec = waited_sec
-
-    async def __aenter__(self) -> "RateBudgetLease":
-        return self
-
-    async def __aexit__(self, exc_type, exc_val, exc_tb) -> bool:
-        self.manager.record_completion(self.domain, self.permits, self.waited_sec,
-                                       duration=time.monotonic() - self.started_at)
-        return False
-
-
-class RateBudgetBorrowProxy:
-    """Wrapper returning an async context from RateBudgetManager.borrow."""
-
-    __slots__ = ("manager", "domain", "permits", "timeout", "_lease")
-
-    def __init__(self, manager: "RateBudgetManager", domain: str,
-                 permits: float = 1.0, timeout: Optional[float] = None):
-        self.manager = manager
-        self.domain = domain
-        self.permits = permits
         self.timeout = timeout
-        self._lease: Optional[Union[RateBudgetLease, NullRateBudgetLease]] = None
-
+        self.limiter = None
+        self.start_time = None
+    
     async def __aenter__(self):
-        self._lease = await self.manager.borrow(self.domain, self.permits, self.timeout)
-        return await self._lease.__aenter__()
-
+        if not self.pool:
+            # Rate limiting disabled
+            return self
+        
+        # Get or create limiter for this domain
+        self.limiter = await self.pool.get_limiter(
+            domain=self.domain,
+            initial_rate=10.0,  # Conservative start
+            max_rate=100.0      # Can be tuned per domain
+        )
+        
+        # Acquire permission
+        self.start_time = time.time()
+        success = await self.limiter.acquire(timeout=self.timeout)
+        
+        if not success:
+            raise asyncio.TimeoutError(
+                f"Rate limit timeout for domain '{self.domain}' after {self.timeout}s"
+            )
+        
+        return self
+    
     async def __aexit__(self, exc_type, exc_val, exc_tb):
-        if self._lease:
-            return await self._lease.__aexit__(exc_type, exc_val, exc_tb)
+        if not self.limiter or not self.start_time:
+            return False
+        
+        latency_ms = (time.time() - self.start_time) * 1000.0
+        
+        # Record outcome for adaptive adjustment
+        if exc_type is None:
+            # Success
+            self.limiter.record_success(latency_ms=latency_ms)
+        elif exc_type == asyncio.TimeoutError:
+            # Timeout
+            self.limiter.record_timeout()
+        else:
+            # Other error
+            self.limiter.record_error()
+        
         return False
 
-
-class RateBudgetManager:
-    """
-    Cooperative token-bucket manager that enforces cross-agent rate budgets per domain.
-
-    Agents borrow permits before issuing external calls (HTTP/RPC). DQO can push budget
-    updates by publishing to the control topic. Metrics are tracked per-domain for
-    observability (qps utilization, wait ratio, throttled events, etc.).
-    """
-
-    CONTROL_TOPIC = "control.rate_budget"
-
-    def __init__(self, initial_config: Optional[Dict[str, Any]] = None):
-        self._domains: Dict[str, RateDomainState] = {}
-        self._lock = asyncio.Lock()
-        self._enabled = True
-        self._default_qps = None
-        self._default_burst = None
-        self._metrics: Dict[str, Dict[str, Any]] = defaultdict(dict)
-        self._429_counts: Dict[str, int] = defaultdict(int)
-        self.control_topic = self.CONTROL_TOPIC
-
-        if initial_config:
-            self.load_config(initial_config)
-
-    @property
-    def enabled(self) -> bool:
-        return self._enabled
-
-    def load_config(self, config: Dict[str, Any]) -> None:
-        """Initialize rate budget configuration from static config."""
-        self._enabled = bool(config.get("enabled", True))
-        self.control_topic = config.get("control_topic", self.CONTROL_TOPIC)
-        self._default_qps = config.get("default_qps")
-        self._default_burst = config.get("default_burst")
-
-        domains_cfg = config.get("domains", {})
-        if isinstance(domains_cfg, list):
-            domains_iter = domains_cfg
-        elif isinstance(domains_cfg, dict):
-            domains_iter = [
-                {"name": name, **(settings if isinstance(settings, dict) else {})}
-                for name, settings in domains_cfg.items()
-            ]
-        else:
-            domains_iter = []
-
-        for domain_settings in domains_iter:
-            name = domain_settings.get("name") or domain_settings.get("domain")
-            if not name:
-                continue
-            qps = float(domain_settings.get("qps", self._default_qps or 0.0))
-            burst = float(domain_settings.get("burst", domain_settings.get("burst_tokens",
-                                                                          self._default_burst or qps * 2 or 1.0)))
-            self._upsert_domain(name, qps, burst)
-
-    def _upsert_domain(self, domain: str, qps: float, burst: float) -> None:
-        now = time.monotonic()
-        burst = max(burst, qps) if qps > 0 else burst
-        state = self._domains.get(domain)
-        if state:
-            state.qps = max(0.0, qps)
-            state.burst = max(0.0, burst)
-            state.tokens = min(state.tokens, state.burst)
-            state.last_update_ts = time.time()
-        else:
-            initial_tokens = burst if burst > 0 else qps
-            self._domains[domain] = RateDomainState(
-                domain=domain,
-                qps=max(0.0, qps),
-                burst=max(0.0, burst),
-                tokens=max(0.0, initial_tokens),
-                last_refill=now
-            )
-        logger.info(f"RateBudgetManager: domain={domain} qps={qps} burst={burst}")
-
-    async def borrow(self, domain: str, permits: float = 1.0,
-                     timeout: Optional[float] = None) -> Union[RateBudgetLease, NullRateBudgetLease]:
-        """Borrow permits for a given domain, respecting token-bucket limits."""
-        if not self.enabled:
-            return NullRateBudgetLease()
-
-        domain_state = self._domains.get(domain)
-        if domain_state is None:
-            # If no domain configured, allow borrow immediately.
-            return NullRateBudgetLease()
-
-        deadline = None
-        loop = asyncio.get_event_loop()
-        if timeout is not None:
-            deadline = loop.time() + timeout
-
-        waited_total = 0.0
-
-        while True:
-            async with self._lock:
-                state = self._domains.get(domain)
-                if state is None:
-                    return NullRateBudgetLease()
-
-                now = time.monotonic()
-                self._refill(state, now)
-
-                if permits <= 0 or state.tokens >= permits:
-                    tokens_to_consume = max(permits, 0.0)
-                    state.tokens = max(0.0, state.tokens - tokens_to_consume)
-                    state.recent_borrows.append((now, tokens_to_consume))
-                    self._metrics[domain]["last_borrow_ts"] = time.time()
-                    return RateBudgetLease(self, domain, tokens_to_consume, waited_total)
-
-                # Need to wait for tokens
-                state.throttled_events += 1
-                wait_needed = (permits - state.tokens) / max(state.qps, 1e-6) if state.qps > 0 else 0.1
-                wait_needed = max(wait_needed, 0.01)
-                state.wait_events.append(wait_needed)
-
-            if deadline and loop.time() + wait_needed > deadline:
-                raise asyncio.TimeoutError(f"Rate budget timeout for domain {domain}")
-
-            await asyncio.sleep(min(wait_needed, 0.5))
-            waited_total += min(wait_needed, 0.5)
-
-    def _refill(self, state: RateDomainState, now: float) -> None:
-        if state.qps <= 0:
-            state.tokens = 0.0
-            state.last_refill = now
-            return
-
-        elapsed = max(0.0, now - state.last_refill)
-        if elapsed <= 0:
-            return
-
-        state.tokens = min(
-            state.burst,
-            state.tokens + elapsed * state.qps
-        )
-        state.last_refill = now
-
-    def record_completion(self, domain: str, permits: float, waited: float,
-                          duration: float) -> None:
-        """Record metrics after the protected operation finishes."""
-        stats = self._metrics[domain]
-        stats.setdefault("completed", 0)
-        stats.setdefault("total_duration_sec", 0.0)
-        stats.setdefault("total_wait_sec", 0.0)
-        stats.setdefault("permits", 0.0)
-
-        stats["completed"] += 1
-        stats["total_duration_sec"] += duration
-        stats["total_wait_sec"] += waited
-        stats["permits"] += permits
-
-    def record_429(self, domain: str) -> None:
-        """Allow collectors to report external 429/limit responses."""
-        self._429_counts[domain] += 1
-
-    def apply_control_message(self, message: Dict[str, Any]) -> None:
-        """Handle control message payload to update budgets."""
-        if not isinstance(message, dict):
-            return
-
-        if "enabled" in message:
-            self._enabled = bool(message["enabled"])
-            logger.info(f"RateBudgetManager: enabled={self._enabled}")
-
-        domains = []
-        if "domains" in message and isinstance(message["domains"], list):
-            domains = message["domains"]
-        elif "domain" in message:
-            domains = [message]
-
-        for entry in domains:
-            if not isinstance(entry, dict):
-                continue
-            name = entry.get("name") or entry.get("domain")
-            if not name:
-                continue
-            qps = entry.get("qps")
-            burst = entry.get("burst") or entry.get("burst_tokens")
-            if qps is None and burst is None:
-                continue
-            current_state = self._domains.get(name)
-            if qps is None and current_state:
-                qps = current_state.qps
-            if burst is None and current_state:
-                burst = current_state.burst
-            if qps is None:
-                qps = self._default_qps or 0.0
-            if burst is None:
-                burst = self._default_burst or qps * 2 or 1.0
-            self._upsert_domain(name, float(qps), float(burst))
-
-    def snapshot(self) -> Dict[str, Any]:
-        """Return a metrics snapshot suitable for Prom/Grafana export."""
-        result: Dict[str, Any] = {}
-        now = time.monotonic()
-        for domain, state in self._domains.items():
-            recent_tokens = [permits for ts, permits in state.recent_borrows if now - ts <= 1.0]
-            qps_utilization = sum(recent_tokens)
-            wait_samples = list(state.wait_events)
-            avg_wait = sum(wait_samples) / len(wait_samples) if wait_samples else 0.0
-            stats = self._metrics.get(domain, {})
-            completed = stats.get("completed", 0)
-            avg_duration = (stats.get("total_duration_sec", 0.0) / completed) if completed else 0.0
-            avg_wait_recorded = (stats.get("total_wait_sec", 0.0) / completed) if completed else 0.0
-
-            result[domain] = {
-                "configured_qps": state.qps,
-                "configured_burst": state.burst,
-                "available_tokens": state.tokens,
-                "qps_utilization": qps_utilization,
-                "avg_wait_sec": avg_wait,
-                "avg_wait_recorded_sec": avg_wait_recorded,
-                "avg_duration_sec": avg_duration,
-                "throttled_events": state.throttled_events,
-                "borrow_count": completed,
-                "last_update_ts": state.last_update_ts,
-                "429_count": self._429_counts.get(domain, 0),
-            }
-
-        return result
 def generate_uuidv7() -> str:
     """
     Generate a UUIDv7 with time-ordered properties for institutional traceability.
@@ -608,6 +406,20 @@ class CircuitBreakerState_Instance:
     opened_time_us: Optional[int] = None
     half_open_call_count: int = 0
     
+    def _update_prometheus_state(self):
+        """Update Prometheus gauge with current state."""
+        state_value = {
+            CircuitBreakerState.CLOSED: 0,
+            CircuitBreakerState.HALF_OPEN: 1,
+            CircuitBreakerState.OPEN: 2
+        }[self.state]
+        if METRICS_AVAILABLE and _metrics_collector:
+            _metrics_collector.set_gauge(
+                'circuit_breaker_state',
+                state_value,
+                labels={'component': self.config.component_id, 'breaker_type': ''}
+            )
+    
     def can_execute(self) -> bool:
         """Check if circuit allows execution."""
         now_us = int(time.time_ns() // 1000)
@@ -619,6 +431,7 @@ class CircuitBreakerState_Instance:
             if (self.opened_time_us and 
                 now_us - self.opened_time_us >= self.config.recovery_timeout_us):
                 self.state = CircuitBreakerState.HALF_OPEN
+                self._update_prometheus_state()
                 self.half_open_call_count = 0
                 self.success_count = 0
                 return True
@@ -636,6 +449,7 @@ class CircuitBreakerState_Instance:
             self.success_count += 1
             if self.success_count >= self.config.success_threshold:
                 self.state = CircuitBreakerState.CLOSED
+                self._update_prometheus_state()
                 self.failure_count = 0
                 self.success_count = 0
                 self.half_open_call_count = 0
@@ -651,9 +465,11 @@ class CircuitBreakerState_Instance:
             self.failure_count += 1
             if self.failure_count >= self.config.failure_threshold:
                 self.state = CircuitBreakerState.OPEN
+                self._update_prometheus_state()
                 self.opened_time_us = now_us
         elif self.state == CircuitBreakerState.HALF_OPEN:
             self.state = CircuitBreakerState.OPEN
+            self._update_prometheus_state()
             self.opened_time_us = now_us
             self.failure_count += 1
 
@@ -665,16 +481,19 @@ class CircuitBreakerState_Instance:
     def force_open(self):
         now_us = int(time.time_ns() // 1000)
         self.state = CircuitBreakerState.OPEN
+        self._update_prometheus_state()
         self.opened_time_us = now_us
 
     def force_close(self):
         self.state = CircuitBreakerState.CLOSED
+        self._update_prometheus_state()
         self.failure_count = 0
         self.success_count = 0
         self.half_open_call_count = 0
 
     def force_half_open(self):
         self.state = CircuitBreakerState.HALF_OPEN
+        self._update_prometheus_state()
         self.success_count = 0
         self.half_open_call_count = 0
 
@@ -885,7 +704,7 @@ class TopicConfig:
     retention_ms: int
     compression_type: CompressionType
     cleanup_policy: str  # "delete" or "compact"
-    min_insync_replicas: int = 2
+    min_insync_replicas: int = 1  # Changed from 2 to 1 for single-node Kafka compatibility
     unclean_leader_election: bool = False
     
     # Performance tuning
@@ -1035,7 +854,7 @@ class LatencyTracker:
             }
 
 class ProducerPool:
-    """Pool of producers grouped by compression type with rate limiting."""
+    """Pool of producers grouped by compression type."""
     
     def __init__(self, bootstrap_servers: List[str], client_id: str, security_config: Dict[str, Any]):
         self.bootstrap_servers = bootstrap_servers
@@ -1043,24 +862,14 @@ class ProducerPool:
         self.security_config = security_config
         self.producers: Dict[str, Any] = {}  # Use Any to avoid import issues
         self.transactional_producer: Optional[Any] = None
-        
-        # Rate limiting (messages per second per producer)
-        self.rate_limiters: Dict[str, asyncio.Semaphore] = {}
-        self.rate_limit_tokens: Dict[str, int] = {}
-        self.rate_limit_last_refill: Dict[str, float] = {}
-        self.max_rate_per_producer = 10000  # 10k msg/sec per producer
-        self.rate_limit_window = 1.0  # 1 second window
     
     async def get_producer(self, compression_type: str) -> Any:
-        """Get producer for specific compression type with rate limiting."""
+        """Get producer for specific compression type."""
         if not KAFKA_AVAILABLE or AIOKafkaProducer is None:
             raise RuntimeError("Kafka not available")
         
         # Validate and potentially fallback compression type
         validated_compression = validate_compression_type(compression_type)
-        
-        # Apply rate limiting
-        await self._rate_limit_check(validated_compression)
             
         if validated_compression not in self.producers:
             producer_config = {
@@ -1071,7 +880,11 @@ class ProducerPool:
                 "linger_ms": 1,
                 "acks": "all",
                 "enable_idempotence": True,
-                "value_serializer": lambda v: json.dumps(v).encode('utf-8') if isinstance(v, dict) else v
+                "value_serializer": lambda v: json.dumps(v).encode('utf-8') if isinstance(v, dict) else v,
+                # Metadata refresh settings to fix NotLeaderForPartitionError
+                "metadata_max_age_ms": 5000,  # Refresh metadata every 5s (default 300s)
+                "request_timeout_ms": 40000,  # 40s timeout
+                "retry_backoff_ms": 100,  # Wait 100ms between retries
             }
             
             # Add security config
@@ -1082,38 +895,6 @@ class ProducerPool:
             self.producers[validated_compression] = producer
             
         return self.producers[validated_compression]
-    
-    async def _rate_limit_check(self, compression_type: str) -> None:
-        """Check and apply rate limiting for producer."""
-        current_time = time.time()
-        
-        # Initialize rate limiter for this compression type if needed
-        if compression_type not in self.rate_limiters:
-            self.rate_limiters[compression_type] = asyncio.Semaphore(self.max_rate_per_producer)
-            self.rate_limit_tokens[compression_type] = self.max_rate_per_producer
-            self.rate_limit_last_refill[compression_type] = current_time
-        
-        # Refill tokens based on elapsed time (token bucket algorithm)
-        last_refill = self.rate_limit_last_refill[compression_type]
-        time_elapsed = current_time - last_refill
-        
-        if time_elapsed >= self.rate_limit_window:
-            # Refill tokens
-            self.rate_limit_tokens[compression_type] = self.max_rate_per_producer
-            self.rate_limit_last_refill[compression_type] = current_time
-        
-        # Check if we have tokens available
-        if self.rate_limit_tokens[compression_type] <= 0:
-            # Rate limited - wait until next refill window
-            sleep_time = self.rate_limit_window - time_elapsed
-            if sleep_time > 0:
-                await asyncio.sleep(sleep_time)
-                # Refill after waiting
-                self.rate_limit_tokens[compression_type] = self.max_rate_per_producer
-                self.rate_limit_last_refill[compression_type] = time.time()
-        
-        # Consume a token
-        self.rate_limit_tokens[compression_type] -= 1
     
     async def get_transactional_producer(self) -> Any:
         """Get transactional producer for exactly-once semantics."""
@@ -1127,7 +908,11 @@ class ProducerPool:
                 "transactional_id": f"{self.client_id}-tx",
                 "enable_idempotence": True,
                 "acks": "all",
-                "value_serializer": lambda v: json.dumps(v).encode('utf-8') if isinstance(v, dict) else v
+                "value_serializer": lambda v: json.dumps(v).encode('utf-8') if isinstance(v, dict) else v,
+                # Metadata refresh settings to fix NotLeaderForPartitionError
+                "metadata_max_age_ms": 5000,  # Refresh metadata every 5s
+                "request_timeout_ms": 40000,  # 40s timeout
+                "retry_backoff_ms": 100,  # Wait 100ms between retries
             }
             config.update(self.security_config)
             
@@ -1164,7 +949,11 @@ class ConsumerWorkerPool:
             
         async with self.semaphore:
             try:
-                await handler(topic, partition_key, payload, headers)
+                result = handler(topic, partition_key, payload, headers)
+                if result is None:
+                    logger.error(f"Handler {handler.__name__ if hasattr(handler, '__name__') else handler} returned None instead of coroutine!")
+                    return
+                await result
                 
                 # Batch commits for performance
                 async with self.commit_lock:
@@ -1175,7 +964,10 @@ class ConsumerWorkerPool:
                         self.pending_commits.clear()
                         
             except Exception as e:
+                import traceback
                 logger.error(f"Message processing error: {e}")
+                logger.error(f"Handler info: {handler.__name__ if hasattr(handler, '__name__') else type(handler)}")
+                logger.error(f"Full traceback:\n{traceback.format_exc()}")
     
     # Legacy method for backward compatibility
     async def process_message(self, msg: Any, handler: Callable, consumer: Any) -> None:
@@ -1207,12 +999,36 @@ class StreamingBus:
     Supports both Kafka and Redpanda with zero-copy optimizations.
     """
     
-    def __init__(self, config: Dict[str, Any]):
-        """Initialize streaming bus with configuration."""
+    def __init__(self, config: Dict[str, Any], memory_governor: Optional[Any] = None, 
+                 workload_distributor: Optional[Any] = None):
+        """
+        Initialize streaming bus with configuration.
+        
+        Args:
+            config: Streaming bus configuration
+            memory_governor: Optional MemoryGovernor for backpressure control
+            workload_distributor: Optional WorkloadDistributor for intelligent partition routing
+        """
         self.config = config
         self.bootstrap_servers = config.get("bootstrap_servers", ["localhost:9092"])
         self.client_id = config.get("client_id", "satoshi-streaming-bus")
         self.security_protocol = config.get("security_protocol", "PLAINTEXT")
+        
+        # Memory governance for backpressure control
+        self.memory_governor = memory_governor
+        self.backpressure_enabled = config.get("backpressure_enabled", True)
+        
+        # Workload distribution for hot key detection and load balancing
+        self.workload_distributor = workload_distributor
+        self.enable_workload_distribution = config.get("enable_workload_distribution", True)
+        # Note: Backpressure thresholds are now handled by MemoryGovernor's pressure levels
+        # The _check_backpressure method delegates to memory_governor.get_memory_pressure_level()
+        # which returns: "none", "low", "medium", "high", "critical"
+        self.backpressure_metrics = {
+            "messages_dropped": 0,
+            "messages_throttled": 0,
+            "throttle_wait_time_ms": 0.0
+        }
         
         # Security configuration
         self.security_config = self._build_security_config()
@@ -1239,7 +1055,8 @@ class StreamingBus:
         
         # Enhanced performance monitoring
         self.latency_tracker = LatencyTracker()
-        self.metrics = {
+        # Type as Dict[str, Any] to allow both int counters and nested dict metrics
+        self.metrics: Dict[str, Any] = {
             "messages_sent": 0,
             "messages_received": 0,
             "bytes_sent": 0,
@@ -1248,8 +1065,7 @@ class StreamingBus:
             "consumer_errors": 0,
             "transactions_committed": 0,
             "transactions_aborted": 0,
-            "circuit_breaker_triggers": 0,
-            "rate_budget_updates": 0
+            "circuit_breaker_triggers": 0
         }
 
         # Per-topic metrics with rate tracking
@@ -1269,15 +1085,12 @@ class StreamingBus:
         self.health_check_task: Optional[asyncio.Task] = None
         self.last_health_check = 0.0
 
-        # Global rate budget manager
-        self.rate_budget = RateBudgetManager(config.get("rate_budget"))
-        self._rate_budget_control_task: Optional[asyncio.Task] = None
-        self._rate_budget_control_enabled = self.rate_budget.enabled and config.get(
-            "rate_budget_control_enabled", True
-        )
-        self._rate_budget_consumer_group = config.get(
-            "rate_budget_consumer_group", f"{self.client_id}.rate_budget"
-        )
+        # Adaptive rate limiting (AIMD algorithm)
+        self.enable_adaptive_rate_limiting = config.get("enable_adaptive_rate_limiting", True)
+        self.adaptive_rate_limiter_pool: Optional[AdaptiveRateLimiterPool] = None
+        if self.enable_adaptive_rate_limiting:
+            self.adaptive_rate_limiter_pool = AdaptiveRateLimiterPool()
+            logger.info("✅ Adaptive rate limiting (AIMD) enabled - uses intelligent feedback-driven algorithm")
         
         # Consumer lag monitoring  
         self.consumer_lag_thresholds = {
@@ -1294,60 +1107,61 @@ class StreamingBus:
         logger.info(f"Enhanced streaming bus initialized with servers: {self.bootstrap_servers}")
 
     def rate_limit(self, domain: str, permits: float = 1.0,
-                   timeout: Optional[float] = None) -> RateBudgetBorrowProxy:
+                   timeout: Optional[float] = None):
         """
-        Return an async context manager that enforces the configured rate budget.
+        Return an async context manager that enforces adaptive rate limiting.
+        
+        Uses AIMD (Additive Increase Multiplicative Decrease) algorithm that adapts
+        to downstream pressure and API responses (429s, timeouts, latency).
         
         Usage:
             async with streaming_bus.rate_limit("onchain_rpc"):
                 await call_external_api()
         """
-        return RateBudgetBorrowProxy(self.rate_budget, domain, permits, timeout)
+        return AdaptiveRateLimitContext(
+            pool=self.adaptive_rate_limiter_pool,
+            domain=domain,
+            timeout=timeout
+        )
 
     def record_rate_limit_429(self, domain: str) -> None:
-        """Record an upstream 429/limit response for observability."""
-        self.rate_budget.record_429(domain)
+        """Record an upstream 429/limit response for adaptive rate adjustment."""
+        if self.adaptive_rate_limiter_pool and domain in self.adaptive_rate_limiter_pool.limiters:
+            limiter = self.adaptive_rate_limiter_pool.limiters[domain]
+            limiter.record_429()
+            logger.debug(f"Recorded 429 for domain '{domain}', rate will decrease")
 
     def get_rate_budget_metrics(self) -> Dict[str, Any]:
-        """Expose rate budget metrics for monitoring."""
-        return self.rate_budget.snapshot()
-
-    async def ensure_rate_budget_listener(self) -> None:
-        """
-        Ensure the control topic listener is running so that rate budgets can
-        be tuned at runtime by the DQO.
-        """
-        if not self._rate_budget_control_enabled:
-            return
-        if not KAFKA_AVAILABLE:
-            logger.warning("Rate budget control listener disabled - Kafka unavailable")
-            return
-        if self._rate_budget_control_task and not self._rate_budget_control_task.done():
-            return
-
-        async def _handler(topic: str, partition_key: str,
-                           message: Dict[str, Any], headers: Dict[str, str]) -> None:
-            try:
-                self.rate_budget.apply_control_message(message)
-                self.metrics["rate_budget_updates"] += 1
-            except Exception as exc:
-                logger.error(f"Failed to apply rate budget control message: {exc}")
-
-        async def _runner() -> None:
-            try:
-                await self.subscribe_with_worker_pool(
-                    consumer_group=self._rate_budget_consumer_group,
-                    topics=[self.rate_budget.control_topic],
-                    handler=_handler,
-                    pool_size=1
-                )
-            except asyncio.CancelledError:
-                raise
-            except Exception as exc:
-                logger.error(f"Rate budget control listener stopped unexpectedly: {exc}")
-
-        self._rate_budget_control_task = asyncio.create_task(_runner())
+        """Expose adaptive rate limiter metrics for monitoring."""
+        if not self.adaptive_rate_limiter_pool:
+            return {"enabled": False, "limiters": []}
+        
+        return {
+            "enabled": True,
+            "type": "adaptive_aimd",
+            "limiters": self.adaptive_rate_limiter_pool.get_all_metrics()
+        }
     
+    def get_workload_distributor_metrics(self) -> Dict[str, Any]:
+        """Expose WorkloadDistributor metrics for monitoring hot keys and partition balance."""
+        if not self.workload_distributor or not self.enable_workload_distribution:
+            return {
+                "enabled": False,
+                "reason": "workload_distributor_not_configured"
+            }
+        
+        return {
+            "enabled": True,
+            "hot_keys_detected": self.workload_distributor.hot_key_detections,
+            "skew_detections": self.workload_distributor.skew_detections,
+            "routing_decisions": dict(self.workload_distributor.routing_decisions),
+            "active_hot_keys": {
+                topic: list(keys.keys()) 
+                for topic, keys in self.workload_distributor.hot_keys.items() 
+                if keys
+            }
+        }
+
     def _build_security_config(self) -> Dict[str, Any]:
         """Build security configuration for producers/consumers."""
         security_config = {}
@@ -1408,6 +1222,56 @@ class StreamingBus:
                 logger.warning("⚠️  PLAINTEXT protocol used in production - security risk!")
         
         return security_config
+    
+    async def _check_backpressure(self, topic: str) -> Tuple[bool, Optional[str]]:
+        """
+        Check memory backpressure and determine if message should be published.
+        
+        Returns:
+            Tuple[bool, Optional[str]]: (should_publish, reason_if_blocked)
+        """
+        if not self.backpressure_enabled or not self.memory_governor:
+            return (True, None)
+        
+        try:
+            # Get memory pressure level
+            pressure_level = self.memory_governor.get_memory_pressure_level()
+            
+            # Critical pressure: Drop messages to prevent OOM
+            if pressure_level == "critical":
+                self.backpressure_metrics["messages_dropped"] += 1
+                return (False, f"Memory pressure CRITICAL - dropping message to topic {topic}")
+            
+            # High pressure: Throttle publishing with adaptive delay
+            elif pressure_level == "high":
+                self.backpressure_metrics["messages_throttled"] += 1
+                
+                # Adaptive delay based on memory pressure severity
+                # MemoryGovernor provides pressure level; we adapt delay accordingly
+                # HIGH pressure (~85-95%) warrants significant but not extreme delay
+                throttle_delay_ms = 100  # Adaptive base: 100ms for HIGH (increased from fixed 50ms)
+                start_time = time.time()
+                await asyncio.sleep(throttle_delay_ms / 1000.0)
+                
+                elapsed_ms = (time.time() - start_time) * 1000
+                self.backpressure_metrics["throttle_wait_time_ms"] += elapsed_ms
+                
+                logger.warning(f"Memory pressure HIGH - throttled publish to {topic} by {throttle_delay_ms}ms")
+                return (True, None)
+            
+            # Medium pressure: Log warning but allow
+            elif pressure_level == "medium":
+                if random.random() < 0.01:  # Log 1% of messages to avoid spam
+                    logger.warning(f"Memory pressure MEDIUM - monitor for potential throttling (topic={topic})")
+                return (True, None)
+            
+            # Low or no pressure: Normal operation
+            else:
+                return (True, None)
+                
+        except Exception as e:
+            logger.error(f"Backpressure check failed: {e}, allowing publish")
+            return (True, None)
     
     async def _ensure_admin_client(self) -> Any:
         """Get or create admin client."""
@@ -1554,7 +1418,14 @@ class StreamingBus:
     async def _publish_with_transport_headers(self, topic: str, partition_key: str, 
                                             payload: Dict[str, Any],
                                             transport_headers: Dict[str, bytes]) -> bool:
-        """Internal method for actual Kafka publishing."""
+        """Internal method for actual Kafka publishing with backpressure control."""
+        # Check memory backpressure BEFORE attempting to publish
+        should_publish, reason = await self._check_backpressure(topic)
+        if not should_publish:
+            logger.warning(f"Backpressure blocking publish: {reason}")
+            self.metrics["producer_errors"] += 1
+            return False
+        
         max_retries = 3
         base_delay = 0.1  # 100ms base delay
         
@@ -1577,12 +1448,33 @@ class StreamingBus:
                     else:
                         kafka_headers.append((k, str(v).encode('utf-8')))
                 
-                # Send message
+                # Intelligent partition selection using WorkloadDistributor (hot key detection, load balancing)
+                partition = None
+                if self.workload_distributor and self.enable_workload_distribution:
+                    try:
+                        message_size = len(json.dumps(payload).encode('utf-8'))
+                        # Get partition count from topic config or default to None (auto-detect)
+                        topic_config = self.topic_configs.get(topic)
+                        partition_count = topic_config.partitions if topic_config else None
+                        
+                        partition = self.workload_distributor.get_partition(
+                            key=partition_key,
+                            topic=topic,
+                            message_size=message_size,
+                            partition_count=partition_count
+                        )
+                        logger.debug(f"WorkloadDistributor selected partition {partition} for key '{partition_key}' on topic {topic}")
+                    except Exception as e:
+                        logger.warning(f"WorkloadDistributor failed, falling back to Kafka default partitioner: {e}")
+                        partition = None
+                
+                # Send message (with explicit partition if WorkloadDistributor provided one)
                 await producer.send_and_wait(
                     topic=topic,
                     key=partition_key.encode('utf-8'),
                     value=json.dumps(payload).encode('utf-8'),
-                    headers=kafka_headers
+                    headers=kafka_headers,
+                    partition=partition  # None = Kafka's default hash partitioner
                 )
                 
                 latency_us = (time.time_ns() - start_time) // 1000
@@ -1605,7 +1497,14 @@ class StreamingBus:
                                   dedupe_key: Optional[str] = None) -> bool:
         """
         Legacy transport method: Publish message with headers and optional deduplication.
-        DEPRECATED: Use publish_with_canonical_headers for institutional compliance.
+        
+        ⚠️ DEPRECATED: Use publish_with_canonical_headers for institutional compliance.
+        
+        This method lacks:
+        - Data lineage tracking (correlation_id, source_id)
+        - Content integrity verification (content_hash)
+        - Audit trail (sequence_number, schema_version)
+        - Regulatory compliance (immutable metadata)
         
         Args:
             topic: Target topic
@@ -1614,7 +1513,20 @@ class StreamingBus:
             headers: Transport headers (passed through as-is)
             dedupe_key: Optional deduplication key for idempotent publishing
         """
-        logger.warning("Using legacy publish_with_headers. Consider upgrading to publish_with_canonical_headers for institutional compliance.")
+        # WARNING: This method is deprecated. All Gold Layer components migrated to canonical headers.
+        # Only use for Bronze/Silver layers or non-institutional data flows.
+        # Rate-limit warnings to prevent CPU wake storm (log once per topic per minute)
+        if not hasattr(self, '_deprecation_warnings'):
+            self._deprecation_warnings = {}
+        
+        now = time.time()
+        if topic not in self._deprecation_warnings or now - self._deprecation_warnings[topic] > 60:
+            self._deprecation_warnings[topic] = now
+            logger.warning(
+                f"⚠️  DEPRECATED API: publish_with_headers() used for topic={topic}. "
+                f"Migrate to publish_with_canonical_headers() for institutional compliance. "
+                f"Missing: lineage tracking, audit trail, content integrity."
+            )
         
         max_retries = 3
         base_delay = 0.1  # 100ms base delay
@@ -2605,12 +2517,16 @@ class StreamingBus:
                 "bootstrap_servers": self.bootstrap_servers,
                 "group_id": consumer_group,
                 "client_id": f"{self.client_id}-consumer-{consumer_group}",
-                "auto_offset_reset": "latest",
+                "auto_offset_reset": "latest",  # Only read NEW messages (historical data has schema mismatches)
                 "enable_auto_commit": False,
                 "fetch_min_bytes": 1,
                 "fetch_max_wait_ms": 100,
                 "max_poll_records": 500,  # Batch size for performance
-                "value_deserializer": lambda m: json.loads(m.decode('utf-8')) if m else None
+                "value_deserializer": lambda m: json.loads(m.decode('utf-8')) if m else None,
+                # Coordinator timeout settings (match Kafka broker config)
+                "session_timeout_ms": 30000,  # 30s - matches Kafka's group_max_session_timeout_ms range
+                "heartbeat_interval_ms": 10000,  # 10s - 1/3 of session_timeout
+                "request_timeout_ms": 40000,  # 40s - must be > session_timeout_ms
             }
             consumer_config.update(self.security_config)
             
@@ -2649,8 +2565,8 @@ class StreamingBus:
                                 consumer.resume(*resume_partitions)
                                 self.paused_partitions.clear()
                     
-                    # Poll messages
-                    msg_batch = await consumer.getmany(timeout_ms=100, max_records=500)
+                    # Poll messages (timeout reduced from 100ms to 500ms to prevent macOS CPU throttling)
+                    msg_batch = await consumer.getmany(timeout_ms=500, max_records=500)
                     
                     # Process batch concurrently
                     tasks = []
@@ -2784,9 +2700,13 @@ class StreamingBus:
             "bootstrap_servers": self.bootstrap_servers,
             "group_id": consumer_group,
             "client_id": f"{self.client_id}-consumer-{consumer_group}",
-            "auto_offset_reset": "latest",
+            "auto_offset_reset": "earliest",  # TEMPORARY: Changed from "latest" to process existing messages
             "enable_auto_commit": False,
-            "value_deserializer": lambda m: json.loads(m.decode('utf-8')) if m else None
+            "value_deserializer": lambda m: json.loads(m.decode('utf-8')) if m else None,
+            # Coordinator timeout settings (match Kafka broker config)
+            "session_timeout_ms": 30000,  # 30s - matches Kafka's group_max_session_timeout_ms range
+            "heartbeat_interval_ms": 10000,  # 10s - 1/3 of session_timeout
+            "request_timeout_ms": 40000,  # 40s - must be > session_timeout_ms
         }
         consumer_config.update(self.security_config)
         
@@ -2895,12 +2815,27 @@ class StreamingBus:
         logger.info(f"Registered circuit breaker for component: {component_id}")
         
         # Broadcast initial state so downstream consumers have a baseline view
+        # NOTE: Fire-and-forget to avoid blocking during initialization
+        # If Kafka isn't ready yet, this will fail silently and be retried later
         try:
             initial_state = await self.system_circuit_breaker.get_component_state(component_id)
             if initial_state:
-                await self._publish_breaker_state(initial_state)
+                # Use asyncio.create_task for fire-and-forget (don't await)
+                asyncio.create_task(self._publish_breaker_state_safe(initial_state, component_id))
         except Exception as exc:
-            logger.debug(f"Unable to publish initial breaker state for {component_id}: {exc}")
+            logger.debug(f"Unable to get initial breaker state for {component_id}: {exc}")
+    
+    async def _publish_breaker_state_safe(self, state, component_id: str):
+        """
+        Safely publish breaker state without blocking caller.
+        Handles cases where Kafka/producer isn't ready yet.
+        """
+        try:
+            await asyncio.wait_for(self._publish_breaker_state(state), timeout=2.0)
+        except asyncio.TimeoutError:
+            logger.debug(f"Timeout publishing initial breaker state for {component_id} (Kafka may not be ready)")
+        except Exception as exc:
+            logger.debug(f"Failed to publish initial breaker state for {component_id}: {exc}")
     
     async def can_component_execute(self, component_id: str) -> bool:
         """Check if component can execute based on circuit breaker state."""
@@ -2962,11 +2897,18 @@ class StreamingBus:
         }
         
         try:
-            await self.publish_with_headers(
+            if not hasattr(self, '_breaker_intent_sequence'):
+                self._breaker_intent_sequence = 0
+            self._breaker_intent_sequence += 1
+            
+            await self.publish_with_canonical_headers(
                 topic="control.breaker_intent",
                 partition_key=intent.component_id,
                 payload=payload,
-                headers=headers
+                source_id="system_circuit_breaker.orchestrator",
+                sequence_number=self._breaker_intent_sequence,
+                correlation_id=f"breaker_{intent.component_id}_{int(time.time() * 1000)}",
+                producer_version="1.0.0"
             )
         except Exception as exc:
             logger.warning(f"Failed to publish breaker intent for {intent.component_id}: {exc}")
@@ -3001,15 +2943,18 @@ class StreamingBus:
         Broadcast the current breaker state snapshot so that downstream components can react.
         """
         try:
-            await self.publish_with_headers(
+            if not hasattr(self, '_breaker_state_sequence'):
+                self._breaker_state_sequence = 0
+            self._breaker_state_sequence += 1
+            
+            await self.publish_with_canonical_headers(
                 topic="control.breaker_state",
                 partition_key=state.get("component_id", "unknown"),
                 payload=state,
-                headers={
-                    "source": "system_circuit_breaker",
-                    "component_id": state.get("component_id", "unknown"),
-                    "state": state.get("state", "unknown")
-                }
+                source_id="system_circuit_breaker.monitor",
+                sequence_number=self._breaker_state_sequence,
+                correlation_id=f"breaker_state_{state.get('component_id', 'unknown')}_{int(time.time() * 1000)}",
+                producer_version="1.0.0"
             )
         except Exception as exc:
             logger.warning(f"Failed to publish breaker state for {state.get('component_id')}: {exc}")
@@ -3092,6 +3037,17 @@ class StreamingBus:
                             estimated_lag = max(0, self.topic_metrics[topic_name]["message_count"] - position)
                             self.topic_metrics[topic_name]["lag_ms"] = estimated_lag
                             
+                            # Update Prometheus metrics
+                            if METRICS_AVAILABLE and _metrics_collector:
+                                _metrics_collector.set_gauge(
+                                    'kafka_consumer_lag',
+                                    estimated_lag,
+                                    labels={
+                                        'consumer_group': group_id,
+                                        'topic': topic_name
+                                    }
+                                )
+                            
                             # Check lag thresholds
                             if estimated_lag > self.consumer_lag_thresholds["critical"]:
                                 logger.error(f"Critical consumer lag: {group_id} on {topic_name} lag={estimated_lag}")
@@ -3131,16 +3087,48 @@ class StreamingBus:
                 "active_count": len(self.consumers),
                 "high_lag_topics": high_lag_topics
             },
-            "rate_budgets": self.rate_budget.snapshot(),
-            "rate_budget_enabled": self.rate_budget.enabled,
-            "rate_budget_control_enabled": self._rate_budget_control_enabled,
+            "rate_limiting": {
+                "adaptive_enabled": self.enable_adaptive_rate_limiting and self.adaptive_rate_limiter_pool is not None,
+                "adaptive_metrics": self.get_rate_budget_metrics() if self.adaptive_rate_limiter_pool else None
+            },
             "last_health_check": self.last_health_check,
             "uptime_seconds": current_time - getattr(self, '_start_time', current_time)
         }
     
     def get_metrics(self) -> Dict[str, Any]:
-        """Get basic transport metrics (legacy method)."""
-        return self.metrics.copy()
+        """Get comprehensive transport and backpressure metrics."""
+        metrics = self.metrics.copy()
+        
+        # Add backpressure metrics if enabled
+        if self.backpressure_enabled and self.memory_governor:
+            metrics["backpressure"] = {
+                "enabled": True,
+                "messages_dropped": self.backpressure_metrics["messages_dropped"],
+                "messages_throttled": self.backpressure_metrics["messages_throttled"],
+                "total_throttle_wait_ms": self.backpressure_metrics["throttle_wait_time_ms"],
+                "current_pressure_level": self.memory_governor.get_memory_pressure_level(),
+                "total_memory_mb": self.memory_governor.get_total_memory_usage_mb()
+            }
+        else:
+            metrics["backpressure"] = {"enabled": False}
+        
+        # Add workload distribution metrics if enabled
+        if self.workload_distributor and self.enable_workload_distribution:
+            workload_metrics = self.get_workload_distributor_metrics()
+            metrics["workload_distribution"] = workload_metrics
+            
+            # Push to Prometheus if enabled
+            if workload_metrics.get("enabled"):
+                try:
+                    from infra.monitoring.prometheus_metrics import get_metrics_collector
+                    prom_collector = get_metrics_collector()
+                    prom_collector.record_workload_distributor_metrics(workload_metrics)
+                except Exception as e:
+                    logger.debug(f"Could not record workload metrics to Prometheus: {e}")
+        else:
+            metrics["workload_distribution"] = {"enabled": False}
+        
+        return metrics
     
     def get_compression_status(self) -> Dict[str, Any]:
         """Get comprehensive compression library status and capabilities."""
@@ -3264,18 +3252,13 @@ class StreamingBus:
         """Enhanced graceful shutdown with final commits and health monitoring cleanup."""
         logger.info("Starting graceful shutdown of streaming bus...")
         
+        # Stop adaptive rate limiter pool
+        if self.enable_adaptive_rate_limiting and self.adaptive_rate_limiter_pool:
+            await self.adaptive_rate_limiter_pool.shutdown()
+            logger.info("Adaptive rate limiter pool shutdown complete")
+        
         # Stop health monitoring first
         await self.stop_health_monitoring()
-
-        # Stop rate budget listener
-        if self._rate_budget_control_task:
-            self._rate_budget_control_task.cancel()
-            try:
-                await self._rate_budget_control_task
-            except asyncio.CancelledError:
-                pass
-            self._rate_budget_control_task = None
-        
         # Final commits for all consumer pools
         for consumer_group, worker_pool in self.consumer_pools.items():
             try:

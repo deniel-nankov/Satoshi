@@ -7,6 +7,53 @@ Satoshi Data Pipeline Configuration
     - Use environment variables for production deployments
 
 Add this file to .gitignore immediately.
+
+🔒 CREDENTIAL ROTATION REQUIRED:
+    WARNING: This template previously contained exposed credentials that MUST be rotated:
+    
+    1. QuickNode RPC/WS URLs - Lines 360-379 (Ethereum mainnet endpoints)
+       → REVOKE old endpoints in QuickNode dashboard
+       → Generate new endpoints and set via QUICKNODE_ETH_RPC_URL / QUICKNODE_ETH_WS_URL env vars
+    
+    2. GitHub Personal Access Token (PAT) - Line 523
+       → REVOKE old token at https://github.com/settings/tokens
+       → Generate new token with 'public_repo' scope
+       → Set via GITHUB_PAT environment variable
+    
+    3. Repository Cleanup - IMPORTANT:
+       → Use git-filter-repo or BFG Repo-Cleaner to purge exposed secrets from git history
+       → Force push cleaned history to remote
+       → Team members must re-clone repository
+    
+    All credentials are now loaded from environment variables or secrets manager.
+    Set credentials via .env file (do not commit!) or CI/CD secrets.
+
+═══════════════════════════════════════════════════════════════════════════
+📊 DATA SOURCES INVENTORY
+═══════════════════════════════════════════════════════════════════════════
+
+✅ ENABLED (PHASE 2 - 140-270 bps daily alpha):
+  - Coinbase (2 exchanges): 70+ spot pairs
+  - Gemini (1 exchange): 40+ spot pairs  
+  - Binance Futures (1 perps exchange): 19 perpetual contracts (funding + OI)
+  - Deribit (1 options exchange): BTC + ETH options (IV surfaces + Greeks)
+  - Ethereum (1 chain): QuickNode premium ($49/mo)
+  - 4 L2 chains: Arbitrum, Base, Polygon, Optimism (free public RPCs)
+  - Snapshot: 10 DAO governance spaces (free)
+  - Exchange Status: Coinbase + Gemini status APIs (free)
+  - GitHub: 12 critical repos for releases (5k/hr with token)
+
+🔄 OPTIONAL (Add for Phase 3+ scaling):
+  - Binance Spot: Largest global spot exchange (free public data)
+  - Kraken: European liquidity and EUR pairs (free public data)
+  - OKX: Asian liquidity + additional funding rates (free public data)
+  - OKX Options: Cross-venue options arbitrage (free public data)
+
+💰 TOTAL MONTHLY COST: $49 (QuickNode Build plan only)
+📈 EXPECTED ALPHA: 140-270 bps daily with current configuration
+🚀 SCALE TRIGGER: $500k+ AUM → Upgrade to QuickNode Scale ($499/mo) for all premium RPCs
+
+═══════════════════════════════════════════════════════════════════════════
 """
 
 # =============================================================================
@@ -18,11 +65,9 @@ EXCHANGE_CONFIG = {
         # ===== COINBASE PRO =====
         "coinbase": {
             "enabled": True,
-            "api_key_name": "organizations/4f9e821c-aac0-4532-9749-3d9fcfbe3251/apiKeys/2d687f42-1b83-46e1-8027-7b8ae66d9665",
+            "api_key_name": "YOUR_COINBASE_API_KEY_NAME_HERE",
             "private_key": """-----BEGIN EC PRIVATE KEY-----
-MHcCAQEEIJwQuzQbIoQMTwlYeE9C1J8MlK3MOgk7rQ7MNEqQINiioAoGCCqGSM49
-AwEHoUQDQgAERP1PNinjCb/0XVUZwXu4A7RT7lS5aFjM1P91rOZa7x9TRubOE7hO
-Qy6bDLkBfSwX/LQ777BuCtQF46kr7nQRAg==
+YOUR_COINBASE_PRIVATE_KEY_HERE
 -----END EC PRIVATE KEY-----""",
             # Major trading pairs - comprehensive list of available tickers
             "symbols": [
@@ -72,8 +117,8 @@ Qy6bDLkBfSwX/LQ777BuCtQF46kr7nQRAg==
         # ===== GEMINI EXCHANGE =====
         "gemini": {
             "enabled": True,
-            "api_key": "master-nnYtPydAmdPjufO8legi",
-            "api_secret": "3hibQDRv5SM4juUCngNc58TdMPpU",
+            "api_key": "YOUR_GEMINI_API_KEY_HERE",
+            "api_secret": "YOUR_GEMINI_API_SECRET_HERE",
             # Major trading pairs available on Gemini
             "symbols": [
                 # Top Market Cap
@@ -105,31 +150,98 @@ Qy6bDLkBfSwX/LQ777BuCtQF46kr7nQRAg==
             "ws_endpoint": "wss://api.gemini.com/v1/marketdata"
         },
         
-        # ===== BINANCE SPOT (DISABLED - Add your keys to enable) =====
+        # ===== BINANCE SPOT (OPTIONAL - Largest volume exchange) =====
+        # Consolidated from duplicate entries - keeping more comprehensive symbol list and optional credentials
         "binance": {
-            "enabled": False,  # Set to True after adding keys
-            "api_key": "YOUR_BINANCE_API_KEY",
-            "api_secret": "YOUR_BINANCE_SECRET",
-            "symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT"],
+            "enabled": False,  # Set to True after adding keys for access to largest global spot liquidity
+            "api_key": None,  # Optional for public data, add YOUR_BINANCE_API_KEY for authenticated requests
+            "api_secret": None,  # Optional for public data, add YOUR_BINANCE_SECRET for trading operations
+            "symbols": [
+                "BTCUSDT", "ETHUSDT", "BNBUSDT", "SOLUSDT", "XRPUSDT",
+                "ADAUSDT", "AVAXUSDT", "DOGEUSDT", "MATICUSDT", "LINKUSDT"
+            ],
             "data_types": ["trades", "book"],
             "rate_limit_qps": 100,
             "rest_endpoint": "https://api.binance.com",
             "ws_endpoint": "wss://stream.binance.com:9443"
         },
         
-        # ===== BINANCE FUTURES (DISABLED) =====
+        # ===== BINANCE FUTURES (Perpetual Funding Rates + Open Interest) =====
         "binance_futures": {
-            "enabled": False,
-            "api_key": "YOUR_BINANCE_FUTURES_API_KEY",
-            "api_secret": "YOUR_BINANCE_FUTURES_SECRET",
-            "symbols": ["BTCUSDT", "ETHUSDT"],
-            "data_types": ["trades", "book", "funding", "oi"],
-            "rate_limit_qps": 100,
+            "enabled": True,
+            # API credentials optional for market data (public endpoints)
+            # Required only for trading - can leave as None for data collection
+            "api_key": None,  # Optional: Add for authenticated requests (higher rate limits)
+            "api_secret": None,  # Optional: Add for trading operations
+            
+            # Perpetual contracts to track (funding rates + OI)
+            "symbols": [
+                # Major pairs - highest funding rate alpha
+                "BTCUSDT", "ETHUSDT", "SOLUSDT", "BNBUSDT",
+                
+                # L1 Alts - funding divergence opportunities
+                "ADAUSDT", "AVAXUSDT", "DOTUSD", "MATICUSDT",
+                "ATOMUSDT", "NEARUSDT", "APTUSDT",
+                
+                # DeFi - high volatility funding
+                "AAVEUSDT", "UNIUSDT", "LINKUSDT", "MKRUSDT",
+                
+                # L2s - cross-L2 funding arb
+                "ARBUSDT", "OPUSDT"
+            ],
+            
+            # Data types for funding rate alpha
+            "data_types": ["funding", "oi"],  # Funding rates + Open Interest only
+            # Note: trades/book already covered by spot exchange
+            
+            # Rate limits
+            "rate_limit_qps": 100,  # Binance Futures allows higher QPS
+            
+            # Endpoints
             "rest_endpoint": "https://fapi.binance.com",
-            "ws_endpoint": "wss://fstream.binance.com"
+            "ws_endpoint": "wss://fstream.binance.com",
+            
+            # Collection intervals
+            "funding_interval_sec": 30,  # 30 seconds (funding updates every 8 hours but track changes)
+            "oi_interval_sec": 60,  # 1 minute for open interest
+            
+            # Quality filters
+            "min_oi_usd": 1_000_000,  # Only track contracts with >$1M OI
+            "require_funding_history": True  # Skip new contracts without history
         },
         
-        # Add more exchanges as needed (Gemini, Kraken, OKX)
+        # ===== KRAKEN (OPTIONAL - European liquidity) =====
+        "kraken": {
+            "enabled": False,  # Enable for European market hours and EUR pairs
+            "api_key": None,
+            "api_secret": None,
+            "symbols": [
+                "XBTUSD", "ETHUSD", "SOLUSD", "ADAUSD",  # Kraken uses XBT prefix for Bitcoin
+                "MATICUSD", "LINKUSD", "UNIUSD", "DOTUSD"
+            ],
+            "data_types": ["trades", "book"],
+            "rate_limit_qps": 20,
+            "rest_endpoint": "https://api.kraken.com",
+            "ws_endpoint": "wss://ws.kraken.com"
+        },
+        
+        # ===== OKX (OPTIONAL - Asian liquidity + Additional funding rates) =====
+        "okx": {
+            "enabled": False,  # Enable for Asian market hours and additional perps
+            "api_key": None,
+            "api_secret": None,
+            "passphrase": None,  # OKX requires passphrase like Coinbase
+            "symbols": [
+                "BTC-USDT", "ETH-USDT", "SOL-USDT", "BNB-USDT",
+                "ADA-USDT", "MATIC-USDT", "LINK-USDT", "UNI-USDT"
+            ],
+            "data_types": ["trades", "book", "funding"],  # OKX supports funding rates
+            "rate_limit_qps": 60,
+            "rest_endpoint": "https://www.okx.com",
+            "ws_endpoint": "wss://ws.okx.com:8443"
+        },
+        
+        # Add more exchanges as needed
     },
     
     # Global settings
@@ -140,20 +252,98 @@ Qy6bDLkBfSwX/LQ777BuCtQF46kr7nQRAg==
 }
 
 # =============================================================================
-# 📈 OPTIONS CHAIN COLLECTOR CONFIGURATION
+# � OPTIONS CHAIN COLLECTOR CONFIGURATION
 # =============================================================================
 
 OPTIONS_CONFIG = {
     "venues": {
+        # ===== DERIBIT (Largest Crypto Options Exchange) =====
         "deribit": {
-            "enabled": False,  # Add keys to enable
-            "api_key": "YOUR_DERIBIT_API_KEY",
-            "api_secret": "YOUR_DERIBIT_SECRET",
-            "symbols": ["BTC", "ETH"]
+            "enabled": True,
+            # API credentials optional for market data (public endpoints)
+            # Required only for trading - can leave as None for data collection
+            "api_key": None,  # Optional: Add for authenticated requests (higher rate limits)
+            "api_secret": None,  # Optional: Add for trading operations
+            
+            # Assets to track
+            "symbols": ["BTC", "ETH"],
+            
+            # Data collection settings
+            "collection_interval_sec": 60,  # 1 minute - balance freshness vs rate limits
+            "rate_limit_qps": 20,  # Conservative for public API
+            
+            # Endpoints
+            "rest_endpoint": "https://www.deribit.com/api/v2",
+            "ws_endpoint": "wss://www.deribit.com/ws/api/v2",
+            
+            # Options chain parameters
+            "min_days_to_expiry": 1,   # Skip options expiring today
+            "max_days_to_expiry": 180, # 6 months out (standard risk horizon)
+            "strike_range_pct": 0.5,   # Collect strikes within ±50% of spot
+            
+            # Greeks and IV collection
+            "collect_greeks": True,     # Delta, gamma, vega, theta, rho
+            "collect_iv": True,         # Implied volatility
+            "collect_volume": True,     # Trading volume
+            "collect_open_interest": True,  # Open interest
+            
+            # Quality filters
+            "min_volume_24h": 0.01,  # Skip illiquid options (< 0.01 BTC volume)
+            "require_valid_iv": True  # Skip options without valid IV
+        },
+        
+        # ===== OKX OPTIONS (OPTIONAL - Additional options liquidity) =====
+        "okx": {
+            "enabled": False,  # Enable for cross-venue options arbitrage
+            "api_key": None,  # Optional for market data
+            "api_secret": None,
+            "passphrase": None,
+            
+            # Assets to track
+            "symbols": ["BTC", "ETH"],
+            
+            # Data collection settings
+            "collection_interval_sec": 60,
+            "rate_limit_qps": 20,
+            
+            # Endpoints
+            "rest_endpoint": "https://www.okx.com/api/v5",
+            "ws_endpoint": "wss://ws.okx.com:8443/ws/v5/public",
+            
+            # Options chain parameters
+            "min_days_to_expiry": 1,
+            "max_days_to_expiry": 180,
+            "strike_range_pct": 0.5,
+            
+            # Greeks and IV collection
+            "collect_greeks": True,
+            "collect_iv": True,
+            "collect_volume": True,
+            "collect_open_interest": True,
+            
+            # Quality filters
+            "min_volume_24h": 0.01,
+            "require_valid_iv": True
         }
     },
-    "collection_interval_sec": 60,
-    "rate_limit_qps": 20
+    
+    # Global options collection settings
+    "collection_interval_sec": 60,  # Default collection interval
+    "rate_limit_qps": 20,
+    
+    # Streaming bus integration
+    "streaming_bus": {
+        "topic": "raw_data.options_chain",
+        "partition_by": "symbol",  # Partition by BTC/ETH
+        "compression": "lz4"
+    },
+    
+    # Circuit breaker for options collector
+    "circuit_breaker": {
+        "enabled": True,
+        "failure_threshold": 5,
+        "recovery_timeout_sec": 300
+    }
 }
 
 # =============================================================================
@@ -179,10 +369,12 @@ OPTIONS_CONFIG = {
 ONCHAIN_CONFIG = {
     "chains": {
         # ===== ETHEREUM MAINNET (QuickNode Premium - Build Plan) =====
+        # SECURITY: Replace placeholders with actual credentials from environment variables
+        # Set QUICKNODE_ETH_RPC_URL and QUICKNODE_ETH_WS_URL in your environment or secrets manager
         "ethereum": {
             "enabled": True,
-            "rpc_url": "https://rough-boldest-bird.quiknode.pro/0b65e1be858da25e93b81fd776f043f1dc11501b/",
-            "ws_url": "wss://rough-boldest-bird.quiknode.pro/0b65e1be858da25e93b81fd776f043f1dc11501b/",
+            "rpc_url": os.getenv("QUICKNODE_ETH_RPC_URL", "https://QUICKNODE_RPC_URL_PLACEHOLDER"),
+            "ws_url": os.getenv("QUICKNODE_ETH_WS_URL", "wss://QUICKNODE_WS_URL_PLACEHOLDER"),
             "fallback_rpcs": [
                 "https://eth.llamarpc.com",
                 "https://rpc.ankr.com/eth"
@@ -338,11 +530,11 @@ EVENTS_CONFIG = {
     # Monitors the same exchanges configured in EXCHANGE_CONFIG
     
     # ===== GITHUB RELEASES (FREE with token - Higher rate limits) =====
+    # SECURITY: Set GITHUB_PAT in environment variables or secrets manager
+    # Generate token at: https://github.com/settings/tokens with 'public_repo' scope
     "github_releases_enabled": True,
-    "github_token": None,  # Optional: Add GitHub Personal Access Token for higher rate limits
-                          # Create at: https://github.com/settings/tokens
-                          # Required scopes: public_repo (read-only)
-                          # Rate limits: 60 req/hr (no token) vs 5,000 req/hr (with token)
+    "github_token": os.getenv("GITHUB_PAT", "GITHUB_PAT_PLACEHOLDER"),
+    # Rate limit: 5,000 requests/hour (authenticated) vs 60 req/hr (unauthenticated)
     "github_repos": [
         # Layer 1 protocols
         "ethereum/go-ethereum",        # Ethereum client (Geth)

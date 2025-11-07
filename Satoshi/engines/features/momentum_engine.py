@@ -257,7 +257,7 @@ class MomentumEngine:
                 self.features_computed += 1
                 
                 # Record metrics
-                if METRICS_AVAILABLE:
+                if METRICS_AVAILABLE and _metrics_collector is not None:
                     _metrics_collector.increment_counter(
                         "momentum_features_computed",
                         value=1.0,

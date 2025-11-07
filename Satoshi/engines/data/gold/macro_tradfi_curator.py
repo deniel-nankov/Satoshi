@@ -82,7 +82,7 @@ class MacroSnapshot:
     equities_last_updated_utc_us: Optional[int] = None
     
     # Data completeness
-    missing_fields: List[str] = None  # List of expected but missing fields
+    missing_fields: Optional[List[str]] = None  # List of expected but missing fields
     
     def __post_init__(self):
         if self.missing_fields is None:
@@ -297,7 +297,7 @@ class MacroTradFiCurator:
                     f"VIX={snapshot.vix_price:.2f if snapshot.vix_price else 'N/A'}, "
                     f"10Y={snapshot.treasury_10y_yield:.2f}% if snapshot.treasury_10y_yield else 'N/A', "
                     f"Stale(rates={snapshot.rates_stale}, equities={snapshot.equities_stale}), "
-                    f"Missing={len(snapshot.missing_fields)} fields"
+                    f"Missing={len(snapshot.missing_fields) if snapshot.missing_fields else 0} fields"
                 )
                 
             except asyncio.CancelledError:

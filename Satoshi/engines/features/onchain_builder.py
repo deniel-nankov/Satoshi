@@ -52,19 +52,12 @@ from collections import defaultdict
 
 # Prometheus metrics (centralized)
 try:
-    from infra.monitoring.prometheus_metrics import AGENT_PROCESSING_TIME, AGENT_ERRORS, AGENT_RUNS
+    from infra.monitoring.prometheus_metrics import MetricsCollector
+    _metrics_collector = MetricsCollector()
+    METRICS_AVAILABLE = True
 except ImportError:
-    # Fallback for tests/standalone
-    class _FakeMetric:
-        def labels(self, **kwargs):
-            return self
-        def observe(self, value):
-            pass
-        def inc(self):
-            pass
-    AGENT_PROCESSING_TIME = _FakeMetric()
-    AGENT_ERRORS = _FakeMetric()
-    AGENT_RUNS = _FakeMetric()
+    _metrics_collector = None
+    METRICS_AVAILABLE = False
 
 
 # =============================
@@ -288,7 +281,12 @@ class OnChainBuilder:
                 return None
         
         start_time = time.time()
-        AGENT_RUNS.labels(**self._metrics_labels).inc()
+        if METRICS_AVAILABLE and _metrics_collector is not None:
+            _metrics_collector.increment_counter(
+                "onchain_agent_runs_total",
+                value=1.0,
+                labels=self._metrics_labels
+            )
         
         try:
             # Convert empty list to valid empty features
@@ -331,14 +329,24 @@ class OnChainBuilder:
             
             # Record metrics
             elapsed_ms = (time.time() - start_time) * 1000
-            AGENT_PROCESSING_TIME.labels(**self._metrics_labels).observe(elapsed_ms)
+            if METRICS_AVAILABLE and _metrics_collector is not None:
+                _metrics_collector.observe_histogram(
+                    "onchain_agent_processing_time_ms",
+                    value=elapsed_ms,
+                    labels=self._metrics_labels
+                )
             
             return features
             
         except Exception as e:
             # Handle failure
             self._consecutive_failures += 1
-            AGENT_ERRORS.labels(**self._metrics_labels).inc()
+            if METRICS_AVAILABLE and _metrics_collector is not None:
+                _metrics_collector.increment_counter(
+                    "onchain_agent_errors_total",
+                    value=1.0,
+                    labels=self._metrics_labels
+                )
             
             # Open circuit if too many failures
             if self._consecutive_failures >= self._failure_threshold:

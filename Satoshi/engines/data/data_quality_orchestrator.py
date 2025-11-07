@@ -1283,23 +1283,6 @@ class DataQualityOrchestrator:
                 metadata={"error": str(e), "mode": "graceful_degradation"},
                 warnings=[f"Freshness check failed: {str(e)}"]
             )
-            return QualityStageResult(
-                stage=QualityStage.FRESHNESS_VALIDATION,
-                result=QualityResult.SKIP,
-                score=1.0,
-                latency_ms=(time.time() - stage_start) * 1000,
-                metadata={"reason": "timeout", "note": "freshness check took too long"}
-            )
-        except Exception as e:
-            logger.error(f"Freshness validation error: {e}", exc_info=True)
-            return QualityStageResult(
-                stage=QualityStage.FRESHNESS_VALIDATION,
-                result=QualityResult.ERROR,
-                score=0.0,
-                latency_ms=(time.time() - stage_start) * 1000,
-                metadata={"error": str(e)},
-                errors=[f"Freshness validation error: {e}"]
-            )
     
     async def _execute_reconciliation(self, payload: Dict, headers: Dict, topic: str) -> QualityStageResult:
         """

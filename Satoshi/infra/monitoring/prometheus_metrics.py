@@ -21,22 +21,33 @@ Architecture:
 import time
 import psutil
 import asyncio
-from typing import Dict, List, Any, Optional, Callable
+from typing import Dict, List, Any, Optional, Callable, TYPE_CHECKING
 from dataclasses import dataclass, field
 from collections import defaultdict, deque
 from threading import Lock
 import logging
 
+# Initialize logger first
+logger = logging.getLogger(__name__)
+
 # Prometheus client library for official metric types and REGISTRY
+if TYPE_CHECKING:
+    from prometheus_client import Counter, Gauge, Histogram, Summary, Info, CollectorRegistry
+
 try:
     from prometheus_client import Counter, Gauge, Histogram, Summary, Info
     from prometheus_client import REGISTRY, CollectorRegistry
     PROMETHEUS_CLIENT_AVAILABLE = True
 except ImportError:
     PROMETHEUS_CLIENT_AVAILABLE = False
+    Counter = None  # type: ignore
+    Gauge = None  # type: ignore
+    Histogram = None  # type: ignore
+    Summary = None  # type: ignore
+    Info = None  # type: ignore
+    REGISTRY = None  # type: ignore
+    CollectorRegistry = None  # type: ignore
     logger.warning("prometheus_client not available - metrics will not be exposed")
-
-logger = logging.getLogger(__name__)
 
 # =============================
 # METRIC DEFINITIONS
@@ -81,9 +92,10 @@ class MetricsCollector:
         self.collection_interval = collection_interval
         
         # prometheus_client metric objects (registered with global REGISTRY)
-        self._prom_counters: Dict[str, Counter] = {}
-        self._prom_gauges: Dict[str, Gauge] = {}
-        self._prom_histograms: Dict[str, Histogram] = {}
+        # Using Any type since Counter/Gauge/Histogram may be None if prometheus_client unavailable
+        self._prom_counters: Dict[str, Any] = {}
+        self._prom_gauges: Dict[str, Any] = {}
+        self._prom_histograms: Dict[str, Any] = {}
         
         # Legacy internal storage (for backward compatibility and custom operations)
         self.metrics: Dict[str, TimeSeries] = {}
@@ -336,7 +348,7 @@ class MetricsCollector:
             )
             
             # Register with prometheus_client if available
-            if PROMETHEUS_CLIENT_AVAILABLE and name not in self._prom_counters:
+            if PROMETHEUS_CLIENT_AVAILABLE and Counter is not None and REGISTRY is not None and name not in self._prom_counters:
                 try:
                     label_names = list(labels.keys()) if labels else []
                     self._prom_counters[name] = Counter(
@@ -367,7 +379,7 @@ class MetricsCollector:
             )
             
             # Register with prometheus_client if available
-            if PROMETHEUS_CLIENT_AVAILABLE and name not in self._prom_gauges:
+            if PROMETHEUS_CLIENT_AVAILABLE and Gauge is not None and REGISTRY is not None and name not in self._prom_gauges:
                 try:
                     label_names = list(labels.keys()) if labels else []
                     self._prom_gauges[name] = Gauge(
@@ -406,7 +418,7 @@ class MetricsCollector:
             self.metrics[name].__dict__['buckets'] = buckets
             
             # Register with prometheus_client if available
-            if PROMETHEUS_CLIENT_AVAILABLE and name not in self._prom_histograms:
+            if PROMETHEUS_CLIENT_AVAILABLE and Histogram is not None and REGISTRY is not None and name not in self._prom_histograms:
                 try:
                     label_names = list(labels.keys()) if labels else []
                     self._prom_histograms[name] = Histogram(

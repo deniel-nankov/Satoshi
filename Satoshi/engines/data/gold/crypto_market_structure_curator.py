@@ -265,6 +265,8 @@ class CryptoMarketStructureCurator:
         - Generate signals (Feature layer)
         """
         m = self._latest_metrics
+        if m is None:
+            raise ValueError("No metrics available to build structure")
         
         # Simple arithmetic (Gold layer responsibility)
         alt_dominance = 100.0 - m['btc_dominance_pct'] - m['eth_dominance_pct']

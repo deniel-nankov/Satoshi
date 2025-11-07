@@ -985,6 +985,8 @@ class QualityMonitoringTSDB:
             self.incident_cache.popleft()
     
     async def stop_incident_consumption(self) -> None:
+        """Stop incident consumption task."""
+        pass
     
     # ============= ENHANCED INSERT METHODS =============
     

@@ -127,6 +127,7 @@ class QualityAgentMetrics:
     last_heartbeat: Optional[datetime] = None
     uptime_percentage: float = 0.0
     sla_breaches: int = 0
+    _last_rate_update: float = 0.0  # Internal field for rate calculation
 
 
 @dataclass
@@ -629,6 +630,10 @@ class QualityMonitoringTSDB:
     
     async def _consume_incident_topic(self, topic: str) -> None:
         """Consume incidents from a specific topic."""
+        if not self.streaming_bus:
+            logger.warning(f"Streaming bus not available - cannot consume from {topic}")
+            return
+            
         try:
             async def incident_handler(topic: str, partition_key: str, 
                                      payload: Dict[str, Any], headers: Dict[str, str]) -> None:
@@ -730,10 +735,10 @@ class QualityMonitoringTSDB:
         
         # Calculate rates (simplified)
         current_time = time.time()
-        if not hasattr(metrics, '_last_rate_update'):
+        if metrics._last_rate_update == 0.0:
             metrics._last_rate_update = current_time
         
-        time_diff = current_time - getattr(metrics, '_last_rate_update', current_time)
+        time_diff = current_time - metrics._last_rate_update
         if time_diff >= 60:  # Update every minute
             metrics.messages_per_second = metrics.messages_processed / 60.0
             metrics._last_rate_update = current_time
@@ -983,10 +988,6 @@ class QualityMonitoringTSDB:
         # Remove old entries
         while self.incident_cache and self.incident_cache[0]['timestamp'] < cutoff_time:
             self.incident_cache.popleft()
-    
-    async def stop_incident_consumption(self) -> None:
-        """Stop incident consumption task."""
-        pass
     
     # ============= ENHANCED INSERT METHODS =============
     
@@ -1324,6 +1325,9 @@ class QualityMonitoringTSDB:
     
     def _get_pipeline_health_summary(self) -> Dict[str, Any]:
         """Get overall pipeline health summary."""
+        if not self.client:
+            return {"error": "ClickHouse client not available"}
+            
         try:
             # Query pipeline SLA performance
             query = """
@@ -1360,6 +1364,9 @@ class QualityMonitoringTSDB:
     
     def _get_incident_trend_analysis(self) -> Dict[str, Any]:
         """Get incident trend analysis for last 24 hours."""
+        if not self.client:
+            return {"error": "ClickHouse client not available"}
+            
         try:
             # Query incident trends
             query = """
@@ -1396,6 +1403,9 @@ class QualityMonitoringTSDB:
     
     def _get_agent_performance_summary(self) -> Dict[str, Any]:
         """Get quality agent performance summary."""
+        if not self.client:
+            return {"error": "ClickHouse client not available"}
+            
         try:
             # Query latest agent metrics
             query = """

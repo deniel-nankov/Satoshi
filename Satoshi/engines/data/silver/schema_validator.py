@@ -45,6 +45,7 @@ class FieldType(Enum):
     STRING = "string"
     INTEGER = "integer" 
     DECIMAL = "decimal"
+    FLOAT = "float"  # Alias for DECIMAL for backward compatibility
     BOOLEAN = "boolean"
     TIMESTAMP_US = "timestamp_us"
     ADDRESS = "address"
@@ -80,8 +81,8 @@ class FieldSchema:
     field_type: FieldType
     required: bool = True
     nullable: bool = False
-    min_value: Optional[Union[int, Decimal]] = None
-    max_value: Optional[Union[int, Decimal]] = None
+    min_value: Optional[Union[int, float, Decimal]] = None
+    max_value: Optional[Union[int, float, Decimal]] = None
     min_length: Optional[int] = None
     max_length: Optional[int] = None
     pattern: Optional[str] = None  # regex pattern
@@ -3120,8 +3121,7 @@ class SchemaValidatorAgent:
                     name="source",
                     field_type=FieldType.STRING,
                     required=True,
-                    max_length=50,
-                    default_value="fred"
+                    max_length=50
                 ),
                 FieldSchema(
                     name="frequency",
@@ -3155,8 +3155,7 @@ class SchemaValidatorAgent:
                     name="source",
                     field_type=FieldType.STRING,
                     required=True,
-                    max_length=50,
-                    default_value="coingecko"
+                    max_length=50
                 ),
                 FieldSchema(
                     name="total_market_cap_usd",
